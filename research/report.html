@@ -1,0 +1,464 @@
+<title>The Thai Dictation Gap</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bai+Jamjuree:wght@500;600;700&family=IBM+Plex+Sans+Thai:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+
+<style>
+/* ── tokens: complete light palette on bare :root ─────────────────── */
+:root{
+  --ground:#F2F4F4;
+  --surface:#FFFFFF;
+  --surface-2:#E7ECEC;
+  --ink:#121A1A;
+  --ink-2:#3D4C4C;
+  --ink-3:#6B7C7C;
+  --rule:#CFD9D9;
+  --rule-2:#E2E9E9;
+  --accent:#0B6B66;
+  --accent-2:#0E8C85;
+  --accent-wash:#DDEDEB;
+  --pass:#1A6B3C;
+  --pass-wash:#DCEEE2;
+  --warn:#8A5410;
+  --warn-wash:#F6E9D5;
+  --fail:#9E2A2A;
+  --fail-wash:#F5DFDF;
+  --shadow:0 1px 2px rgba(18,26,26,.05),0 8px 24px -12px rgba(18,26,26,.18);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0C1212;
+    --surface:#131B1B;
+    --surface-2:#1B2525;
+    --ink:#E8EFEE;
+    --ink-2:#B3C2C1;
+    --ink-3:#7F9190;
+    --rule:#2A3838;
+    --rule-2:#1F2B2B;
+    --accent:#4FBDB4;
+    --accent-2:#6FD3CA;
+    --accent-wash:#16302E;
+    --pass:#5FCB8A;
+    --pass-wash:#123021;
+    --warn:#D9A25C;
+    --warn-wash:#33260F;
+    --fail:#E88A8A;
+    --fail-wash:#361A1A;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0C1212;
+  --surface:#131B1B;
+  --surface-2:#1B2525;
+  --ink:#E8EFEE;
+  --ink-2:#B3C2C1;
+  --ink-3:#7F9190;
+  --rule:#2A3838;
+  --rule-2:#1F2B2B;
+  --accent:#4FBDB4;
+  --accent-2:#6FD3CA;
+  --accent-wash:#16302E;
+  --pass:#5FCB8A;
+  --pass-wash:#123021;
+  --warn:#D9A25C;
+  --warn-wash:#33260F;
+  --fail:#E88A8A;
+  --fail-wash:#361A1A;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.7);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--ground);
+  color:var(--ink);
+  font-family:"IBM Plex Sans Thai","Helvetica Neue",Arial,sans-serif;
+  font-size:16.5px;
+  line-height:1.62;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px;margin:0 auto;padding:0 clamp(18px,4vw,40px) 96px}
+.col{max-width:69ch}
+
+/* ── masthead ─────────────────────────────────────────────────────── */
+header.mast{padding:clamp(44px,7vw,84px) 0 30px;border-bottom:2px solid var(--ink)}
+.eyebrow{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--accent);margin:0 0 18px;display:flex;flex-wrap:wrap;gap:10px 18px;
+}
+h1{
+  font-family:"Bai Jamjuree","IBM Plex Sans Thai",sans-serif;
+  font-weight:700;font-size:clamp(38px,6.4vw,68px);line-height:1.02;
+  letter-spacing:-.022em;margin:0 0 20px;text-wrap:balance;
+}
+.standfirst{
+  font-size:clamp(17px,2.1vw,20.5px);line-height:1.5;color:var(--ink-2);
+  max-width:60ch;margin:0 0 30px;
+}
+.standfirst strong{color:var(--ink);font-weight:600}
+
+/* ── evidence tag legend + inline tags ────────────────────────────── */
+.legend{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 6px}
+.tag{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:10.5px;letter-spacing:.07em;font-weight:500;
+  padding:3px 8px;border-radius:3px;white-space:nowrap;
+  border:1px solid var(--rule);color:var(--ink-2);background:var(--surface);
+}
+.tag.m{color:var(--pass);background:var(--pass-wash);border-color:transparent;font-weight:500}
+.tag.d{color:var(--accent);background:var(--accent-wash);border-color:transparent}
+.tag.u{color:var(--warn);background:var(--warn-wash);border-color:transparent}
+
+/* ── sections ─────────────────────────────────────────────────────── */
+section{padding-top:clamp(48px,6vw,74px)}
+h2{
+  font-family:"Bai Jamjuree","IBM Plex Sans Thai",sans-serif;
+  font-weight:600;font-size:clamp(25px,3.3vw,34px);line-height:1.14;
+  letter-spacing:-.015em;margin:0 0 8px;text-wrap:balance;
+}
+h2 .num{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.46em;
+  font-weight:400;color:var(--accent);letter-spacing:.06em;
+  display:block;margin-bottom:9px;
+}
+h3{
+  font-family:"Bai Jamjuree","IBM Plex Sans Thai",sans-serif;
+  font-weight:600;font-size:clamp(17.5px,2vw,20px);line-height:1.28;
+  margin:34px 0 6px;letter-spacing:-.008em;text-wrap:balance;
+}
+p{margin:0 0 15px}
+a{color:var(--accent);text-decoration:underline;text-underline-offset:2px;text-decoration-thickness:1px}
+a:hover{color:var(--accent-2)}
+:focus-visible{outline:2px solid var(--accent-2);outline-offset:3px;border-radius:2px}
+strong{font-weight:600}
+ul{margin:0 0 15px;padding-left:1.15em}
+li{margin-bottom:8px}
+li::marker{color:var(--accent)}
+
+/* ── thesis pull ──────────────────────────────────────────────────── */
+.thesis{
+  border-left:3px solid var(--accent);padding:4px 0 4px 22px;margin:26px 0 30px;
+  font-family:"Bai Jamjuree","IBM Plex Sans Thai",sans-serif;
+  font-size:clamp(19px,2.5vw,25px);line-height:1.34;font-weight:500;
+  letter-spacing:-.012em;color:var(--ink);max-width:52ch;
+}
+blockquote{
+  margin:22px 0;padding:16px 20px;background:var(--surface);
+  border-left:3px solid var(--rule);border-radius:0 5px 5px 0;
+  color:var(--ink-2);font-size:15.5px;
+}
+blockquote p:last-child{margin-bottom:0}
+blockquote.alert{border-left-color:var(--fail);background:var(--fail-wash);color:var(--ink)}
+
+/* ── SPECIMEN: the signature element ──────────────────────────────── */
+.spec{
+  background:var(--surface);border:1px solid var(--rule);border-radius:7px;
+  padding:0;margin:24px 0;overflow:hidden;box-shadow:var(--shadow);
+}
+.spec-head{
+  display:flex;justify-content:space-between;align-items:center;gap:12px;
+  padding:9px 16px;background:var(--surface-2);border-bottom:1px solid var(--rule);
+  font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);
+}
+.spec-row{display:flex;gap:14px;padding:13px 16px;border-bottom:1px solid var(--rule-2);align-items:baseline;flex-wrap:wrap}
+.spec-row:last-child{border-bottom:0}
+.spec-label{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:10.5px;
+  letter-spacing:.05em;color:var(--ink-3);flex:0 0 92px;text-transform:uppercase;
+}
+.spec-text{font-size:19px;line-height:1.5;flex:1 1 260px;min-width:0}
+.ok{color:var(--pass);font-weight:600;background:var(--pass-wash);padding:1px 5px;border-radius:3px}
+.bad{color:var(--fail);font-weight:600;background:var(--fail-wash);padding:1px 5px;border-radius:3px;text-decoration:underline wavy var(--fail) 1px;text-underline-offset:4px}
+.gloss{font-size:13px;color:var(--ink-3);font-style:italic}
+
+/* ── tables ───────────────────────────────────────────────────────── */
+.scroll{overflow-x:auto;margin:22px 0;border:1px solid var(--rule);border-radius:7px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14.5px;min-width:min(100%,540px)}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--rule-2);vertical-align:top}
+thead th{
+  background:var(--surface-2);font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);
+  font-weight:500;white-space:nowrap;border-bottom:1px solid var(--rule);
+}
+tbody tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13.5px;white-space:nowrap}
+.neg{color:var(--fail);font-weight:500}
+.pos{color:var(--pass);font-weight:500}
+tr.hi td{background:var(--accent-wash)}
+code{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.88em;
+  background:var(--surface-2);padding:1.5px 5px;border-radius:3px;color:var(--ink);
+}
+pre{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12.8px;line-height:1.6;
+  background:var(--surface);border:1px solid var(--rule);border-radius:7px;
+  padding:15px 17px;overflow-x:auto;margin:20px 0;color:var(--ink-2);
+}
+pre strong{color:var(--ink);font-weight:600}
+
+/* ── verdict cards ────────────────────────────────────────────────── */
+.verdicts{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:24px 0}
+.v{background:var(--surface);border:1px solid var(--rule);border-radius:7px;padding:15px 16px;border-top:3px solid var(--fail)}
+.v.t{border-top-color:var(--pass)}
+.v-claim{font-size:14.5px;color:var(--ink-2);margin:0 0 9px;line-height:1.45}
+.v-verdict{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;letter-spacing:.08em;
+  font-weight:500;color:var(--fail);text-transform:uppercase;
+}
+.v.t .v-verdict{color:var(--pass)}
+
+/* ── steps ────────────────────────────────────────────────────────── */
+.step{display:flex;gap:16px;padding:15px 0;border-bottom:1px solid var(--rule-2)}
+.step:last-child{border-bottom:0}
+.step-n{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;font-weight:500;
+  color:var(--accent);flex:0 0 46px;padding-top:3px;letter-spacing:.04em;
+}
+.step-b{flex:1;min-width:0}
+.step-t{font-weight:600;margin:0 0 3px;font-size:16px}
+.step-d{font-size:14.5px;color:var(--ink-2);margin:0}
+.cost{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;color:var(--ink-3);letter-spacing:.04em}
+
+footer{margin-top:70px;padding-top:26px;border-top:2px solid var(--ink);font-size:13.5px;color:var(--ink-3)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <p class="eyebrow"><span>Research report</span><span>24 August 2026</span><span>10 agents · ~60,000 words</span></p>
+  <h1>The Thai Dictation Gap</h1>
+  <p class="standfirst">Four premises went into this research. <strong>Three of them were false.</strong> The one that survived is narrower, sharper, and — measured on real hardware today — <strong>fixable with an eight-word glossary.</strong></p>
+  <div class="legend">
+    <span class="tag m">MEASURED — run on this machine</span>
+    <span class="tag d">DOC — vendor documentation</span>
+    <span class="tag">3P — third-party evaluation</span>
+    <span class="tag u">UNVERIFIED</span>
+  </div>
+</header>
+
+<section class="col">
+  <h2><span class="num">01</span>Bottom line</h2>
+  <p>Build it — but not the product you set out to build, and not for the reason you expected.</p>
+  <div class="verdicts">
+    <div class="v"><p class="v-claim">“Nobody serves Thai dictation”</p><p class="v-verdict">False</p></div>
+    <div class="v"><p class="v-claim">“US incumbents ignore code-switching”</p><p class="v-verdict">False</p></div>
+    <div class="v"><p class="v-claim">“Speaking Thai beats typing it”</p><p class="v-verdict">Unsupported</p></div>
+    <div class="v t"><p class="v-claim">“Thai + English in one sentence is broken”</p><p class="v-verdict">True &amp; fixable</p></div>
+  </div>
+  <p>Wispr Flow <em>specifically optimised</em> Thai. Windows 11, Google and every Whisper wrapper list it. Wispr even sells <em>Hinglish as a named language</em> in India at a 72% discount, with UPI payments — so the “incumbents ignore mixed languages” thesis is not merely unsupported, the opposite is documented.</p>
+  <p class="thesis">The product is not “faster dictation.” It is <em>“we write your English words in English.”</em></p>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="num">02</span>The measured core</h2>
+    <p>This is the part nobody has published. A local Whisper was run against Thai speech containing English technical terms, on macOS 26.5.1. <span class="tag m">MEASURED</span></p>
+    <blockquote><p><strong>Read the revision below before acting on these two failures.</strong> They were measured on <code>ggml-small</code> (487&nbsp;MB). Re-running on <code>large-v3</code> overturned two conclusions. They are kept here because they are the honest record of what a small model does — and what every competitor shipping a small local model is doing to their users.</p></blockquote>
+    <h3>Both obvious settings fail — and the second fails dangerously</h3>
+  </div>
+
+  <div class="spec">
+    <div class="spec-head"><span>Setting: language = th</span><span>Thai intact · English destroyed 7 / 7</span></div>
+    <div class="spec-row"><span class="spec-label">Spoken</span><span class="spec-text">เดี๋ยว <span class="ok">deploy</span> ให้ก่อนนะ</span></div>
+    <div class="spec-row"><span class="spec-label">Output</span><span class="spec-text">เดี๋ยว <span class="bad">ดิบโล้ย</span> ให้ก่อนนะ</span></div>
+    <div class="spec-row"><span class="spec-label">Spoken</span><span class="spec-text">ช่วย <span class="ok">refactor function</span> นี้หน่อย</span></div>
+    <div class="spec-row"><span class="spec-label">Output</span><span class="spec-text">ช่วย <span class="bad">เรฟาเทอร์ฟังชัน</span> นี้หน่อย</span></div>
+  </div>
+
+  <div class="spec">
+    <div class="spec-head"><span>Setting: language = en</span><span>English survives · Thai hallucinated</span></div>
+    <div class="spec-row"><span class="spec-label">Spoken</span><span class="spec-text">เดี๋ยว deploy ให้ก่อนนะ <span class="gloss">— “let me deploy it first”</span></span></div>
+    <div class="spec-row"><span class="spec-label">Output</span><span class="spec-text"><span class="bad">Wait, deploy, I’ll give you a call.</span></span></div>
+    <div class="spec-row"><span class="spec-label">Spoken</span><span class="spec-text">ช่วย refactor function นี้หน่อย</span></div>
+    <div class="spec-row"><span class="spec-label">Output</span><span class="spec-text"><span class="bad">Refrigerator Function, Ninoi.</span></span></div>
+  </div>
+
+  <div class="col">
+    <p>For a dictation tool, silently fabricated sentences are the worst possible failure — the user pastes confident nonsense into a client email. And <code>auto</code> is not a third option: byte-identical to <code>language=th</code>.</p>
+
+    <h3>Three failure modes, only one repairable</h3>
+    <ul>
+      <li><strong>Systematic transliteration</strong> — <span lang="th">เรฟาเทอร์</span> for <em>refactor</em>. Phonetic shadow survives; likely recoverable.</li>
+      <li><strong>Substitution into a real word</strong> — <em>meeting</em> → <span lang="th">มีทิ้ง</span>, which is <em>readable Thai</em>. <em>refactor</em> → “Refrigerator”, an ordinary English word. <strong>Nothing downstream can flag this.</strong></li>
+      <li><strong>Merge and loss</strong> — <em>branch main</em> (two tokens) → <span lang="th">รันสมีน</span> (one). Boundary gone.</li>
+    </ul>
+    <blockquote class="alert"><p><strong>A repair dictionary is impossible.</strong> Two runs of the <em>identical file</em> produced <span lang="th">ดีโพล้อย</span> and <span lang="th">ดิบโล้ย</span>. There is no stable key — repair must be a semantic pass, never a lookup.</p></blockquote>
+
+    <h3>The finding the business rests on <span class="tag u">REVISED</span></h3>
+    <p>Re-running at full model scale <strong>overturned two of the earlier conclusions.</strong> The headline — <em>the Latin-script barrier is soft</em> — survives and is now confirmed twice over. The <em>mechanism</em> changed.</p>
+    <p><strong>Correction 1 — transliteration is scale-dependent, not universal.</strong> Everything above was measured on <code>ggml-small</code> (487&nbsp;MB). On <code>large-v3</code>, at <code>language=th</code>, <strong>with no prompt and no configuration at all:</strong></p>
+  </div>
+
+  <div class="spec">
+    <div class="spec-head"><span>large-v3 · unprompted</span><span>English retention 0 / 7 → 2 / 7 + 1 partial, free</span></div>
+    <div class="spec-row"><span class="spec-label">small</span><span class="spec-text">เดี๋ยว <span class="bad">ดิบโล้ย</span> ให้ก่อนนะ</span></div>
+    <div class="spec-row"><span class="spec-label">large-v3</span><span class="spec-text">เดี๋ยว <span class="ok">deploy</span> ให้ก่อนนะ <span class="gloss">— exactly right, no prompt</span></span></div>
+    <div class="spec-row"><span class="spec-label">small</span><span class="spec-text">ช่วย <span class="bad">เรฟาเทอร์ฟังชัน</span> นี้หน่อย</span></div>
+    <div class="spec-row"><span class="spec-label">large-v3</span><span class="spec-text">ช่วย <span class="ok">Refrater Function</span> นี้หน่อย <span class="gloss">— Latin script</span></span></div>
+  </div>
+
+  <div class="col">
+    <p>The <code>&lt;|th|&gt;</code> token is <strong>not a hard Latin-script ban</strong> — a large enough model crosses it unaided. This <em>strengthens</em> the local recommendation: Pathumma-Whisper-L3 and Typhoon-Whisper-L3 are both <code>large-v3</code> fine-tunes, so they inherit this before any Thai tuning.</p>
+
+    <p><strong>Correction 2 — the glossary is not monotonic. It can subtract.</strong> At <code>large-v3</code>, the same eight-word glossary <strong>regressed</strong> <code>refactor function</code> from correct Latin back into Thai script — with both words <em>in the glossary</em> — and <strong>deleted <code>meeting</code> entirely</strong>. It did recover all four of <code>commit, push, branch, main</code>. Replicated 3× per condition; both reproduce 3/3. Systematic, not noise.</p>
+    <p>Both model sizes land at 5/7 with the glossary — <strong>but not on the same five words.</strong> The glossary changes <em>which</em> terms survive, not reliably <em>how many</em>.</p>
+
+    <blockquote class="alert"><p><strong>A deleted word is worse than a transliterated one.</strong> Transliteration leaves a phonetic shadow a repair pass can use. Deletion leaves nothing — no repair layer can recover a word that was never emitted, and the user cannot see what is missing. <strong>Track deletion rate as a first-class metric alongside ETR.</strong></p></blockquote>
+
+    <p class="thesis">The primary lever is base-model scale. The glossary is a secondary, double-edged tool — evaluate it per term, never assume it helps.</p>
+    <p>Still an integration problem rather than a research frontier — but “just add a glossary” was too simple.</p>
+    <blockquote><p><strong>Caveats.</strong> Audio is synthetic (macOS <code>say -v Kanya</code>), so the <em>pattern</em> is the finding, not the absolute numbers. <code>initial_prompt</code> caps at 224 tokens, introduces spurious commas, and corrupted an adjacent Thai word (<span lang="th">ขึ้น</span>→<span lang="th">คืน</span>). One bonus result: <code>large-v3</code> was <strong>byte-stable across all 12 runs</strong> while <code>small</code> produced two different spellings of the same file — larger models are more <em>repeatable</em>, not merely more accurate.</p></blockquote>
+
+    <h3>Why the glossary is a moat, not a feature</h3>
+    <p>A glossary only helps if it holds <em>the right words for this utterance</em>. A desktop app knows what a cloud API cannot: the frontmost application, the current git branch names, identifiers in the open buffer, dependency names, and the user’s accepted corrections. That is a per-utterance, context-derived glossary — a moat mapped directly onto a measured mechanism.</p>
+  </div>
+</section>
+
+<section class="col">
+  <h2><span class="num">03</span>Why the gap persists</h2>
+  <p>Not an oversight. Four independent causes.</p>
+  <ul>
+    <li><strong>Whisper is architecturally biased against it — though not absolutely.</strong> “Whisper’s language and task tokens cannot explicitly direct the model to do code-switching ASR, with each language token only representing one language.” That claim is about what the token can be <em>directed</em> to do, and it stands — but a <code>large-v3</code> model crosses the barrier anyway, unprompted. So Whisper-based competitors inherit a <strong>handicap, not an impossibility</strong>, and <strong>the model size they ship decides how badly they suffer it.</strong> Superwhisper, MacWhisper, VoiceInk, Better Dictation, Spokenly and Handy all carry it — and several default to small models for speed.</li>
+    <li><strong>The cloud tier excludes Thai specifically.</strong> Deepgram’s code-switch model: 10 languages, Thai absent. AssemblyAI’s: 18 languages, Thai absent — Vietnamese is in. Speechmatics ran a deliberate Southeast Asia bilingual push, shipped Mandarin/Malay/Tamil/Tagalog-English, and <strong>skipped Thailand.</strong></li>
+    <li><strong>Academia has never looked.</strong> CS-FLEURS — 113 language pairs, including a 45-pair low-resource set — contains <strong>no Thai.</strong> A 127-paper review of code-switching ASR: “Thai receives no mention.” SEAME, the <em>South-East Asia</em> code-switching corpus, skips Thailand. <strong>No Thai-English code-switch speech corpus exists.</strong></li>
+    <li><strong>The Thai NLP community scores the fix as a defect.</strong> Typhoon2-Audio’s “Code-Switching” benchmark defines accuracy as: <em>“The response does not contain characters from other languages.”</em> A model scoring 100% <strong>never emits <code>deploy</code> in Latin script.</strong></li>
+  </ul>
+  <p class="thesis">The people who could fix this don’t speak Thai. The people who speak Thai are optimising a benchmark that punishes the fix.</p>
+  <blockquote><p><strong>But the clock is real.</strong> Wispr announced <strong>Canto</strong> alongside its $280M Series B — its first proprietary speech model, explicitly targeting “half the world [that] moves between languages… often inside a single sentence.” Their current docs still say the opposite. <strong>Window: roughly 18–24 months.</strong></p></blockquote>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="num">04</span>Architecture</h2>
+    <h3>Pick the ASR with a bake-off, not an argument</h3>
+  </div>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Path</th><th>Evidence</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr class="hi"><td><strong>Local Whisper, large-v3 class</strong><br><span class="gloss">Pathumma-Whisper-L3, Apache-2.0</span></td><td><span class="tag m">MEASURED</span> 2/7 unprompted; 5/7 with glossary, non-monotonic</td><td>Highest-confidence option, and the only one that <em>composes with the privacy moat</em>. <strong>Choose on base-model scale first</strong>, glossary second.</td></tr>
+        <tr><td><strong>Audio-native LLM</strong><br><span class="gloss">Gemini 3 Flash / Pro</span></td><td><span class="tag">3P</span> Thai CER 10.95 <em>(Pro only)</em></td><td>The only category where you can constrain <em>output script</em> by instruction rather than hope. $0.027–0.09 per audio-hour.</td></tr>
+        <tr><td><strong>Soniox <code>stt-rt-v5</code></strong></td><td><span class="tag u">MARKETING ONLY</span></td><td>The <em>only</em> vendor documenting Thai mid-sentence switching, with an example emitting <code>to-go</code> in Latin. Sub-200 ms. Zero published Thai WER — test day one.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col">
+    <p><strong>Do not build:</strong> two parallel ASR passes merged — Gladia published the number that kills it, <strong>13% → 41% WER</strong> intra-utterance on Spanish-English, the best-resourced pair on earth. Nor Typhoon ASR Realtime as primary: it is a Transducer, so it has <strong>no <code>initial_prompt</code> hook</strong> and the measured fix does not port.</p>
+    <blockquote><p><strong>Stale anchor corrected.</strong> Thonburian Whisper’s widely-cited 6.59% Thai WER was clean read speech. On the 2026 Thai leaderboard it ranks <strong>last of eight</strong>, at 18.96% CER on TVSpeech — the benchmark built from technical jargon and proper nouns, i.e. this exact workload.</p></blockquote>
+
+    <h3>The two moats nearly cancelled each other</h3>
+    <p>Every <em>local</em> Thai path is a single-language decoder. Apple’s <code>SpeechTranscriber</code> has no Thai at all; <code>SFSpeechRecognizer</code> is one locale per instance by construction; Whisper has one language token. So “your voice never leaves your laptop” and “we write your English words in English” looked mutually exclusive — until the glossary result rescued both.</p>
+    <p><strong>That is the load-bearing result of this report</strong> — and the revision strengthens it: a <code>large-v3</code>-class local model emits Latin-script inserts <em>unprompted</em>, so it now rests on model choice rather than a prompting trick. If it fails to replicate on real recorded speech, the two moats separate again and you must choose one.</p>
+
+    <h3>Apple’s free path is closed for Thai — which is itself a moat</h3>
+  </div>
+  <pre><strong>SpeechTranscriber.supportedLocales  = 30</strong>  de · en · es · fr · it · ja · ko · pt · yue · zh
+                                           <strong>THAI ABSENT</strong>
+<strong>SFSpeechRecognizer.supportedLocales = 63</strong>  th-TH present · supportsOnDevice = TRUE</pre>
+  <div class="col">
+    <p>This <strong>corrects a published blog claim</strong> that <code>SpeechTranscriber</code> covers Thai across ~34–42 locales. English-only competitors get a free, fast, private, zero-cost OS engine. <strong>For Thai, nobody does</strong> — everyone must ship their own model, which raises your cost and every competitor’s.</p>
+
+    <h3>Latency: two clocks, and one invisible bug</h3>
+    <p>Don’t stack Nielsen, Doherty and RAIL into one budget — they measure different things. The literature requires <em>acknowledgment</em> within 100 ms, not text. Text gets ≤500 ms as a stretch, ≤700 ms to stay competitive. Push-to-talk is the largest free win: it replaces a <em>speculative silence timeout</em> with a <em>deterministic finalize event</em>, and AssemblyAI’s default 1536 ms turn-silence alone blows a 700 ms budget by 2×.</p>
+    <blockquote class="alert"><p><strong>The trap.</strong> Push-to-talk only pays off if you <em>both</em> disable server-side turn detection <em>and</em> explicitly force-finalize on key release. Miss either and it silently degrades to voice-assistant latency. It doesn’t error — it just feels slow.</p></blockquote>
+    <p><span class="tag m">MEASURED</span> Mic warm-up on Apple Silicon: <strong>2,568 ms cold</strong> on first access, ~250 ms warm, <strong>68 ms</strong> for a kept-warm CoreAudio unit. Pre-warming is mandatory, not an optimisation.</p>
+
+    <h3>Text injection — and why Thai forces the clipboard</h3>
+    <p>Electron apps (VS Code, Slack, Notion) don’t build an accessibility tree, and the flag that would build it is itself broken — so clipboard paste is the only reliable route. Elevated Windows and password fields accept nothing at all; detect and say so.</p>
+    <p><span class="tag m">MEASURED</span> With the Thai Kedmanee layout active, synthetic keystroke injection <strong>re-translates virtual keycodes</strong> — Apple’s own docs concede frameworks “may ignore the Unicode string… and do their own translation.” Add an undocumented ~20-UTF-16-unit delivery limit: <strong>the first 20 Thai graphemes are 26 UTF-16 units</strong>, so naive chunking splits tone marks from their base consonants and produces visible mojibake.</p>
+
+    <h3>The second, quieter win</h3>
+    <ul>
+      <li><strong>“Auto-punctuate” in Thai means auto-<em>space</em>.</strong> Thai has no sentence period; the Royal Society publishes 22 numbered spacing rules, and a space is required at every Thai↔Latin boundary. Thai dictation users report the <em>words</em> come out roughly right and <strong>the spacing comes out wrong</strong> — which a cheap cleanup pass fixes. This may beat code-switching on perceived quality.</li>
+      <li><strong>Buddhist Era dates are the top silent-corruption risk.</strong> <span lang="th">พ.ศ. 2569</span> → <span lang="th">พ.ศ. 2026</span> looks well-formed and is wrong. Mask years before the model call.</li>
+      <li><strong>Word segmentation is free on macOS.</strong> <code>NLTokenizer</code> handles Thai correctly with no Python. This matters commercially: naive whitespace counting <strong>under-bills Thai users by 7.1×</strong>.</li>
+      <li><strong>The token tax is ~2.5× smaller than folklore.</strong> On <code>o200k</code> Thai costs only <strong>1.33–1.85×</strong> English, not the 4× commonly claimed. Free lever: Thai numerals <span lang="th">๒๕๖๙</span> cost 7 tokens versus 2 for <code>2569</code> — normalise first.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="num">05</span>Economics invert at a Thai price</h2>
+    <p>At <strong>$20/month</strong>, ASR cost is irrelevant — every credible provider clears 90% gross margin. At a Thai price point that conclusion <em>reverses</em>. Below: margins including the 19 free users each paid user carries at 5% conversion.</p>
+  </div>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Provider</th><th class="num">Paid</th><th class="num">+19 free</th><th class="num">Total</th><th class="num">GM @ ฿199</th><th class="num">GM @ ฿299</th><th class="num">GM @ $20</th></tr></thead>
+      <tbody>
+        <tr class="hi"><td><strong>Local</strong> (own model)</td><td class="num">$0.02</td><td class="num">$0.10</td><td class="num">$0.12</td><td class="num pos">98.0%</td><td class="num pos">98.7%</td><td class="num">99.4%</td></tr>
+        <tr class="hi"><td><strong>Groq</strong> whisper-turbo</td><td class="num">$0.20</td><td class="num">$0.84</td><td class="num">$1.03</td><td class="num pos">83.1%</td><td class="num pos">88.7%</td><td class="num">94.8%</td></tr>
+        <tr><td>AssemblyAI Streaming</td><td class="num">$0.67</td><td class="num">$2.84</td><td class="num">$3.52</td><td class="num">42.2%</td><td class="num">61.6%</td><td class="num">82.4%</td></tr>
+        <tr><td>Deepgram Flux</td><td class="num">$2.03</td><td class="num">$8.56</td><td class="num">$10.58</td><td class="num neg">−73.7%</td><td class="num neg">−15.6%</td><td class="num">47.1%</td></tr>
+        <tr><td>OpenAI live-transcribe</td><td class="num">$4.44</td><td class="num">$18.77</td><td class="num">$23.21</td><td class="num neg">−281%</td><td class="num neg">−154%</td><td class="num neg">−16.1%</td></tr>
+        <tr><td>Google Chirp <span class="gloss">(logging off)</span></td><td class="num">$6.26</td><td class="num">$26.46</td><td class="num">$32.72</td><td class="num neg">−437%</td><td class="num neg">−258%</td><td class="num neg">−63.6%</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col">
+    <p class="thesis">The free tier, not the paid user, is what kills you.</p>
+    <p>Providers that are comfortably profitable at $20 go deeply negative at ฿199. At Thai pricing the viable set is <strong>local inference or cheap batch inference — nothing else.</strong> A second, independent argument for the local path, arriving from a completely different direction than privacy.</p>
+    <p>Note the <strong>privacy premium</strong> too: Google charges +50% to turn data logging off, and Deepgram’s listed prices are tied to a programme under which it stores your audio to train on. Budget <strong>1.5–2×</strong> on any cloud quote where privacy is load-bearing. The headline prices are, for at least two major vendors, the <em>surveillance</em> price.</p>
+  </div>
+</section>
+
+<section class="col">
+  <h2><span class="num">06</span>The competitor, and the law</h2>
+  <p><strong>Wispr Flow is the real competitor, not Glaido</strong> — $280M Series B at $2B, 60 billion words written, “almost all of the Fortune 500”. Their exposed flank is privacy, and it is unusually wide:</p>
+  <ul>
+    <li><strong>Context Awareness is on by default and transmits a screenshot of your screen with each dictation.</strong></li>
+    <li>Audio and transcripts “may be used to evaluate, train, and improve Wispr’s models. <strong>This is the default for trial and standard accounts.</strong>”</li>
+    <li><strong>No on-device option exists at all.</strong> Their DPA lists 34 sub-processors, every one US-located.</li>
+    <li>SOC 2 Type II is claimed in marketing while their own security FAQ says it is “not yet issued”.</li>
+    <li>In late 2025 they were caught sending screenshots of active windows to the cloud — <strong>and banned the user who reported it.</strong></li>
+  </ul>
+  <p>Thailand’s PDPA turns that flank into a legal argument. Thailand has published <strong>no adequacy whitelist</strong>, so sending Thai voice abroad requires either standard contractual clauses with every foreign sub-processor, or consent obtained <em>after expressly warning the user the destination lacks adequate protection</em>. <strong>Local-only processing deletes that obligation entirely</strong> — no transfer occurs.</p>
+  <blockquote class="alert"><p><strong>A design decision with direct legal force: keep voiceprint and speaker-ID out of v1.</strong> Transcription without a speaker model is <em>ordinary</em> personal data. Add voice enrolment and you fall under §26 sensitive biometric data, requiring separate explicit consent.</p></blockquote>
+  <p><strong>On price:</strong> Wispr costs a Thai buyer ฿392–490/month — at or above Netflix Premium (฿419), Thailand’s most expensive mainstream subscription, for a typing accessory used by one person. But don’t treat that as structural: Wispr already charges <strong>₹400 (~฿137) in India and accepts UPI</strong>. Price against the ฿200–320 an income-tiered Wispr Thailand would plausibly charge — which keeps <strong>฿199–299/month plus a ฿2,900–3,900 lifetime tier</strong> viable. A one-time purchase is the one structure a subscription-native incumbent is least willing to match.</p>
+  <p>Only <strong>22.6% of Thai adults hold a credit card</strong>, while PromptPay has near-universal coverage and Stripe Thailand supports it natively. But note the B2B trap: you cannot issue a compliant <span lang="th">ใบกำกับภาษี</span> without VAT registration, and many Thai companies won’t buy without one. <strong>B2C self-serve is dramatically lower-friction — don’t chase Thai enterprise logos early.</strong></p>
+</section>
+
+<section class="col">
+  <h2><span class="num">07</span>The build sequence</h2>
+  <div class="step"><div class="step-n">STEP 0</div><div class="step-b"><p class="step-t">Record 20 utterances in your own voice <span class="cost">— ½ day</span></p><p class="step-d">Everything measured so far used synthetic speech. You are the target user. Highest leverage-to-cost step available, and it validates or kills the entire glossary finding.</p></div></div>
+  <div class="step"><div class="step-n">STEP 1</div><div class="step-b"><p class="step-t">Three-way bake-off <span class="cost">— 2 days · under $1</span></p><p class="step-d">Same clips through Soniox, Gemini 3 Flash <em>and</em> Pro, and Pathumma-Whisper + <code>initial_prompt</code>. Score every engine <strong>both with and without the glossary</strong> — prompting was measured to <em>subtract</em> at <code>large-v3</code>. Track ETR (English-Term Retention), <strong>deletion rate</strong>, and Thai CER. Plain WER is invalid for code-mixed text.</p></div></div>
+  <div class="step"><div class="step-n">STEP 2</div><div class="step-b"><p class="step-t">Benchmark the incumbents on identical clips <span class="cost">— ½ day · ~$15</span></p><p class="step-d">Wispr Flow, Monologue, Superwhisper. <strong>This decides the pitch.</strong> Clean consistent Latin inserts means the technology wedge is dead and this is a distribution business. Flip-flopping means you have a ten-second demo video.</p></div></div>
+  <div class="step"><div class="step-n">STEP 3</div><div class="step-b"><p class="step-t">Measure repair recoverability <em>blind</em> <span class="cost">— ½ day</span></p><p class="step-d">Strip ground truth, hand outputs to an LLM cold, score recovered / substituted / lost. The substituted-plus-lost fraction is the hard ceiling on any repair strategy.</p></div></div>
+  <div class="step"><div class="step-n">STEP 4</div><div class="step-b"><p class="step-t">Unblock the free Apple path <span class="cost">— 1 day</span></p><p class="step-d">Wrap the probe in an <code>.app</code> bundle with <code>NSSpeechRecognitionUsageDescription</code>, then test <code>SFSpeechRecognizer(th-TH)</code> with and without <code>contextualStrings</code>. Zero cost, zero download if it works.</p></div></div>
+  <div class="step"><div class="step-n">STEP 5</div><div class="step-b"><p class="step-t">Build the glossary engine <span class="cost">— 1 week</span></p><p class="step-d"><strong>This is the moat.</strong> Per-utterance English glossary from frontmost app, git branch names, open-buffer identifiers, dependency names and accepted corrections. 224-token budget, English only, rotated by context. Because prompting can regress <em>or delete</em> terms, this needs a <strong>per-term A/B harness</strong>, not a static word list.</p></div></div>
+</section>
+
+<section class="col">
+  <h2><span class="num">08</span>Honest risks</h2>
+  <ul>
+    <li><strong>Wispr’s Canto is aimed directly at this.</strong> An 18–24 month window, not an open field.</li>
+    <li><strong>You’d be entering behind on Thai</strong> — Wispr already has Thai TikTok reviews and Thai Facebook coverage.</li>
+    <li><strong>The dominant Thai code-mixing pattern is lexical insertion</strong> — English nouns in Thai syntax — which is the case Wispr’s docs claim it <em>does</em> handle. The surviving gap is output <em>script</em>, not capability. Step 2 confirms or kills this.</li>
+    <li><strong>The market is thin.</strong> Thai average wage ฿15,316/month; Thailand shows 195 iOS ratings against India’s 2,572. Realistic scale is a <strong>฿10–50M/year local software business</strong>, not a venture outcome.</li>
+    <li><strong>The leader is commoditising the category</strong> — Wispr’s free tier now includes 100+ languages and a notetaker. Selling “better dictation” means competing with free.</li>
+  </ul>
+</section>
+
+<section class="col">
+  <h2><span class="num">09</span>What I could not verify</h2>
+  <ul>
+    <li><strong>Real-voice replication of the scale and glossary results.</strong> All audio was synthetic. This is Step 0.</li>
+    <li><strong>Whether Pathumma / Typhoon Whisper inherit <code>large-v3</code>’s unprompted Latin-script behaviour.</strong> Inferred from shared lineage, not measured on those models.</li>
+    <li><strong>Soniox’s Thai quality.</strong> Vendor marketing only; zero published Thai WER.</li>
+    <li><strong>Gemini’s Thai accuracy at the Flash tier.</strong> The cheap pricing is Flash; the only Thai benchmark is <em>Pro</em>. These do not currently meet.</li>
+    <li><strong>Whether an audio LLM actually obeys a script-constraining instruction for Thai.</strong> No vendor documents it — and it is the crux of the top recommendation.</li>
+    <li><strong>Deepgram’s opt-out discount</strong> — whether declining data-training forfeits ~50%. Ask in writing.</li>
+    <li><strong>Windows AI Speech Recognition’s language list.</strong> Microsoft publishes none. If Thai is absent, Windows mirrors macOS.</li>
+    <li><strong>Reddit</strong> was unreachable from the research environment.</li>
+  </ul>
+</section>
+
+<footer class="col">
+  <p>Compiled from ten parallel research briefs with per-claim sourcing, preserved alongside this report. Measurements were run on macOS 26.5.1 (build 25F80), Apple Silicon, 24 August 2026. Product names and quoted material belong to their respective owners; this is independent analysis, not affiliated with or endorsed by any company named.</p>
+</footer>
+
+</div>

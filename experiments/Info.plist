@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>local.research.thaiasr</string>
+  <key>CFBundleName</key><string>thaiASR</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Local research probe: measuring Thai/English code-switching accuracy on pre-recorded test audio files.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Not used; required key only.</string>
+</dict>
+</plist>
