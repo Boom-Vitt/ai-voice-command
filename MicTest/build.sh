@@ -17,6 +17,7 @@ SRC=Sources/MicTest
 APP="${1:-$HOME/Desktop/MicTest.app}"
 SDK="$(xcrun --show-sdk-path --sdk macosx)"
 ENTITLEMENTS="$SRC/MicTest.entitlements"
+ICON="$SRC/MicTest.icns"
 
 # ---------------------------------------------------------------------------
 # Signing identity -- resolved FIRST, before anything is compiled or deleted.
@@ -72,6 +73,17 @@ if ! compgen -G "$SRC/*.swift" > /dev/null; then
   exit 1
 fi
 
+# Same reason the Swift preflight is up here: checked BEFORE the build starts
+# removing things. The icon is copied in during bundle assembly, which is after
+# `rm -rf "$APP"`, so a missing .icns discovered there would abort with the old
+# app already deleted and the new one half-built -- a bundle that looks installed
+# and has no icon. The .icns is committed; tools/make-icon.py regenerates it.
+if [ ! -f "$ICON" ]; then
+  echo "✗ missing app icon: $ICON" >&2
+  echo "  Regenerate it with: python3 tools/make-icon.py $ICON" >&2
+  exit 1
+fi
+
 echo "› compiling"
 rm -rf build && mkdir -p build
 # main.swift uses top-level code as its entry point, so it must NEVER be
@@ -84,6 +96,10 @@ echo "› assembling bundle"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp build/MicTest "$APP/Contents/MacOS/MicTest"
+# Resources/ is covered by the code signature, so the icon has to be in place
+# BEFORE the codesign call below -- adding a file to a signed bundle invalidates
+# it, and `codesign --verify` would then fail and delete $APP.
+cp "$ICON" "$APP/Contents/Resources/MicTest.icns"
 
 # LSUIElement=true makes this an agent app: no Dock icon, no app switcher entry,
 # and -- critically for dictation -- showing the HUD cannot steal keyboard focus
@@ -96,6 +112,15 @@ cp build/MicTest "$APP/Contents/MacOS/MicTest"
 # prompt for kTCCServiceSpeechRecognition at all, so on-device recognition is
 # hard-denied and the app produces no live text with no visible reason.
 # NSMicrophoneUsageDescription stays: the audio engine still needs it.
+#
+# CFBundleIconFile names Resources/MicTest.icns; the extension is optional and
+# omitted by convention. Because LSUIElement hides the Dock icon, this is not
+# decoration -- Finder, Get Info, the Force Quit window, Login Items and the
+# Microphone/Accessibility panes of System Settings are the ONLY places the user
+# ever sees this app pictured, and those permission panes are exactly where a
+# blank generic icon costs a grant. Deliberately NOT CFBundleIconName: that key
+# resolves against an asset catalog (Assets.car), which this hand-assembled
+# bundle does not have, so it would name nothing.
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -104,6 +129,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>MicTest</string>
   <key>CFBundleIdentifier</key><string>com.boombignose.mictest</string>
   <key>CFBundleExecutable</key><string>MicTest</string>
+  <key>CFBundleIconFile</key><string>MicTest</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>

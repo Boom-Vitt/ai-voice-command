@@ -421,15 +421,47 @@ final class FlushRequestBox: @unchecked Sendable {
 /// CAVEAT, the cloud fields: `finishCapture` deliberately does NOT cancel `cloudTask` —
 /// the cloud pass answering after the key is released is the entire point of it. A round
 /// trip that lands after the "capture stopped" line has already printed is therefore
-/// missing from that line, and if the user has started the next capture in the meantime it
-/// is counted into that capture's bucket instead. (`applyCloudResult`/`applyCloudFailure`
-/// discard results whose generation is stale, so the misattribution window is the narrow
-/// same-generation one, not the whole round trip.) Read the per-capture cloud fields as a
-/// LOWER BOUND; `lifetime` is the exact count. `secureInputRefusals` shares the caveat and
-/// is easy to miss doing it: one of its two increment sites is the live injection path, but
-/// the other is `applyCloudResult` refusing to auto-apply into a secure field, which runs on
-/// the same late hop as the cloud fields. Everything else here is incremented on the main
-/// actor while the capture is still live and is exact.
+/// missing from that line.
+///
+/// THIS CAVEAT USED TO BE WRONG IN BOTH DIRECTIONS (review finding), and the correction is
+/// in the file rather than in a commit message because "read `lifetime` as the exact count"
+/// is the same species of lie as the 17:54 line above: an instrument certifying a number it
+/// does not measure. What it claimed was that a late result lands in the NEXT capture's
+/// bucket, and that `lifetime` was exact. What the code does:
+///
+///   - The misattribution it warned about CANNOT happen. `beginCapture` bumps
+///     `captureGeneration` before any late MainActor hop can run, so by the time a next
+///     capture exists to be mis-credited, the `generation == captureGeneration` guards in
+///     `applyCloudResult` and `applyCloudFailure` have already failed.
+///
+///   - `lifetime` under-counts for exactly that reason. Those guards `return` ahead of BOTH
+///     increments — `if !cancelled { lifetime.cloudErrors += 1; thisCapture.cloudErrors += 1 }`
+///     never runs — so a round trip the user out-ran by releasing and pressing again is
+///     counted nowhere at all. `AUTOSTART CLOUD SUMMARY` can honestly print
+///     `sent=3 applied=0 unapplied=0 errors=0` while three results came back and were
+///     discarded by design.
+///
+/// So: read EVERY cloud field, per-capture and lifetime alike, as a LOWER BOUND on results
+/// that came back. `cloudSent` is the exception and the one number to anchor on:
+/// `registerCloudTask` increments it on the dispatch hop, on the main actor, while the
+/// capture is still live. `cloudSkipped` is outside the arithmetic entirely — both of its
+/// increment sites are in `noteFinalChunk`'s gate, counting utterances that were never sent.
+///
+/// What `sent` minus (`applied` + `unapplied` + `errors`) counts is round trips that
+/// answered into nothing, and that is TWO populations, not one: the ones the
+/// generation/utterance guards discarded, AND the ones `applyCloudFailure` saw with
+/// `cancelled == true`, which pass the guards and then deliberately increment nothing (a
+/// request we cancelled ourselves is not a cloud error — `noteFinalChunk`'s supersede
+/// branch says the same thing from the other end). So the difference is a floor on "answers
+/// thrown away", not a measurement of staleness; do not quote it as one.
+/// The discards are not invisible, but they are not
+/// symmetrical either: `applyCloudResult` traces "superseded … discarded" on its way out
+/// while `applyCloudFailure` returns silently, so a discarded FAILURE leaves no mark
+/// anywhere in the trace. `secureInputRefusals` shares the caveat and is easy to miss doing
+/// it: one of its two increment sites is the live injection path, but the other is
+/// `applyCloudResult` refusing to auto-apply into a secure field, which runs on the same
+/// late hop as the cloud fields. Everything else here is incremented on the main actor
+/// while the capture is still live and is exact.
 private struct TraceCounters {
     var partialsSeen = 0
     /// Partials skipped by tickUI because a newer partial arrived on the same tick.
@@ -437,7 +469,19 @@ private struct TraceCounters {
     var finalsSeen = 0
     var injectedChars = 0
     var injectFailures = 0
-    var divergences = 0
+    /// Non-extension partials (revision, word merge, retraction) where the stale tail was
+    /// successfully deleted and retyped in the document.
+    ///
+    /// This replaces a single `divergences` field, which was renamed rather than kept
+    /// because its old readings were worthless and a reader must not carry them forward:
+    /// `repairDivergence` had no call sites, so `divergences=0` across all 4029 field trace
+    /// lines meant "the code cannot run", not "no divergence occurred". Two names that did
+    /// not exist before make that discontinuity impossible to miss in a grep.
+    var divergencesRepaired = 0
+    /// Non-extension partials where `replaceLastInserted` REFUSED and the document was
+    /// deliberately left untouched. This is the number that matters when judging whether
+    /// the focused app can host live revision at all.
+    var divergencesRefused = 0
     var secureInputRefusals = 0
     var finalChunks = 0
     var cloudSent = 0
@@ -557,6 +601,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// after launch is never blocked.
     private var lastDaemonKillAt = Date.distantPast
 
+    /// Rate limiter for tier 3's DETECTOR line, deliberately a separate stamp from
+    /// `lastDaemonKillAt` and deliberately the same 120 s. Stamping the kill's own limiter
+    /// from the detector would both claim a kill that never happened and change
+    /// `tier3Armed`'s second condition, which is exactly what the "acts on nothing" promise
+    /// in that branch forbids. Same interval, though, because with the toggle ON the kill
+    /// can fire at most once per two minutes: one line per 120 s is one line per
+    /// counterfactual kill, which is the quantity a human re-litigating the default wants
+    /// to count. Only ever written on the toggle-OFF path, so the ON path is untouched.
+    private var lastTier3WouldFireLoggedAt = Date.distantPast
+
     /// The room's measured noise floor, in the same RMS units the tap stores, tracked
     /// asymmetrically over the 1 Hz `tickStatus` samples. It is what decides which samples
     /// count as speech — see `speechThreshold`.
@@ -612,17 +666,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// deliberately does not clear it: that continues the same engine session in the same
     /// room, exactly as it continues the same `frames` count.
     ///
-    /// Seeded from the first NON-ZERO sample, and the non-zero part is load-bearing:
-    /// `beginCapture` calls `levelBox.reset()`, so a tick landing before the tap has stored
-    /// anything reads exactly 0. Seeding 0 would put `speechThreshold` back on
-    /// `absoluteQuietFloor` — the old broken constant — and the 0.005 rise then needs 81
-    /// ticks at this room's 0.003 ambient to climb out of it: it would reproduce the exact
-    /// bug this tracker replaces for the first ~1.4 minutes of EVERY capture, which is
-    /// longer than most of them. Seeding from a live sample can only
-    /// OVER-estimate (if the user is already talking on tick one), which is the safe
-    /// direction — it makes the watchdog harder to arm — and the 0.1 fall rate settles it
-    /// within seconds anyway.
+    /// Seeded from the first sample AT OR ABOVE `absoluteQuietFloor`, and the lower bound
+    /// is load-bearing: `beginCapture` calls `levelBox.reset()`, so a tick landing before
+    /// the tap has stored anything reads exactly 0. Seeding 0 would put `speechThreshold`
+    /// back on `absoluteQuietFloor` — the old broken constant — and the 0.005 rise then
+    /// needs 81 ticks at this room's 0.003 ambient before the threshold climbs back up to
+    /// the ambient itself: it would reproduce the exact bug this tracker replaces for the
+    /// first ~1.4 minutes of EVERY capture, which is longer than most of them.
+    ///
+    /// The bound used to be `> 0`, which admits ANY positive value and therefore admits the
+    /// same failure by a different route (review finding). A fade-in or route-switch
+    /// artifact — Bluetooth, AirPods, an aggregate device coming up — delivers samples
+    /// around 3e-4, three orders of magnitude under speech and an order under this room's
+    /// ambient. Seeding there pins `speechThreshold` to `absoluteQuietFloor` exactly as
+    /// seeding 0 does, and the same arithmetic (both counts recomputed from the 0.005 rise
+    /// against a 0.003 ambient, same criterion) says it takes 60 ticks — a full minute of
+    /// the old bug — to climb out. `absoluteQuietFloor` is the natural bound because it is
+    /// already the value below which the gate refuses to trust a measured floor at all.
+    ///
+    /// A room whose ambient never reaches 0.0025 therefore never seeds, `noiseFloor` stays
+    /// 0, and `speechThreshold` rides `absoluteQuietFloor` for the whole capture. That is
+    /// the DESIGNED resting state, not a missed seed — it is precisely what that constant
+    /// is documented to be for — so do not "fix" it by lowering this bound. The sustained
+    /// `rms == 0` case is the same state and is safe for the same reason.
+    ///
+    /// Seeding from a live sample can only OVER-estimate (if the user is already talking on
+    /// tick one), which is the safe direction — it makes the watchdog harder to arm — and
+    /// the 0.1 fall rate settles it within seconds anyway.
     private var noiseFloorSeeded = false
+
+    /// One `NOISE FLOOR: non-finite RMS sample` line per capture, not one per tick. See the
+    /// rejection branch in `tickStatus`: the condition can persist for a whole capture, and
+    /// a 1 Hz flood in the trace file would bury the ladder lines it is meant to be read
+    /// beside. Cleared with the floor itself in `beginCapture`'s full-start path.
+    private var nonFiniteRMSTracedThisCapture = false
 
     /// Floor under the floor. This is the ORIGINAL fixed loud-tick threshold and it survives
     /// on purpose — it is not leftover dead code. In a near-silent room the measured
@@ -657,9 +734,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// round climbed all three tiers and killed a system service twice without one line
     /// anywhere recording what the gate had measured; this is the fix for that, and it is a
     /// requirement of the design, not a convenience.
-    private func levelTrace(_ rms: Float) -> String {
-        String(format: "rms=%.5f floor=%.5f thr=%.5f",
-               Double(rms), Double(noiseFloor), Double(speechThreshold))
+    ///
+    /// `floor` prints `(never measured)` rather than `0.00000` when the tracker has not
+    /// seeded (review finding): those are different facts and only one of them is a
+    /// measurement. A capture shorter than one `tickStatus` tick used to render the second
+    /// as the first — `floor=0.00000 thr=0.00250` reads as "the room measured silent" when
+    /// nothing was ever sampled. `thr` stays numeric in that state on purpose: whatever the
+    /// floor's provenance, `absoluteQuietFloor` is genuinely the threshold the gate used.
+    ///
+    /// `loudTicks` is the strike's EVIDENCE and is passed only by the watchdog ladder — see
+    /// the capture at the top of the strike branch in `tickStatus` for why it has to be read
+    /// before the counter is zeroed, and why the label spells out that it is history rather
+    /// than a reading from this tick.
+    private func levelTrace(_ rms: Float, loudTicks: Int? = nil) -> String {
+        let floorPart = noiseFloorSeeded
+            ? String(format: "floor=%.5f", Double(noiseFloor))
+            : "floor=(never measured)"
+        let ticksPart = loudTicks.map {
+            " loudTicksSinceEvent=\($0) (accumulated since the last recogniser event; the "
+                + "rms above is this tick alone and is routinely below thr on a firing tick)"
+        } ?? ""
+        return String(format: "rms=%.5f ", Double(rms))
+            + floorPart
+            + String(format: " thr=%.5f", Double(speechThreshold))
+            + ticksPart
     }
 
     /// The last error the Speech service delivered to this process, formatted for the trace.
@@ -684,11 +782,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Authoritative "the user wants to be dictating right now".
     ///
-    /// `onPressStart` runs synchronously inside the CGEventTap callback and spends the tap's
-    /// own latency budget — a slow callback is what makes the system post
-    /// `.tapDisabledByTimeout` and kill the tap. So the press handler does exactly one thing
-    /// (set this flag, a plain property write) and defers everything heavy. `onPressEnd`
-    /// already runs from a deferred main-queue block, so it may act immediately.
+    /// `onPressStart` is delivered from HotkeyMonitor's deferred main-queue release, not
+    /// from inside the CGEventTap callback (it moved there when chord rejection forced the
+    /// verdict to the key-up edge). It still does exactly one thing — set this flag — and
+    /// defers everything heavy, because the ~110 ms release grace is already spent before
+    /// the user hears anything happen. `onPressEnd` is never fired at all.
     ///
     /// Because both handlers write this flag and then ask `syncDictation()` to reconcile,
     /// the result is order-independent: even if the deferred begin were to land after the
@@ -931,6 +1029,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wireHUD()
         wireRecognizer()
         wireHotkey()
+        wireSystemStateObservers()
 
         // The HUD comes up idle rather than hidden, and stays that way: see the header. This
         // is the affordance that survives a status item hiding behind the notch.
@@ -1262,20 +1361,131 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Right-Option once to start dictating, tap again to stop. The release edge is
         // ignored entirely.
         //
-        // LATENCY CONTRACT: this body runs synchronously inside the CGEventTap callback and
-        // spends the tap's own budget. It does one property write and one deferred hop —
-        // nothing that allocates, starts an audio engine, or lays out a window. Violating
-        // this gets the tap killed with .tapDisabledByTimeout, which presents as "dictation
-        // randomly stopped working" rather than as a crash.
+        // WHERE THIS RUNS — changed 2026-08-27, read before moving work in here.
+        // This no longer runs inside the CGEventTap callback. Chord rejection made
+        // down-edge delivery impossible: whether a press is a hotkey tap or the Option
+        // half of Option+Left is not knowable until the key comes back UP, and a toggle
+        // cannot be taken back once the engine is running and text has been typed. So
+        // HotkeyMonitor snapshots the verdict at key-up and fires this from its deferred
+        // release on the main queue — roughly 110 ms later than the old behaviour. The
+        // tap's own latency budget therefore no longer binds this closure.
+        //
+        // Keep it small anyway. That 110 ms already sits between the user's tap and the
+        // first frame of audio; anything slow added here lands on top of it and presents
+        // as "the hotkey feels laggy".
         hotkey.onPressStart = { [weak self] in
             guard let self else { return }
             self.wantsDictation.toggle()
             Task { @MainActor [weak self] in self?.syncDictation() }
         }
 
-        // Toggle mode: the key-up edge means nothing. (Kept as an explicit no-op rather
-        // than left unassigned so nobody re-wires the old hold behaviour by accident.)
+        // Toggle mode: the key-up edge means nothing, and since 2026-08-27 HotkeyMonitor
+        // does not fire this at all — the up-edge is where the chord verdict is decided and
+        // where `onPressStart` is now delivered from. Kept assigned rather than left nil so
+        // that anyone re-wiring hold-to-talk has to read why it is dead first.
         hotkey.onPressEnd = { }
+
+        // ── The off-switch died while the microphone was live ────────────────────────
+        //
+        // Toggle mode is what makes this reachable. All four of the monitor's stuck-on
+        // defences (`synthesizeReleaseIfHolding`, `maxHoldDuration`, the state poll,
+        // `onPressEnd`) are gated on `isHolding`, which in toggle mode is true only for
+        // the ~100 ms a physical tap is down — so every one of them is inert here. Lock
+        // the screen or click a password field and Secure Event Input kills every session
+        // event tap: `wantsDictation` stays true, `endCapture` is never called, the
+        // microphone keeps recording, and the ONLY remaining off-switch is the hotkey,
+        // dead for exactly the same reason.
+        //
+        // `onHotkeyUnusable` fires once per transition into that state (not per poll), on
+        // the main actor. Treat it as an emergency stop, not a graceful release.
+        hotkey.onHotkeyUnusable = { [weak self] in
+            guard let self else { return }
+            self.stopBecauseOffSwitchIsUnreachable(
+                why: "hotkey tap is unusable — Secure Event Input or a tap that could not be reinstalled",
+                message: "Dictation stopped: MicTest can no longer see \(defaultHotkeyName). "
+                    + "Secure input (a password field, the lock screen, or Terminal secure entry) "
+                    + "shuts off every event tap, and the hotkey is the only way to stop "
+                    + "recording — so the microphone was switched off rather than left live "
+                    + "with no way to turn it off.")
+        }
+    }
+
+    /// System-state observers that exist for exactly one reason: **the microphone must
+    /// never outlive the user's ability to turn it off.**
+    ///
+    /// The event tap dies for reasons this app cannot see and is never told about — Secure
+    /// Event Input taken by another process, the login window, a tap disabled by timeout
+    /// that fails to reinstall. Sleep and screen-lock are the two transitions where that is
+    /// most likely AND where a live microphone is least excusable, and they are observable
+    /// directly rather than inferred, so observe them directly. There were no
+    /// `willSleep`/`screenIsLocked` observers anywhere in this project before this build.
+    ///
+    /// Selector-based, not closure-based, for the same reason the timers in
+    /// `applicationDidFinishLaunching` are: it keeps us clear of `@Sendable`-closure
+    /// capture questions under `-swift-version 6`. Never unregistered — this delegate lives
+    /// for the whole process, and `DistributedNotificationCenter` does not clean up after a
+    /// deallocated observer the way `NotificationCenter` does, so an observer with a
+    /// shorter life than the app would be a dangling-pointer bug, not a leak.
+    private func wireSystemStateObservers() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(systemWillSleep),
+            name: NSWorkspace.willSleepNotification, object: nil)
+
+        // Not an AppKit constant: screen lock/unlock is only published on the DISTRIBUTED
+        // centre, by name, and only while a session is active.
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(screenWasLocked),
+            name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+
+        trace("system-state observers: willSleep + com.apple.screenIsLocked armed "
+            + "(microphone must not outlive the ability to stop it)")
+    }
+
+    @objc private func systemWillSleep(_ note: Notification) {
+        stopBecauseOffSwitchIsUnreachable(
+            why: "the Mac is going to sleep",
+            message: "Dictation stopped because the Mac is going to sleep.")
+    }
+
+    @objc private func screenWasLocked(_ note: Notification) {
+        stopBecauseOffSwitchIsUnreachable(
+            why: "the screen was locked",
+            message: "Dictation stopped because the screen was locked. The lock screen takes "
+                + "Secure Event Input, which kills the hotkey — leaving the microphone live "
+                + "with no way to stop it.")
+    }
+
+    /// Emergency stop: something removed the user's ability to turn the microphone off.
+    ///
+    /// Deliberately NOT `endCapture` + release drain. The drain exists to catch the tail of
+    /// speech after a deliberate key release; here nothing was released, the user may not
+    /// even be at the machine, and the correct latency for "the microphone is live and
+    /// unstoppable" is zero. `finishCapture` is the full synchronous teardown and it
+    /// invalidates any drain already in flight.
+    ///
+    /// ORDERING IS LOAD-BEARING, and it is the same order `fail()` documents:
+    ///   1. `wantsDictation = false` FIRST, or the self-heal `syncDictation()` at the end
+    ///      of `finishCapture` reads it as still-true and starts a fresh session — the
+    ///      exact stuck-microphone this function exists to prevent;
+    ///   2. teardown;
+    ///   3. the HUD error LAST, because `finishCapture` calls `showIdleHUD()` on its way
+    ///      out and would otherwise overwrite the explanation seconds later. A microphone
+    ///      that switched itself off without saying why is its own bug.
+    private func stopBecauseOffSwitchIsUnreachable(why: String, message: String) {
+        let wasLive = isCapturing || drainTimer != nil
+        // Trace unconditionally: "the hotkey died while idle" is a real diagnosis too, and
+        // it is the line that explains why the next tap does nothing.
+        trace("OFF-SWITCH LOST: \(why) — wantsDictation=\(wantsDictation) "
+            + "isCapturing=\(isCapturing) hotkeyHealthy=\(hotkey.isHealthy)"
+            + (wasLive || wantsDictation ? "; stopping capture" : "; nothing was live"))
+        guard wasLive || wantsDictation else { return }
+
+        wantsDictation = false
+        if wasLive { finishCapture(reason: "off-switch lost: \(why)") }
+        lastOutcome = "Dictation stopped — \(why)"
+        hud.set(.error(message))
+        hud.show()
+        refreshMenu()
     }
 
     /// Reconcile actual state with `wantsDictation`. Idempotent and order-independent — see
@@ -1408,10 +1618,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // only. The drain-cancel resume at the top of this method returns long before here
         // and keeps the floor it has already measured, which is correct: it continues the
         // SAME engine session in the same room, exactly as it continues the same `frames`
-        // count. Re-seeding happens on the first `tickStatus` that reads a non-zero sample;
-        // see `noiseFloorSeeded` for why non-zero matters.
+        // count. Re-seeding happens on the first `tickStatus` sample that reaches
+        // `absoluteQuietFloor`; see `noiseFloorSeeded` for why the bound is that and not
+        // merely non-zero, and for why a room quieter than it never seeds at all.
         noiseFloor = 0
         noiseFloorSeeded = false
+        nonFiniteRMSTracedThisCapture = false
 
         do {
             try recognizer.start()
@@ -1582,15 +1794,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // other, never floating between them.
         //
         // `rms`/`floor`/`thr` sit in the per-capture group beside `frames` because that is
-        // what they are: the room as this capture last measured it, from the same
-        // `levelBox.read()` on the same line. `beginCapture` clears the floor on the next
-        // full start, so what prints here is never a previous capture's room. They are here
-        // so that a session that ended badly can be read against what the speech gate
-        // actually saw, without needing a watchdog line to have fired at all.
+        // what they are: the room as this capture last measured it. `beginCapture` clears
+        // the floor on the next full start, so what prints here is never a previous
+        // capture's room. They are here so that a session that ended badly can be read
+        // against what the speech gate actually saw, without needing a watchdog line to
+        // have fired at all.
+        //
+        // THEY ARE NOT COHERENT WITH EACH OTHER, and the previous version of this comment
+        // asserted that they were — "from the same `levelBox.read()` on the same line"
+        // (review finding). Only `rms` comes from the read above. `floor` and `thr` are
+        // whatever the last `tickStatus` left behind, so they are up to one tick — 1 s —
+        // older than the `rms` beside them, and for a capture shorter than one tick they
+        // were never measured at all. Recomputing them here would be worse than the
+        // staleness: the tracker's coefficients (0.1 fall / 0.005 rise, derived on
+        // `noiseFloor`) are calibrated to the 1 Hz tick cadence, so folding an extra
+        // out-of-band sample in at teardown would perturb the very time constants the
+        // printed numbers exist to let a reader reason about. So: leave them stale by one
+        // tick, say so here, and let `levelTrace` print `floor=(never measured)` instead of
+        // rendering "never sampled" as `floor=0.00000`.
         trace("capture stopped (\(reason)); frames=\(frames) \(levelTrace(rms)) "
             + "partials=\(thisCapture.partialsSeen) coalesced=\(thisCapture.partialsCoalesced) "
             + "finals=\(thisCapture.finalsSeen) injectedChars=\(thisCapture.injectedChars) "
-            + "divergences=\(thisCapture.divergences) "
+            + "divergencesRepaired=\(thisCapture.divergencesRepaired) "
+            + "divergencesRefused=\(thisCapture.divergencesRefused) "
             + "injectFailures=\(thisCapture.injectFailures) "
             + "secureInputRefusals=\(thisCapture.secureInputRefusals) "
             + "finalChunks=\(thisCapture.finalChunks) cloudSent=\(thisCapture.cloudSent) "
@@ -1600,8 +1826,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "  [lifetime: sessions=\(sessions) partials=\(lifetime.partialsSeen) "
             + "coalesced=\(lifetime.partialsCoalesced) finals=\(lifetime.finalsSeen) "
             + "injectedChars=\(lifetime.injectedChars) "
+            + "divergencesRepaired=\(lifetime.divergencesRepaired) "
+            + "divergencesRefused=\(lifetime.divergencesRefused) "
             + "injectFailures=\(lifetime.injectFailures) "
-            + "divergences=\(lifetime.divergences) "
             + "secureInputRefusals=\(lifetime.secureInputRefusals) "
             + "finalChunks=\(lifetime.finalChunks) cloudSent=\(lifetime.cloudSent) "
             + "cloudApplied=\(lifetime.cloudApplied) "
@@ -1804,8 +2031,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // runs only while capturing; the `else` branch at the bottom of this method
             // deliberately leaves the value alone so `finishCapture` can still print the
             // room as it was at teardown.
-            if !noiseFloorSeeded {
-                if rms > 0 {
+            //
+            // A NON-FINITE SAMPLE IS REJECTED BEFORE IT REACHES THE FLOOR, and that branch
+            // is verified arithmetic rather than defensive decoration (review finding).
+            // Checked in Swift: `Float.infinity + 0.1 * (0.003 - .infinity)` is NaN after
+            // ONE fall step, and a NaN floor is permanent — `rms < noiseFloor` is false for
+            // every finite sample, so the else-branch below folds NaN into NaN forever, and
+            // `max(Float(0.0025), Float.nan * 3.0)` returns 0.0025 because `y >= x` is false
+            // for NaN. The gate would silently revert to the exact broken constant this
+            // tracker replaced, for the rest of the capture: only `beginCapture`'s full
+            // start clears it. The source is a virtual/aggregate device handing the tap
+            // garbage; a 0/0 of our own making is not possible, `processTap` already guards
+            // `frameCount > 0`. Logged, not swallowed — the line carries `levelTrace`, so
+            // the poisoned value prints as `rms=nan` — but once per capture, because a 1 Hz
+            // flood in the trace is its own defect.
+            if !rms.isFinite {
+                if !nonFiniteRMSTracedThisCapture {
+                    nonFiniteRMSTracedThisCapture = true
+                    trace("NOISE FLOOR: non-finite RMS sample from the tap (\(levelTrace(rms))); "
+                        + "rejected from the floor and the speech gate — a virtual or "
+                        + "aggregate input device is delivering garbage. Logged once per capture.")
+                }
+            } else if !noiseFloorSeeded {
+                // The bound is `absoluteQuietFloor`, not `> 0`: any positive value would
+                // let a ~3e-4 route-switch artifact seed the floor and pin the threshold to
+                // the old broken constant for 60 ticks. See `noiseFloorSeeded`.
+                if rms >= Self.absoluteQuietFloor {
                     noiseFloor = rms
                     noiseFloorSeeded = true
                 }
@@ -1814,7 +2065,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 noiseFloor += Self.noiseFloorRise * (rms - noiseFloor)
             }
-            if rms > speechThreshold { loudTicksSinceRecognizerEvent += 1 }
+            // `isFinite` again rather than leaning on the chain above: `nan > thr` is false
+            // and harmless, but `+inf > thr` is TRUE, and three of those would arm the whole
+            // ladder off samples that never described a room.
+            if rms.isFinite, rms > speechThreshold { loudTicksSinceRecognizerEvent += 1 }
             let heardSpeechSinceSilence = loudTicksSinceRecognizerEvent >= 3
             // B2 fix (review finding): suppressed bounces every ~7 s for 70 s got this
             // process THROTTLED by the Speech service (kAFAssistantErrorDomain 1107 in the
@@ -1823,14 +2077,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // further attempt doubles the required silence window: 6 -> 12 -> 24 -> 48 s
             // (capped). Tier 3 fires on the 2nd suppressed bounce regardless, so real
             // systemic wedges still resolve fast; only the hopeless churn slows down.
-            let bounceBackoff: Double = min(48, 6 * pow(2, Double(min(suppressedBouncesSinceRestart, 3))))
+            //
+            // THE CEILING IS 12 s WHILE TIER 3 IS ONLY OBSERVING, and it has to be, because
+            // above the rotation cadence this whole ladder switches itself off (review
+            // finding). `suppressedBouncesSinceRestart` resets in exactly three places — a
+            // real partial, a deliberate stop, tier 3's own success — and with the toggle
+            // OFF none of them happen while a wedge persists, so the count ratchets
+            // monotonically and pins the backoff at 48 s. Meanwhile `LiveRecognizer` keeps
+            // stamping `lastRecognizerEventAt` right through a total wedge: `emitState` is
+            // local and needs no answer from the Speech service, so the 20 s rotation, its
+            // 6 s overlap fallback and the 2 s promote land events at +26/+28 and every 20 s
+            // after. The largest event-free window the guard below can EVER observe is 26 s
+            // straight after a restart and 18 s once the schedule settles. At 48 s the guard
+            // is unsatisfiable forever — and it takes tiers 1 and 2 down with it, so turning
+            // tier 3 off also disabled the cheap recovery that works and the evidence
+            // gathering the toggle exists for. Measured, 30 runs x 4 environments: 1.7-2.0
+            // `WOULD FIRE` lines and then total silence for the remaining ~1050 s.
+            //
+            // Simulated against that stamping model, 1200 s, user quiet 60 s in every 300 s
+            // (one missed strike is all it takes to settle the schedule into its 18 s
+            // cadence): ceilings of 18/20/24/26/48 s all go permanently silent — last ladder
+            // line at 306/307/297/122/122 s. 16 s survives (60 bounces), 12 s survives (77),
+            // 6 s survives (139). 12 s is chosen because it is the highest EXISTING rung of
+            // the 6/12/24/48 ladder that clears the 18 s worst case with margin, and because
+            // rung 6 is the one that produced the ~7 s bounce cadence that got this process
+            // throttled: capping there would reinstate the defect the backoff exists to
+            // prevent. At 12 s the observed cadence is ~13 s minimum, ~15 s mean — one rung
+            // slower than the measured-throttling cadence, permanently.
+            //
+            // Cap the BACKOFF, not the COUNTER. The counter is tier 3's arming evidence and
+            // it is printed verbatim in the WOULD FIRE line; saturating it would make that
+            // line under-report how long the wedge had persisted, which is the very defect
+            // the `loudTicks` capture below exists to fix. A derived, unprinted quantity is
+            // the safe thing to clamp.
+            //
+            // The ON path keeps 48 s exactly. There the ratchet is self-limiting — reaching
+            // the armed state fires the kill, which resets the counter — so the pin is only
+            // reachable inside the 120 s window after a kill, and this commit deliberately
+            // does not perturb the path that `kill -9`s a system service. That residual pin
+            // is real and is left standing knowingly; if the toggle is ever promoted to
+            // default-ON, this ceiling has to come with it.
+            let backoffCeiling: Double = daemonRestartEnabled ? 48 : 12
+            let bounceBackoff: Double = min(backoffCeiling,
+                                            6 * pow(2, Double(min(suppressedBouncesSinceRestart, 3))))
             if heardSpeechSinceSilence, Date().timeIntervalSince(lastRecognizerEventAt) > bounceBackoff {
                 // Every trace this ladder emits carries the three numbers the gate actually
                 // used. Non-negotiable: the previous round climbed all three tiers and
                 // killed a system service twice with nothing anywhere recording what had
                 // been measured, which made the whole escalation unfalsifiable after the
                 // fact. Anything added to this ladder that traces must carry it too.
-                let levels = levelTrace(rms)
+                //
+                // FOUR numbers now, and the fourth is the one that was missing (review
+                // finding). `rms` is the room on THIS tick; the strike was armed by up to
+                // 26 s of accumulated speech-level ticks, and the reset two lines down used
+                // to destroy that count before ANY of the nine `RECOGNIZER WATCHDOG` lines
+                // below could print it. It is the single number that would have made the
+                // 16:09-16:15 field failure diagnosable: it separates "three ambient ticks
+                // armed the ladder" from "the user talked into a dead recogniser for twenty
+                // seconds". Read it here, before the reset, and thread it through `levels`
+                // so all nine lines carry it without any of them having to remember to.
+                //
+                // The label says "accumulated" for a reason: on most firing ticks the
+                // printed `rms` is BELOW `thr`. That is correct — the counter deliberately
+                // persists through the silence that follows, which is the whole reason it
+                // beats an instantaneous RMS check (see `loudTicksSinceRecognizerEvent`) —
+                // but on the page it reads as a self-contradiction, and a trace that has to
+                // be explained by someone who already knows the answer is not a trace.
+                let levels = levelTrace(rms, loudTicks: loudTicksSinceRecognizerEvent)
                 lastRecognizerEventAt = Date()   // debounce: one action per silent window
                 loudTicksSinceRecognizerEvent = 0
                 recognizerStalledTicks &+= 1
@@ -1912,21 +2225,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             && Date().timeIntervalSince(lastDaemonKillAt) > 120
                             && Date().timeIntervalSince(lastRealPartialAt) < 300
                         // DETECTOR ON, TRIGGER OPT-IN (see `daemonRestartEnabled`). With
-                        // the toggle off this branch acts on nothing: it does NOT stamp
-                        // `lastDaemonKillAt`, does NOT reset `suppressedBouncesSinceRestart`
-                        // and does NOT touch the HUD, because none of that happened. It
-                        // logs one rich line and falls through to the ordinary suppressed
-                        // bounce below.
+                        // the toggle off this branch changes no ladder state: it does NOT
+                        // stamp `lastDaemonKillAt`, does NOT reset
+                        // `suppressedBouncesSinceRestart` and does NOT touch the HUD,
+                        // because none of that happened. It logs one rich line and falls
+                        // through to the ordinary suppressed bounce below. The one thing it
+                        // does write, `lastTier3WouldFireLoggedAt`, is the log's own rate
+                        // limiter and nothing reads it but the `trace` guard below — kept
+                        // separate from `lastDaemonKillAt` precisely so that this promise
+                        // stays literally true.
                         //
-                        // EXPECT THIS LINE TO REPEAT, and do not read the repetition as a
-                        // loop bug: precisely because nothing is stamped or reset, both
-                        // counter-based conditions stay satisfied, so it re-prints once per
-                        // backoff window (6 -> 48 s, capped) until `lastRealPartialAt` ages
-                        // past 300 s and disarms it. That is what a detector with no
-                        // trigger looks like. `lastServiceError` is carried for the same
-                        // reason and read the same way: to be judged by a human later, not
-                        // branched on now — see `lastServiceErrorDescription()`.
-                        if tier3Armed, !daemonRestartEnabled {
+                        // THE LINE IS RATE-LIMITED; THE DETECTION IS NOT. `tier3Armed` is
+                        // evaluated on every strike and the fall-through to the ordinary
+                        // suppressed bounce is unconditional — only the `trace` is throttled,
+                        // and only to the 120 s the kill itself is limited to, through a
+                        // separate stamp (see `lastTier3WouldFireLoggedAt`). Without it the
+                        // 12 s backoff ceiling above prints this line on every armed strike
+                        // — every ~13 s. Simulated over 1200 s: 73 near-identical lines when
+                        // intermittent partials keep the detector armed throughout, 16-20 in
+                        // a total wedge (where `lastRealPartialAt` disarms it at 300 s
+                        // anyway). They would bury the tier-1 and tier-2 lines they are
+                        // meant to be read beside. Throttled, the line means "tier 3 would
+                        // have fired in this two-minute window", which is one line per
+                        // counterfactual kill — and the DETECTIONS behind it are unthinned,
+                        // still 73 and 16-20, because only the `trace` is gated.
+                        //
+                        // EXPECT IT TO REPEAT, and do not read the repetition as a loop bug:
+                        // precisely because no LADDER state is stamped or reset, both
+                        // counter-based conditions stay satisfied, so it re-prints every
+                        // 120 s until
+                        // `lastRealPartialAt` ages past 300 s and disarms it. That is what a
+                        // detector with no trigger looks like. `lastServiceError` is carried
+                        // for the same reason and read the same way: to be judged by a human
+                        // later, not branched on now — see `lastServiceErrorDescription()`.
+                        if tier3Armed, !daemonRestartEnabled,
+                           Date().timeIntervalSince(lastTier3WouldFireLoggedAt) > 120 {
+                            lastTier3WouldFireLoggedAt = Date()
                             trace("RECOGNIZER WATCHDOG TIER 3 WOULD FIRE (disabled): \(levels) "
                                 + "suppressedBounces=\(suppressedBouncesSinceRestart) "
                                 + String(format: "sinceLastRealPartial=%.0f s ",
@@ -2027,8 +2361,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !utteranceDiverged && injectionBlockedReason == nil {
             hud.set(.transcribing(text.isEmpty ? hudIdleBody : text))
         }
-        trace("FINAL: \(text.count) chars, injected \(injectedForUtterance.count) chars, "
-            + "diverged=\(utteranceDiverged)")
+        // THIS IS THE LINE THE RETRACTION EVIDENCE CAME FROM — `FINAL: 6 chars, injected
+        // 22 chars, diverged=false` was how 16 characters of retracted Thai left in the
+        // user's document were spotted — so it has to be readable as a check on the repair
+        // that now runs. Two of its three numbers were not comparable: `text` is TRIMMED
+        // and `injectedForUtterance` holds the UNTRIMMED `raw` that `deliver` was given,
+        // so a final carrying trailing whitespace printed a mismatch even after a perfectly
+        // correct reconciliation. `raw` is printed alongside, and the two counts to compare
+        // are `raw` and `injected`: equal means the document now matches the recogniser.
+        trace("FINAL: \(text.count) chars (raw \(raw.count)), "
+            + "injected \(injectedForUtterance.count) chars, diverged=\(utteranceDiverged)")
         refreshMenu()
     }
 
@@ -2132,14 +2474,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        // Forward-only typing, by the user's explicit choice ("just keep typing; if it's
-        // wrong I'll fix it myself"): when the recogniser revises earlier words we do NOT
-        // go back and repair -- we only ever append what lies beyond the count already
-        // typed. Screen text may briefly differ from the recogniser's best guess, and
-        // that is the accepted trade for never touching text behind the caret.
-        let typedCount = injectedForUtterance.count
-        guard text.count > typedCount else { return }   // revision only, nothing new to add
-        let suffix = String(text.dropFirst(typedCount))
+        // ── Forward-only typing was the ORIGINAL trade, and the user has reversed it ──
+        //
+        // The rule used to be "just keep typing; if it's wrong I'll fix it myself": when
+        // the recogniser revised earlier words we did NOT go back, we only appended what
+        // lay beyond the COUNT already typed. That decision is preserved here because it
+        // was a real one — its whole point was that the app could not delete anything, so
+        // it could never eat text the user typed by hand. What it also could not do was
+        // stay correct, and for Thai it did not:
+        //
+        //   let typedCount = injectedForUtterance.count
+        //   guard text.count > typedCount else { return }
+        //   let suffix = String(text.dropFirst(typedCount))
+        //
+        // `dropFirst` never checked that `injectedForUtterance` is a PREFIX of `text`, and
+        // for Thai it routinely is not. Two separate mechanisms, both reproduced in a
+        // standalone harness (5 of the 6 measured sequences landed wrong):
+        //
+        //   * COUNT-STALL. Adding a tone mark to an existing cluster does not raise
+        //     `text.count` — "เดียว" and "เดี๋ยว" are both 4 grapheme clusters — so the
+        //     `>` gate returned and the mark was lost PERMANENTLY: the next growing
+        //     partial sliced straight past it. "ก"→"ก่"→"ก่อ"→"ก่อน" typed "กอน".
+        //   * MISALIGNMENT. A word-merge revision passes the gate and then slices at the
+        //     wrong place: "ไม่ เป" (5 clusters) → "ไม่เป็นไร" (7) typed "ไม่ เปไร".
+        //     Same class, non-Thai trigger: "👩"→"👩‍"→"👩‍💻"→"👩‍💻 hi" typed "👩 hi".
+        //
+        // So the gate is now "does the document differ from what I typed", not "is the
+        // text longer", and the comparison is by CONTENT in grapheme clusters, never by
+        // count. `commonPrefixLength` is the only arbiter:
+        //
+        //   * lcp == injectedForUtterance.count — `text` is a strict extension of what we
+        //     typed. This is the overwhelming majority of partials and it was already
+        //     correct, so it keeps the cheap append path below, untouched.
+        //   * otherwise — the recogniser revised, merged, or RETRACTED characters we have
+        //     already put in the user's document. Delete back to the common prefix and
+        //     retype the remainder, via `repairDivergence` → `replaceLastInserted`.
+        //
+        // The retraction case falls out of the same branch with no special handling: a
+        // shrinking partial has lcp == text.count < injectedForUtterance.count, so the
+        // replacement is the empty string and the repair is a pure delete. That is the
+        // fix for the field evidence where a `FINAL: 6 chars, injected 22 chars` line
+        // meant 16 characters of retracted Thai were simply left in the document.
+        //
+        // THIS IS THE FIRST TIME THIS APP CAN DELETE ANYTHING, and the user authorised it
+        // knowing exactly that: the old path could not eat hand-typed text because it
+        // could not remove text at all. What makes it safe is entirely inside
+        // `replaceLastInserted` — the `expecting:` content check, the caret-must-be-a-caret
+        // guard, the clamped-range read-back, and the caret restore on every refusal.
+        // Do not weaken any of them, and never follow a refusal with blind backspaces.
+        let lcp = commonPrefixLength(injectedForUtterance, text)
+        guard lcp == injectedForUtterance.count else {
+            // Revision, merge, or retraction: everything from `lcp` onwards is stale.
+            repairDivergence(to: text, isFinal: isFinal)
+            return
+        }
+        let suffix = String(text.dropFirst(lcp))
         guard !suffix.isEmpty else { return }
 
         if let reason = injector.inject(suffix) {
@@ -2186,13 +2575,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return n
     }
 
-    /// A partial (or the final) revised characters we already typed. Keep the longest
-    /// common prefix; replace exactly the stale tail via `replaceLastInserted(count:with:)`.
-    /// On success, injection simply continues on the next partial. On a refusal, stop
-    /// injecting for this utterance and let the FINAL / cloud pass be the recovery —
-    /// NEVER follow the refusal with blind backspaces. Counts only in the trace.
+    /// A partial (or the final) revised, merged, or RETRACTED characters we already typed.
+    /// Keep the longest common prefix; replace exactly the stale tail via
+    /// `replaceLastInserted(count:with:)`. On success, injection simply continues on the
+    /// next partial. On a refusal, stop injecting for this utterance and let the FINAL /
+    /// cloud pass be the recovery — NEVER follow the refusal with blind backspaces.
+    ///
+    /// A retraction reaches here as `replacement == ""` and is therefore a pure DELETE of
+    /// the stale tail. That is the one shape that can remove text without putting any
+    /// back, and it is exactly what the field evidence asked for (`FINAL: 6 chars,
+    /// injected 22 chars` left 16 characters of retracted Thai in the document).
+    ///
+    /// HISTORY, because the trace numbers from before today mean the opposite of what they
+    /// look like: until this build this function had ZERO call sites. It is the only writer
+    /// of the divergence counters and the only caller of `replaceLastInserted`, so every
+    /// `divergences=0` in a pre-existing trace line was not a health signal — the counter
+    /// could not be non-zero. `deliver()` now calls it on every non-extension partial, so
+    /// the counters below measure something for the first time. They are split into
+    /// repaired/refused deliberately: a single total cannot distinguish "the document was
+    /// corrected" from "the app declined to touch the document", and those are the two
+    /// outcomes a reader of the trace actually needs to tell apart.
     private func repairDivergence(to text: String, isFinal: Bool) {
-        lifetime.divergences += 1; thisCapture.divergences += 1
         let lcp = commonPrefixLength(injectedForUtterance, text)
         let staleCount = injectedForUtterance.count - lcp
         let replacement = String(text.dropFirst(lcp))
@@ -2200,6 +2603,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let expected = String(injectedForUtterance.suffix(staleCount))
         if let reason = injector.replaceLastInserted(count: staleCount, with: replacement,
                                                      expecting: expected) {
+            lifetime.divergencesRefused += 1; thisCapture.divergencesRefused += 1
             utteranceDiverged = true
             lastTranscript = text
             lastOutcome = "Typed text is stale — in-place repair failed"
@@ -2221,8 +2625,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        lifetime.divergencesRepaired += 1; thisCapture.divergencesRepaired += 1
         injectedForUtterance = text
         lifetime.injectedChars += replacement.count; thisCapture.injectedChars += replacement.count
+
+        // Keep the CHUNK ledger honest about the document, exactly as the cloud path does
+        // after its own replace. `typedSinceLastChunk` is what `noteFinalChunk` snapshots
+        // and what `replaceRecentText(find:)` later searches the document for; if it still
+        // held the stale tail we just deleted, that search would look for a span that no
+        // longer exists and the cloud correction would refuse — silently converting every
+        // repaired utterance's cloud result into `cloudUnapplied`.
+        //
+        // Matched with `.backwards, .anchored, .literal` rather than by Character
+        // arithmetic: the ledger is a CONCATENATION of injected suffixes, so its own
+        // grapheme segmentation can merge across a join that neither source string had
+        // (a leading combining mark absorbing the character before it). An anchored
+        // literal match is the same unit discipline `replaceLastInserted` uses, and it
+        // simply fails rather than mis-slicing.
+        if expected.isEmpty {
+            typedSinceLastChunk += replacement
+        } else if let stale = typedSinceLastChunk.range(of: expected,
+                                                        options: [.backwards, .anchored, .literal]) {
+            typedSinceLastChunk.replaceSubrange(stale, with: replacement)
+        } else {
+            // The stale tail reaches back past the last chunk cut, so this repair spans a
+            // boundary the ledger cannot express. Leave it alone and say so: an unpatched
+            // ledger costs one cloud correction, a mis-patched one rewrites the wrong span.
+            trace("DIVERGENCE: chunk ledger NOT patched — the \(staleCount) stale chars "
+                + "reach back past the last chunk boundary (ledger holds \(typedSinceLastChunk.count) chars)")
+        }
+
         if utteranceDiverged {
             // The reconciliation succeeded after an earlier failed repair: the typed text
             // is correct again, so injection may resume.
@@ -2231,7 +2663,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         trace("DIVERGENCE: repaired in place\(isFinal ? " (final reconciliation)" : "") — "
             + "kept \(lcp) common chars, replaced \(staleCount) stale chars with "
-            + "\(replacement.count) chars")
+            + "\(replacement.count) chars"
+            + (replacement.isEmpty ? " (RETRACTION: pure delete)" : ""))
     }
 
     // MARK: - Chunk loop (cloud accuracy pass)
@@ -2577,18 +3010,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastOutcome = String(format: "Cloud auto-corrected the typed text (%.0f ms)", elapsedMS)
             trace("FAL: auto-corrected span (\(typedSpan.count) -> \(text.count) chars)")
 
-            // ── Bookkeeping: the forward-only mark is NOT touched here ──────────────
-            // `injectedForUtterance` is consumed by `deliver()` purely by COUNT —
-            // `partial.dropFirst(mark.count)` — against RECOGNIZER text, so the mark
-            // must stay in recognizer-text units at all times. The cloud text is a
-            // document-side rewrite in fal's own units: fal adds spaces and punctuation,
-            // so the lengths differ. Folding it into the mark (as this block once did)
-            // desynchronised the count for a still-open utterance: later partials first
+            // ── Bookkeeping: the recogniser-side mark is NOT touched here ───────────
+            // `injectedForUtterance` is consumed by `deliver()` against RECOGNIZER text,
+            // so the mark must stay in recognizer-text units at all times. The cloud text
+            // is a document-side rewrite in fal's own units: fal adds spaces and
+            // punctuation, so the strings differ. Folding it into the mark (as this block
+            // once did) desynchronised a still-open utterance: later partials first
             // compared shorter than the inflated mark and were skipped (typing froze),
-            // and once they outgrew it, dropFirst(mark.count) cut into genuinely new
-            // speech (characters eaten). The document-side effect of the replace is
-            // recorded where document units live — the `typedSinceLastChunk` ledger
-            // patch just below. NEVER assign cloud text into `injectedForUtterance`.
+            // and once they outgrew it, `dropFirst(mark.count)` cut into genuinely new
+            // speech (characters eaten).
+            //
+            // `deliver()` no longer consumes the mark by COUNT — it diffs it by CONTENT,
+            // in grapheme clusters, and a mismatch now makes it DELETE from the user's
+            // document (see the block in `deliver`). That makes this rule strictly
+            // stronger, not weaker: cloud text in the mark would no longer merely
+            // desynchronise a count, it would present the next partial with a common
+            // prefix computed against text the recogniser never said, and the repair
+            // would delete correct characters to "fix" them. The document-side effect of
+            // the replace is recorded where document units live — the
+            // `typedSinceLastChunk` ledger patch just below.
+            // NEVER assign cloud text into `injectedForUtterance`.
             //
             // What we DO record is ownership: the cloud has rewritten this utterance's
             // typed text, and a late on-device FINAL must not "reconcile" it back to
@@ -2825,7 +3266,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "axTrusted=\(hotkey.permissionGranted()) tapHealthy=\(hotkey.isHealthy) "
             + "partials=\(lifetime.partialsSeen) finals=\(lifetime.finalsSeen) "
             + "injectedChars=\(lifetime.injectedChars) injectFailures=\(lifetime.injectFailures) "
-            + "divergences=\(lifetime.divergences) "
+            + "divergencesRepaired=\(lifetime.divergencesRepaired) "
+            + "divergencesRefused=\(lifetime.divergencesRefused) "
             + "secureInputRefusals=\(lifetime.secureInputRefusals)")
         trace("AUTOSTART CLOUD SUMMARY: available=\(cloudAvailable) enabled=\(cloudEnabled) "
             + "finalChunks=\(lifetime.finalChunks) sent=\(lifetime.cloudSent) "
