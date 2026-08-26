@@ -67,6 +67,19 @@ import OSLog
 //   "TextInjector"'` when a paste goes wrong — the first thing you want to know
 //   is whether you are debugging AX or the clipboard.
 //
+//   `replaceLastInserted` is layered the same way, and was not always: it was
+//   AX-only until 2026-08-27, which meant the Thai-revision repair could only
+//   land in the apps that never needed it. OSLog measured the AX write refused
+//   158 of 158 times in the field, so the repair refused in Electron, Chromium
+//   and Cursor every single time — and `commonPrefixLength` routes a Thai tone
+//   mark to repair rather than append, which is 2 repairs in a 7-partial
+//   `สวัสดีครับ` sequence. Its path B differs from the one above in one
+//   important way: the SPAN is verified before the write and the EFFECT is
+//   verified after it, and nothing is claimed in between. The span comes from
+//   the same AX checks path A uses, including a selection the field itself
+//   echoes back; the effect is a collapsed caret at an offset only a correct
+//   replacement produces. Read that function's header before touching it.
+//
 // ── 3. Privacy note ──────────────────────────────────────────────────────────
 //
 // The transcript is the user's speech. It is NEVER logged, not even at debug
@@ -121,6 +134,47 @@ final class TextInjector: TextInjecting {
     /// and to react to a superseding injection; coarse enough that the polling
     /// itself costs nothing.
     private static let restorePollInterval: TimeInterval = 0.05
+
+    /// How long we let an Accessibility *selection* write settle before
+    /// concluding the field ignored it, and how often we look.
+    ///
+    /// The single 40 ms sleep this replaces was sized for an AppKit text view,
+    /// which applies the write on the same runloop turn. Chromium — the case
+    /// the repair fallback below exists for — is architecturally different:
+    /// setting kAXSelectedTextRange there dispatches an action to the *renderer*
+    /// process and returns before the renderer has acted. This file's own
+    /// clipboard note measures Electron round trips at 100-300 ms, so a 40 ms
+    /// read-back would declare "the field clamped the selection" on a field
+    /// that was about to comply, and the fallback would never be reached in the
+    /// only apps that need it.
+    ///
+    /// Polling rather than sleeping once means a native app matches on the
+    /// FIRST read and pays nothing at all; only a field that is genuinely
+    /// refusing burns the whole budget, and that happens at most twice per
+    /// session because `main.swift` latches final-only mode on the first
+    /// refusal. Honest cost note: each poll is an AX round trip bounded by
+    /// `axMessagingTimeout`, so a wedged target can overshoot this by one
+    /// message timeout.
+    private static let axSelectionSettleTimeout: TimeInterval = 0.4
+    private static let axSelectionPollInterval: TimeInterval = 0.025
+
+    /// How long we wait for a synthesised repair keystroke (Cmd+V, or a bare
+    /// Delete) to come back as a collapsed caret at exactly the offset a
+    /// correct replacement would produce.
+    ///
+    /// This is the receipt that lets the repair fallback refuse honestly. The
+    /// clipboard path proper cannot have one — `changeCount` is a write
+    /// counter, there is no read receipt (see `scheduleReceiptSequencedRestore`)
+    /// — but a *replacement* has a second, independent signature the paste
+    /// itself cannot fake: the selection we established collapses to a caret at
+    /// `selectionStart + replacement.utf16.count`. An insertion that failed to
+    /// replace lands the caret one selection-length further along, so the two
+    /// outcomes are distinguishable by a single cheap read.
+    ///
+    /// Sized past the same 100-300 ms Electron round trip as above. It costs
+    /// nothing on the happy path in a native app and roughly one round trip in
+    /// Electron; it is only paid on a repair, never on an ordinary partial.
+    private static let repairEchoTimeout: TimeInterval = 0.4
 
     /// Cumulative byte budget for snapshotting the user's existing clipboard.
     ///
@@ -349,14 +403,76 @@ final class TextInjector: TextInjecting {
     /// Replace the last `count` grapheme clusters before the caret with `text`.
     ///
     /// Guarantee: this either replaces exactly the intended range or does
-    /// nothing and returns a reason. It never falls back to synthesized
-    /// backspaces — a blind Delete storm into the wrong window is how a user
-    /// loses a paragraph, so on ANY ambiguity we leave the document alone and
-    /// let the caller surface the reason instead.
+    /// nothing and returns a reason. `count` is a HARD CEILING — no path in
+    /// here can remove more than the `count` clusters the caller says this app
+    /// itself typed — and on ANY ambiguity we leave the document alone and let
+    /// the caller surface the reason instead.
     ///
-    /// AX-only by design: apps whose AX text surface is absent (Chromium
-    /// without an AX tree, terminals) simply refuse here, and the caller's
-    /// recovery is "stop revising, keep what was typed".
+    /// ── Two paths, mirroring `inject()` ─────────────────────────────────────
+    ///
+    /// This was AX-only until 2026-08-27, and that turned out to be a delivery
+    /// bug wearing a safety property's clothes. Field measurement (OSLog,
+    /// `TextInjector.swift:341` at baseline `9bba5c9`): the Accessibility
+    /// *write* was refused **158 of 158 times**, so every real injection in the
+    /// sampled sessions went through the clipboard. An AX-only repair therefore
+    /// succeeded exactly where `inject`'s path A already worked — TextEdit,
+    /// Mail, Notes, Xcode — and refused exactly where path B was needed:
+    /// Electron, Chromium, Slack, Cursor, VS Code, i.e. the apps this user
+    /// actually works in.
+    ///
+    /// And the repair is not a rare event. `main.swift`'s `commonPrefixLength`
+    /// compares Characters, so adding a Thai tone mark to the trailing cluster
+    /// yields a *different* Character ("ก" vs "ก่") and routes to repair rather
+    /// than to the cheap append: **2 repairs in a 7-partial `สวัสดีครับ`
+    /// sequence, and at least one repair in all six measured test sequences.**
+    /// So in those apps the FIRST revision of an utterance refused, `main.swift`
+    /// latched `finalOnlyInjection`, the remaining partials were skipped, and
+    /// the FINAL reconciled through the same refusing path — the document kept
+    /// "ก" and "ก่อน" never arrived.
+    ///
+    ///   Path A — set kAXSelectedText over the selection. Preferred, tried
+    ///     first, and unchanged. One synchronous IPC: no clipboard, no
+    ///     keystroke, no undo entry.
+    ///
+    ///   Path B — Cmd+V (or, for a pure retraction, a single Delete) over the
+    ///     SAME selection, which by then the field has echoed back to us.
+    ///     Reached only on solid evidence that path A was a silent no-op.
+    ///
+    /// ── Why path B is not a blind edit ──────────────────────────────────────
+    ///
+    /// It posts a keystroke, but every guard below has already run and passed
+    /// before it fires, and the span being removed is an AX *range the field
+    /// itself confirmed by read-back* — never a count of backspaces.
+    ///
+    /// That is what the 158/158 measurement actually licenses. Those refusals
+    /// are all from the caret-did-not-move detector in `insertViaAccessibility`,
+    /// which is only reachable after the systemwide focused-element copy
+    /// succeeds, `AXUIElementIsAttributeSettable` returns settable, the AX set
+    /// returns .success, and THREE separate kAXSelectedTextRange reads succeed.
+    /// In other words: in these apps AX *reads* work and only AX *writes* are
+    /// inert. (Re-measured 2026-08-27: 59 such notices persisted in the last
+    /// 36 h of OSLog, 59 of 59 from that same detector, zero from the settable
+    /// gate.) So we verify by reading and only then write by keystroke, which
+    /// is strictly stronger than writing blind.
+    ///
+    /// This also DISSOLVES the unit problem rather than solving it. A
+    /// synthesised backspace count would have to be expressed in the unit the
+    /// target app consumes, and that unit is not ours: AppKit and Blink delete
+    /// by extended grapheme cluster, readline in a terminal deletes by code
+    /// point — so "ก่" is one backspace in one and two in the other, and a ZWJ
+    /// emoji is one or three. We never compute such a count. The only keystroke
+    /// here that can delete anything is a single Delete against a selection the
+    /// field has confirmed is non-empty and exactly `count` clusters wide,
+    /// which removes the selection and nothing else in all of them.
+    ///
+    /// Honest limits. A read-only AX text surface (Terminal.app's scrollback)
+    /// still refuses at the settable gate, as it should — nothing here helps
+    /// there. And whether Chromium's kAXSelectedTextRange *write* moves the
+    /// real selection was not measurable from this machine (a probe binary and
+    /// System Events both lack assistive access, and granting it is a security
+    /// settings change). If it does not, the clamped-range read-back below
+    /// refuses exactly as it does today and path B is simply never entered —
+    /// the change is inert there, not unsafe.
     ///
     /// Units: `count` is in grapheme clusters (Swift `Character`), matching the
     /// caller's bookkeeping. AX ranges are UTF-16 code units, so we convert by
@@ -369,6 +485,9 @@ final class TextInjector: TextInjecting {
     /// that makes the delayed cloud path safe: between typing and the cloud
     /// result (~4 s) the user can focus a different field, whose caret would
     /// otherwise pass every positional check while holding someone else's text.
+    /// Path B REQUIRES it: a position that merely looks right is not enough to
+    /// justify posting a destructive keystroke, so a nil `expecting` refuses
+    /// there even though path A would have proceeded.
     func replaceLastInserted(count: Int, with text: String,
                              expecting: String? = nil) -> String? {
         guard count >= 0 else { return "internal error: negative count" }
@@ -441,39 +560,197 @@ final class TextInjector: TextInjecting {
         // Some fields apply the selection ASYNCHRONOUSLY: the set returns
         // .success but an immediate re-read still shows the old caret. Seen in
         // production ("the field clamped the selection" on a field that had
-        // accepted the very same insertions) — so on mismatch, wait one beat
-        // and re-read once before concluding the field really clamped it.
-        func readBack() -> CFRange? { selectedTextRange(of: focused) }
-        var applied = readBack()
-        if !(applied?.location == target.location && applied?.length == target.length) {
-            usleep(40_000)   // 40 ms settle; AX set is IPC, application can lag a runloop turn
-            applied = readBack()
-        }
+        // accepted the very same insertions) — so we poll for it rather than
+        // concluding on one read. This step is SHARED infrastructure now: it is
+        // what establishes the span for both paths below, and its budget is
+        // sized for a Chromium renderer round trip rather than an AppKit
+        // runloop turn (see `axSelectionSettleTimeout`). A native field still
+        // matches on the very first read.
+        let applied = selection(of: focused, becomes: target,
+                                within: Self.axSelectionSettleTimeout)
         guard let applied,
               applied.location == target.location, applied.length == target.length else {
-            // Restore the caret so we do not leave a surprise selection behind.
-            var restore = CFRange(location: caret.location, length: 0)
-            if let restoreValue = AXValueCreate(.cfRange, &restore) {
-                AXUIElementSetAttributeValue(
-                    focused, kAXSelectedTextRangeAttribute as CFString, restoreValue)
-            }
+            // Nothing has been posted yet, so collapsing the caret back is safe
+            // and leaves no surprise selection behind.
+            collapseSelection(of: focused, to: caret.location)
             let got = applied.map { "(\($0.location),\($0.length))" } ?? "unreadable"
             return "the field clamped the selection (wanted (\(target.location),\(target.length)), got \(got)); not replacing"
         }
 
-        guard AXUIElementSetAttributeValue(
-            focused, kAXSelectedTextAttribute as CFString, text as CFString
-        ) == .success else {
-            var restore = CFRange(location: caret.location, length: 0)
-            if let restoreValue = AXValueCreate(.cfRange, &restore) {
-                AXUIElementSetAttributeValue(
-                    focused, kAXSelectedTextRangeAttribute as CFString, restoreValue)
-            }
-            return "the field refused the replacement text"
-        }
-        return nil
-    }
+        // The selection is now established AND confirmed by the field itself.
+        // Everything from here on replaces exactly `applied` and nothing wider.
+        //
+        // A correct replacement — by any mechanism — collapses that selection to
+        // a caret immediately after the text that replaced it. An insertion that
+        // failed to consume the selection lands `len16` further along instead,
+        // so this one number tells the two apart.
+        let collapsed = CFRange(location: target.location + text.utf16.count, length: 0)
 
+        // ── Path A: the AX attribute write. Preferred, and unchanged. ────────
+        if AXUIElementSetAttributeValue(
+            focused, kAXSelectedTextAttribute as CFString, text as CFString
+        ) == .success {
+            // Verify it to the SAME standard `insertViaAccessibility` uses, and
+            // for the same reason. Before today this path trusted .success, and
+            // against 158/158 field evidence that these apps return .success and
+            // do nothing that was a live "the ledger claims text that did not
+            // land" bug: `main.swift` would set `injectedForUtterance = text`
+            // while the document still held the stale tail, with the stale tail
+            // left SELECTED.
+            //
+            // The asymmetry is deliberate and matches that function's comment:
+            // only a selection that is STILL exactly the span we asked to have
+            // replaced is solid evidence of a no-op. An unreadable range, or a
+            // range that moved anywhere else, is not — and treating it as one
+            // would deliver the replacement TWICE. So the question asked here
+            // is "did it move at all", which a field that complied answers on
+            // the first read; only a field that is genuinely inert pays the
+            // settle budget.
+            let echo = selection(of: focused, movesOff: target,
+                                 within: Self.axSelectionSettleTimeout)
+            if let echo, echo.location == collapsed.location, echo.length == 0 {
+                // Positively confirmed: the selection collapsed to exactly
+                // where a correct replacement of this length leaves it.
+                return nil
+            }
+            if let echo, echo.location == target.location, echo.length == target.length {
+                Self.log.notice(
+                    "AX accepted a \(text.utf16.count, privacy: .public)-unit replacement over a \(target.length, privacy: .public)-unit selection but the selection did not collapse; falling back to the clipboard repair path."
+                )
+            } else {
+                // AMBIGUOUS, and deliberately NOT treated as confirmation.
+                // `movesOff` fires on any movement, and something other than
+                // our write can move a selection inside a 400 ms window — an
+                // autocomplete popup, a focus change, the user clicking. Only
+                // the exact collapsed offset above is positive evidence; only
+                // an unmoved selection is positive evidence of a no-op. This is
+                // neither, so we fall back on `insertViaAccessibility`'s
+                // standing rule — trust the .success, because a false negative
+                // here delivers the replacement TWICE — and record the range so
+                // a future reader can see how often this actually happens.
+                let got = echo.map { "(\($0.location),\($0.length))" } ?? "unreadable"
+                Self.log.notice(
+                    "AX replacement accepted; selection settled at \(got, privacy: .public) rather than the expected collapse — ambiguous, trusting the write."
+                )
+                return nil
+            }
+        }
+
+        // ── Path B: repair the AX-verified selection with a keystroke. ───────
+        //
+        // Reached only when path A is proven inert. The selection is still
+        // standing and still verified, so the mechanism below replaces exactly
+        // it. Two shapes, and only one of them touches the pasteboard.
+
+        // A position that merely looks right is not enough to post a
+        // destructive keystroke on. `repairDivergence` always supplies this;
+        // the parameter is optional only for path A's benefit.
+        guard expecting != nil else {
+            collapseSelection(of: focused, to: caret.location)
+            return "the field ignored the AX replacement and no content check was supplied; not repairing"
+        }
+
+        // Secure Event Input, re-checked at the moment it matters. The entry
+        // check above is several AX round trips and up to two settles old by
+        // now, and the rule is that the transcript must never reach the
+        // pasteboard while SEI is held — that is a property of the write, not
+        // of function entry. Nothing has been posted yet, so we can back out
+        // cleanly.
+        if secureInputActive() {
+            collapseSelection(of: focused, to: caret.location)
+            return "secure input became active mid-repair; nothing was written to the clipboard"
+        }
+
+        var borrowedGeneration: Int?
+        let postedAt: Date
+        if text.isEmpty {
+            // PURE RETRACTION. The recogniser took characters back, so there is
+            // nothing to paste — and therefore no reason to borrow the user's
+            // clipboard at all. One Delete against a non-empty selection deletes
+            // the selection, exactly, in every app: no count, no unit, no script
+            // dependence. Retractions are one of the two repair shapes, so this
+            // is a real reduction in pasteboard exposure rather than a rounding
+            // error.
+            //
+            // The guard is not paranoia. A bare Delete against an EMPTY
+            // selection deletes one unit of whatever precedes the caret — text
+            // this app may not have typed. That is the single most destructive
+            // thing this file could do, so it is checked explicitly here rather
+            // than inferred from `count > 0` several screens above.
+            guard target.length > 0 else {
+                collapseSelection(of: focused, to: caret.location)
+                return "internal error: refusing to post Delete with an empty selection"
+            }
+            guard postDeleteKey() else {
+                collapseSelection(of: focused, to: caret.location)
+                return "could not post the delete keystroke. Check Accessibility permission in System Settings."
+            }
+            postedAt = Date()
+            Self.log.notice(
+                "Repair fallback: deleted a \(target.length, privacy: .public)-unit selection with one Delete (no clipboard borrow)."
+            )
+        } else {
+            switch borrowPasteboardAndPasteV(text) {
+            case .failed(let reason):
+                // The borrow released itself and nothing was posted.
+                collapseSelection(of: focused, to: caret.location)
+                return reason
+            case .posted(let generation, let at, _):
+                borrowedGeneration = generation
+                postedAt = at
+                Self.log.notice(
+                    "Repair fallback: pasted \(text.count, privacy: .public) chars over a \(target.length, privacy: .public)-unit selection."
+                )
+            }
+        }
+        // Hand the borrow back on EVERY exit from here, anchored at the instant
+        // the keystroke went out. Anchoring on `postedAt` rather than on "when
+        // the restore task happens to start" is what keeps the verification
+        // below from lengthening the pasteboard window: the user's clipboard is
+        // still returned `pasteSettleTimeout` after the paste, not after the
+        // paste plus however long we spent watching for the receipt.
+        defer {
+            if let borrowedGeneration {
+                scheduleReceiptSequencedRestore(generation: borrowedGeneration, since: postedAt)
+            }
+        }
+
+        // The receipt. Without it this function would return `nil` on nothing
+        // more than "we posted a key event", and the caller would write `text`
+        // into its ledger whether or not the document ever changed.
+        let echo = selection(of: focused, becomes: collapsed,
+                             within: Self.repairEchoTimeout)
+        if let echo, echo.location == collapsed.location, echo.length == 0 {
+            return nil
+        }
+
+        // No receipt. DELIBERATELY leave the selection standing rather than
+        // collapsing the caret, which is the opposite of what every refusal
+        // above does — and the reason is the one outcome worse than refusing.
+        //
+        // A synthetic Cmd+V can be delivered late; this file's own note puts
+        // Electron round trips at 100-300 ms and the budget above at 400 ms,
+        // but "late" has no hard bound. If we collapsed the caret and the paste
+        // then landed, it would insert AFTER the stale tail instead of over it,
+        // leaving the document as a hybrid of two different partials —
+        // `prefix + stale + replacement`. Leaving the selection standing makes
+        // the late paste land correctly instead, and the two possible outcomes
+        // are then both safe: either the document still reads exactly as it did
+        // (nothing landed), or it reads exactly as the caller intended (it
+        // landed late). In neither case does the ledger claim text that is not
+        // there, because we are returning a refusal for both.
+        //
+        // The caller interpolates this reason straight into the HUD, so it says
+        // that a selection was left behind: the FINAL reconciliation will hit
+        // the "a selection is active" guard at the top of this function, and
+        // the user should learn why from the first message.
+        Self.log.notice(
+            "Repair fallback posted but was not echoed back within \(Int(Self.repairEchoTimeout * 1000), privacy: .public) ms; refusing and leaving the selection standing."
+        )
+        return "the repair keystroke was not confirmed by the field; the stale text is left "
+            + "SELECTED rather than deleted (so a late paste still lands correctly) and "
+            + "nothing was recorded as typed"
+    }
     /// Replace the LAST occurrence of `find` located strictly BEFORE the caret
     /// with `replacement`, then restore the caret to where it was (adjusted by
     /// the length delta so it stays at the same logical spot in the text that
@@ -720,9 +997,95 @@ final class TextInjector: TextInjecting {
         return range
     }
 
+    /// Block until `kAXSelectedTextRange` reads back as `expected`, or until
+    /// `timeout` elapses; return the last value we managed to read (`nil` if we
+    /// never could read one at all).
+    ///
+    /// Yes, this blocks the main actor. It is deliberate and it is bounded. The
+    /// two callers are both mid-way through an edit that must not be
+    /// interleaved with another injection, and `replaceLastInserted` is
+    /// synchronous by contract — making it async would let a second partial
+    /// arrive while a selection is standing, which is a far worse problem than
+    /// a stalled HUD. The cost is only paid on a repair, never on an ordinary
+    /// partial, and a native field satisfies the very first read.
+    ///
+    /// Two honest side effects of the blocking. A pending clipboard restore
+    /// from a PREVIOUS injection cannot run while we are here, so that borrow
+    /// can stretch from 700 ms to roughly 1.1 s in the worst case. And each
+    /// poll is an AX round trip capped by `axMessagingTimeout`, so a wedged
+    /// target can overshoot `timeout` by one message timeout.
+    private func settledSelection(of element: AXUIElement, within timeout: TimeInterval,
+                                  until satisfied: (CFRange) -> Bool) -> CFRange? {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last = selectedTextRange(of: element)
+        while true {
+            if let seen = last, satisfied(seen) { return seen }
+            if Date() >= deadline { return last }
+            usleep(useconds_t(Self.axSelectionPollInterval * 1_000_000))
+            last = selectedTextRange(of: element)
+        }
+    }
+
+    /// `settledSelection`'s two shapes, named so the call sites read as the
+    /// question they are actually asking.
+    ///
+    /// The distinction is not cosmetic, it is what the budget gets spent on.
+    /// "Has it become X" must be answered positively — nothing but the exact
+    /// value will do, because a paste that INSERTED instead of replacing also
+    /// lands a plausible-looking caret. "Has it moved at all" can be answered
+    /// by the first read in a healthy field, so the budget is only ever burned
+    /// in the case we actually want to pay for: a field that is sitting there
+    /// doing nothing.
+    private func selection(of element: AXUIElement, becomes expected: CFRange,
+                           within timeout: TimeInterval) -> CFRange? {
+        settledSelection(of: element, within: timeout) {
+            $0.location == expected.location && $0.length == expected.length
+        }
+    }
+    private func selection(of element: AXUIElement, movesOff anchor: CFRange,
+                           within timeout: TimeInterval) -> CFRange? {
+        settledSelection(of: element, within: timeout) {
+            !($0.location == anchor.location && $0.length == anchor.length)
+        }
+    }
+
+    /// Put the caret back where we found it, collapsed, after deciding not to
+    /// replace.
+    ///
+    /// Only ever call this when NOTHING has been posted yet. Once a keystroke
+    /// is in flight, collapsing the caret is the one move that can turn a
+    /// refusal into a corrupted document — see the closing comment of
+    /// `replaceLastInserted`.
+    private func collapseSelection(of element: AXUIElement, to location: Int) {
+        var restore = CFRange(location: location, length: 0)
+        if let restoreValue = AXValueCreate(.cfRange, &restore) {
+            AXUIElementSetAttributeValue(
+                element, kAXSelectedTextRangeAttribute as CFString, restoreValue)
+        }
+    }
+
     // MARK: - Path B: clipboard + synthetic Cmd+V
 
-    private func injectViaClipboard(_ text: String, targetID: String) -> String? {
+    /// Outcome of borrowing the user's pasteboard and posting Cmd+V.
+    private enum PasteHandoff {
+        /// The keystroke went out. `postedAt` is when the clipboard-exposure
+        /// clock started; the caller owns scheduling the restore and MUST pass
+        /// `postedAt` as `since:` so the borrow is never longer than
+        /// `pasteSettleTimeout`, no matter what the caller does in between.
+        case posted(generation: Int, postedAt: Date, keyCode: CGKeyCode)
+        /// Nothing was pasted and the user's clipboard is already back.
+        case failed(String)
+    }
+
+    /// Borrow the pasteboard, put `text` on it, and post Cmd+V — the mechanism
+    /// half of the clipboard path, with no policy about when to restore.
+    ///
+    /// Split out of `injectViaClipboard` so `replaceLastInserted`'s repair
+    /// fallback can reuse the *same* borrow bookkeeping
+    /// (`restorePending` / `restoreGeneration` / `ourChangeCount`) instead of
+    /// growing a second, parallel one. There is exactly one borrow mechanism in
+    /// this file and this is it.
+    private func borrowPasteboardAndPasteV(_ text: String) -> PasteHandoff {
         let pasteboard = NSPasteboard.general
 
         // Resolve the keycode BEFORE touching the pasteboard, so a resolution
@@ -730,6 +1093,18 @@ final class TextInjector: TextInjecting {
         // in practice — there is a hardcoded fallback — but ordering the fragile
         // step first is free.)
         let vKeyCode = resolveVKeyCodeForPaste()
+
+        // Secure Event Input, checked at the WRITE rather than only at the
+        // caller's entry. `inject` checks on the way in, but the AX path and its
+        // settle run in between, and a password field or a Cursor leak can claim
+        // SEI inside that window. Putting the transcript on the general
+        // pasteboard at that moment is precisely what must never happen, so the
+        // check belongs here where the bytes actually land.
+        if secureInputActive() {
+            Self.log.notice("Secure Event Input became active before the pasteboard write; nothing was copied.")
+            return .failed("Secure input is active (password field, Terminal secure entry, "
+                + "or a Cursor/Electron leak). Nothing was put on the clipboard.")
+        }
 
         // Only snapshot when we are not already holding one. See `restorePending`.
         if !restorePending {
@@ -743,26 +1118,36 @@ final class TextInjector: TextInjecting {
         guard pasteboard.setString(text, forType: .string) else {
             // Put things back immediately; we never got as far as pasting.
             completeRestore(generation: generation, restoring: true)
-            return "Could not write the transcript to the clipboard."
+            return .failed("Could not write the transcript to the clipboard.")
         }
         ourChangeCount = pasteboard.changeCount
 
         guard postCommandV(keyCode: vKeyCode) else {
             completeRestore(generation: generation, restoring: true)
-            return "Could not post the paste keystroke. Check Accessibility permission in System Settings."
+            return .failed("Could not post the paste keystroke. Check Accessibility permission in System Settings.")
         }
+        return .posted(generation: generation, postedAt: Date(), keyCode: vKeyCode)
+    }
 
-        Self.log.info(
-            "Pasted \(text.count, privacy: .public) chars into \(targetID, privacy: .public) via keycode \(vKeyCode, privacy: .public)"
-        )
+    private func injectViaClipboard(_ text: String, targetID: String) -> String? {
+        switch borrowPasteboardAndPasteV(text) {
+        case .failed(let reason):
+            return reason
 
-        // Hand the restore off to a non-blocking watcher and return. `inject` is
-        // synchronous and main-actor-isolated, so *waiting* here would freeze the
-        // UI for the full settle timeout. Returning `nil` now is honest: we have
-        // successfully delivered the keystroke, which is the most any injector
-        // can actually observe (see the receipt discussion below).
-        scheduleReceiptSequencedRestore(generation: generation)
-        return nil
+        case .posted(let generation, let postedAt, let vKeyCode):
+            Self.log.info(
+                "Pasted \(text.count, privacy: .public) chars into \(targetID, privacy: .public) via keycode \(vKeyCode, privacy: .public)"
+            )
+
+            // Hand the restore off to a non-blocking watcher and return.
+            // `inject` is synchronous and main-actor-isolated, so *waiting* here
+            // would freeze the UI for the full settle timeout. Returning `nil`
+            // now is honest: we have successfully delivered the keystroke, which
+            // is the most any injector can actually observe (see the receipt
+            // discussion below).
+            scheduleReceiptSequencedRestore(generation: generation, since: postedAt)
+            return nil
+        }
     }
 
     /// Watch the pasteboard and put the user's clipboard back at the right time.
@@ -791,9 +1176,17 @@ final class TextInjector: TextInjecting {
     ///
     /// Which means `pasteSettleTimeout` is not a "fallback" — on the happy path
     /// it is the mechanism. Size it accordingly.
-    private func scheduleReceiptSequencedRestore(generation: Int) {
+    ///
+    /// `since` is the instant the Cmd+V went out. It is a parameter rather than
+    /// `Date()` inside the task because the repair fallback in
+    /// `replaceLastInserted` blocks for its receipt before scheduling: without
+    /// the anchor, that wait would be ADDED to the pasteboard window instead of
+    /// counted inside it. It also slightly tightens the ordinary path, whose
+    /// window previously started whenever the task first got to run rather than
+    /// at the paste itself.
+    private func scheduleReceiptSequencedRestore(generation: Int, since postedAt: Date) {
         Task { @MainActor [weak self] in
-            let deadline = Date().addingTimeInterval(Self.pasteSettleTimeout)
+            let deadline = postedAt.addingTimeInterval(Self.pasteSettleTimeout)
             while Date() < deadline {
                 try? await Task.sleep(for: .milliseconds(Int(Self.restorePollInterval * 1000)))
                 guard let self, generation == self.restoreGeneration else {
@@ -952,6 +1345,48 @@ final class TextInjector: TextInjecting {
         // `.cghidEventTap` injects at the lowest point in the event stream, so
         // the event passes through the same path as real hardware input and is
         // seen by every tap and by the target app's normal key handling.
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
+        return true
+    }
+
+    /// Post a bare Delete (backspace) keypress to the HID tap.
+    ///
+    /// This is the ONLY synthesised deletion in the project, and it is safe for
+    /// exactly one reason: its caller has already established and read back a
+    /// NON-EMPTY selection, and a Delete against a non-empty selection removes
+    /// the selection and nothing else. No count is computed, so there is no
+    /// unit to get wrong — which is the whole point, because the unit is not
+    /// ours to choose. AppKit and Blink delete by extended grapheme cluster,
+    /// readline in a terminal by code point; "ก่" is one backspace in one and
+    /// two in the other, and a ZWJ emoji sequence is one or three. A count in
+    /// the wrong unit is the exact class of bug that started this
+    /// investigation, so we never produce one.
+    ///
+    /// Flags are assigned ABSOLUTELY and empty, for the same reason
+    /// `postCommandV` assigns `.maskCommand` absolutely: at repair time the
+    /// user may still be physically holding the Right-Option hotkey, or the OS
+    /// may not have settled its release. `CGEvent.flags` is absolute rather
+    /// than additive, so a bare assignment wipes inherited hardware modifier
+    /// state. It matters more here than there — Cmd+Delete is "delete to
+    /// beginning of line" and Option+Delete is "delete word backward", either
+    /// of which would blow straight through the `count` ceiling this function
+    /// exists to respect.
+    ///
+    /// Source and tap choices mirror `postCommandV`; read its comment before
+    /// changing either. Note that the key posted here is Delete, not
+    /// Right-Option, so it cannot register as the held hotkey key itself.
+    private func postDeleteKey() -> Bool {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        let deleteKey = CGKeyCode(kVK_Delete)
+
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: deleteKey, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: deleteKey, keyDown: false)
+        else { return false }
+
+        keyDown.flags = []
+        keyUp.flags = []
+
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
         return true
