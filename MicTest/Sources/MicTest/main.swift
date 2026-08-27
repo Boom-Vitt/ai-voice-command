@@ -1473,12 +1473,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///      that switched itself off without saying why is its own bug.
     private func stopBecauseOffSwitchIsUnreachable(why: String, message: String) {
         let wasLive = isCapturing || drainTimer != nil
+        let actingNow = wasLive || wantsDictation
         // Trace unconditionally: "the hotkey died while idle" is a real diagnosis too, and
         // it is the line that explains why the next tap does nothing.
-        trace("OFF-SWITCH LOST: \(why) — wantsDictation=\(wantsDictation) "
+        //
+        // The LABEL is conditional on purpose, and the reason is this file's own history.
+        // Every ordinary sleep and screen-lock reaches here, so an all-caps alarm printed
+        // when nothing was running would fire several times a night and teach whoever reads
+        // this file to skim past it -- and then it is not there on the one occasion the
+        // microphone really was live and unstoppable. Measured 2026-08-27, first night after
+        // the observers landed: three OFF-SWITCH LOST lines, all three "nothing was live".
+        // Spend the loud label only when something was actually taken away.
+        trace((actingNow ? "OFF-SWITCH LOST: " : "off-switch watch: ")
+            + "\(why) — wantsDictation=\(wantsDictation) "
             + "isCapturing=\(isCapturing) hotkeyHealthy=\(hotkey.isHealthy)"
-            + (wasLive || wantsDictation ? "; stopping capture" : "; nothing was live"))
-        guard wasLive || wantsDictation else { return }
+            + (actingNow ? "; stopping capture" : "; nothing was live"))
+        guard actingNow else { return }
 
         wantsDictation = false
         if wasLive { finishCapture(reason: "off-switch lost: \(why)") }
