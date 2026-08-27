@@ -176,6 +176,87 @@ final class TextInjector: TextInjecting {
     /// Electron; it is only paid on a repair, never on an ordinary partial.
     private static let repairEchoTimeout: TimeInterval = 0.4
 
+    /// Hard ceiling on the total time `replaceLastInserted` may spend POLLING,
+    /// summed across all three of the settle loops it can run.
+    ///
+    /// Why a ceiling, and why here rather than in the three budgets above.
+    /// `HotkeyMonitor` attaches its event tap's run-loop source to
+    /// `CFRunLoopGetMain()` (`HotkeyMonitor.swift:514`) and its mask now includes
+    /// `.keyDown`, so that tap is serviced by the very run loop these polls
+    /// block. A main thread that stops answering gets the tap disabled with
+    /// `.tapDisabledByTimeout`; `HotkeyMonitor:576` re-enables it, but every
+    /// event delivered during the disable is gone — and if one of them was the
+    /// toggle-OFF tap, the microphone stays live with no off-switch. That is the
+    /// exact failure that file exists to prevent, so it outranks a good repair.
+    ///
+    /// The three budgets are each individually right and NONE of them has safe
+    /// slack to give back:
+    ///
+    ///   • `becomes: target` — burning it in full means we return WITHOUT
+    ///     posting, so shortening it saves nothing in the case that matters and
+    ///     costs repairs in Chromium, which is the case it was sized for.
+    ///   • `movesOff: target` — load-bearing for CORRECTNESS, not for speed.
+    ///     Inside the budget, an AX write that complies late is seen and no
+    ///     keystroke is posted; outside it we post, and if the write then lands
+    ///     the document gets the replacement twice. Shortening it trades
+    ///     document integrity for latency, which is the wrong direction.
+    ///   • `repairEchoTimeout` — shortening this only converts a success into an
+    ///     honest refusal with the selection left standing, which is the one
+    ///     failure mode this design has already proved safe (see the closing
+    ///     comment of `replaceLastInserted`, and the harness control arm that
+    ///     produces a hybrid document when that decision is reversed).
+    ///
+    /// So the ceiling clips the SUM instead, and the last settle absorbs the
+    /// clipping — the only one whose degraded outcome is already safe. In the
+    /// case that fires routinely (Electron: AX reads sub-millisecond, AX writes
+    /// inert) the serial cost is one 100-300 ms renderer round trip for the
+    /// range write, the full 400 ms `movesOff` burn because the write is inert,
+    /// and one more 100-300 ms round trip for the paste receipt — this file's
+    /// own Electron figures put that at ~1.1 s, twice per Thai utterance. At
+    /// 0.9 s the first two are untouched and the receipt still keeps ~200 ms,
+    /// which covers the middle of that band.
+    ///
+    /// HONEST INPUT: the threshold at which the window server disables an
+    /// unresponsive tap is NOT published by Apple and was NOT measured here —
+    /// measuring it needs a probe binary holding assistive access, which this
+    /// machine does not grant and granting is a security-settings change. So
+    /// this constant is not "provably under threshold T". What it is: the
+    /// routinely-incurred block drops ~200 ms and the pathological one ~900 ms,
+    /// with no correctness traded for either.
+    private static let repairPollBudget: TimeInterval = 0.9
+
+    /// Per-message timeout for the repair's OWN Accessibility traffic — i.e.
+    /// everything after the prologue, which keeps `axMessagingTimeout`.
+    ///
+    /// `axMessagingTimeout` deliberately stays at 250 ms: `inject()` uses it on
+    /// every partial, so lowering it there would change the AX-vs-clipboard
+    /// routing decision for every injection in the app. That is a far larger
+    /// behavioural change than this one and it is not measurable from here. This
+    /// tighter value is set on the already-captured focused element, so its
+    /// blast radius is exactly one `replaceLastInserted` call.
+    ///
+    /// What it buys: each settle poll is an AX round trip, so a wedged target
+    /// overshoots a settle budget by one message timeout — 100 ms rather than
+    /// 250 ms, three times over. It does nothing for the case that actually
+    /// kills the tap (in Electron these reads are sub-millisecond); it clips the
+    /// pathological tail only. 100 ms is still ~100x the reads measured in the
+    /// apps this path exists for.
+    private static let repairMessagingTimeout: Float = 0.1
+
+    /// Wall-clock ceiling on `snapshotPasteboard`.
+    ///
+    /// The byte budget below bounds how much we COPY; it never bounded how long
+    /// we WAIT. `data(forType:)` forces a lazy promise, which is a synchronous
+    /// IPC into whichever app owns the pasteboard, and AppKit exposes no timeout
+    /// for it. So — stated plainly rather than papered over — this CANNOT bound
+    /// one fetch, only the decision to start another: a single beachballing
+    /// provider can still overrun it by exactly one fetch.
+    ///
+    /// It needs a bound because it runs on the main actor inside the same window
+    /// as the polls above, and it also tightens the ordinary `injectViaClipboard`
+    /// path, which snapshots on every partial.
+    private static let snapshotTimeBudget: TimeInterval = 0.15
+
     /// Cumulative byte budget for snapshotting the user's existing clipboard.
     ///
     /// Reading a pasteboard type *forces* any lazy promise behind it, which can
@@ -201,6 +282,16 @@ final class TextInjector: TextInjecting {
         subsystem: Bundle.main.bundleIdentifier ?? "org.boombignose.PhayaVoice",
         category: "TextInjector"
     )
+
+    /// The one refusal reason that means "we were about to type into somebody
+    /// else's window". Hoisted to a constant so both repair shapes return the
+    /// SAME string: this is the reason a field report most needs to be able to
+    /// grep for, and two near-identical hand-written variants would defeat that.
+    /// The distinguishing detail (which branch we were in) goes to OSLog, where
+    /// it belongs, rather than into the HUD.
+    private static let focusMovedRefusal =
+        "keyboard focus moved after the selection was verified; the repair keystroke was NOT "
+        + "posted and nothing was changed"
 
     // MARK: - Clipboard restore bookkeeping
 
@@ -444,6 +535,15 @@ final class TextInjector: TextInjecting {
     /// before it fires, and the span being removed is an AX *range the field
     /// itself confirmed by read-back* — never a count of backspaces.
     ///
+    /// Every guard EXCEPT one runs against `focused`, captured at entry, and a
+    /// keystroke does not go to `focused` — it goes to whatever holds keyboard
+    /// focus when it is delivered. That gap is closed by `focusIsStill`,
+    /// re-asked immediately before each of the two posts; read its comment,
+    /// because it is the difference between "verified" and "verified something
+    /// else". And `expecting` must be at least 3 grapheme clusters here even
+    /// though path A accepts one, because a one-character content check is not
+    /// an identification.
+    ///
     /// That is what the 158/158 measurement actually licenses. Those refusals
     /// are all from the caret-did-not-move detector in `insertViaAccessibility`,
     /// which is only reachable after the systemwide focused-element copy
@@ -566,8 +666,31 @@ final class TextInjector: TextInjecting {
         // sized for a Chromium renderer round trip rather than an AppKit
         // runloop turn (see `axSelectionSettleTimeout`). A native field still
         // matches on the very first read.
+        //
+        // BUDGET. Everything from here to the end of this function polls the
+        // target app, and every poll blocks the main run loop — the same run
+        // loop that services `HotkeyMonitor`'s now-`.keyDown`-masked event tap
+        // (`HotkeyMonitor.swift:514`). `repairPollBudget` is the ceiling on the
+        // SUM of the settle loops below: each asks for its own budget and gets
+        // whatever is left, so no combination of them can stack past it. A zero
+        // remainder degrades a settle to a single read, which is still an honest
+        // answer rather than a guess. Read that constant's comment before
+        // changing any of the three budgets — which one absorbs the clipping is
+        // a safety decision, not an ordering accident.
+        //
+        // The messaging timeout tightens here for the same reason: from this
+        // point the AX traffic is this repair's own, so a wedged target
+        // overshoots a budget by 100 ms rather than 250 ms. The prologue above
+        // keeps `axMessagingTimeout` untouched — it is byte-identical to
+        // `fc6c49b` and its 5 round trips are pre-existing cost that this path
+        // did not introduce.
+        AXUIElementSetMessagingTimeout(focused, Self.repairMessagingTimeout)
+        let pollDeadline = Date().addingTimeInterval(Self.repairPollBudget)
+        func remainingPoll(_ cap: TimeInterval) -> TimeInterval {
+            min(cap, max(0, pollDeadline.timeIntervalSinceNow))
+        }
         let applied = selection(of: focused, becomes: target,
-                                within: Self.axSelectionSettleTimeout)
+                                within: remainingPoll(Self.axSelectionSettleTimeout))
         guard let applied,
               applied.location == target.location, applied.length == target.length else {
             // Nothing has been posted yet, so collapsing the caret back is safe
@@ -607,7 +730,7 @@ final class TextInjector: TextInjecting {
             // the first read; only a field that is genuinely inert pays the
             // settle budget.
             let echo = selection(of: focused, movesOff: target,
-                                 within: Self.axSelectionSettleTimeout)
+                                 within: remainingPoll(Self.axSelectionSettleTimeout))
             if let echo, echo.location == collapsed.location, echo.length == 0 {
                 // Positively confirmed: the selection collapsed to exactly
                 // where a correct replacement of this length leaves it.
@@ -645,9 +768,38 @@ final class TextInjector: TextInjecting {
         // A position that merely looks right is not enough to post a
         // destructive keystroke on. `repairDivergence` always supplies this;
         // the parameter is optional only for path A's benefit.
-        guard expecting != nil else {
+        guard let expecting else {
             collapseSelection(of: focused, to: caret.location)
             return "the field ignored the AX replacement and no content check was supplied; not repairing"
+        }
+
+        // ...and the content check has to be SPECIFIC enough to identify the
+        // span, which a single character is not. `staleCount == 1` is the
+        // commonest Thai repair shape there is — "ก" -> "ก่" adds a tone mark to
+        // the trailing cluster and `main.swift`'s `commonPrefixLength` compares
+        // Characters, so `expecting` is routinely ONE grapheme cluster. If focus
+        // has moved to another editable field whose text merely happens to end
+        // in that same character, every check above passes and path B rewrites
+        // text the user typed by hand.
+        //
+        // `replaceRecentText` has refused anything under 3 clusters since it was
+        // written, for exactly this reason ("ครับ" found in the wrong place is
+        // how an unrelated word gets eaten) — and this path is strictly more
+        // destructive than that one, because it posts a keystroke at whatever
+        // has focus rather than writing to a captured element reference. The
+        // weaker check on the more dangerous path was an oversight.
+        //
+        // PATH B ONLY, deliberately. Path A writes through `focused`, an element
+        // reference captured at entry, so a positional-plus-content match there
+        // cannot land in a different app no matter how short `expecting` is;
+        // applying this gate to path A would refuse repairs that are perfectly
+        // safe and lose them for no gain. The cost here is a truncated utterance
+        // the user can recover from the HUD; the cost of not doing it is text
+        // they wrote themselves.
+        guard expecting.count >= 3 else {
+            collapseSelection(of: focused, to: caret.location)
+            return "the stale text is too short to identify safely (under 3 characters) "
+                + "for a keystroke repair; not repairing"
         }
 
         // Secure Event Input, re-checked at the moment it matters. The entry
@@ -681,6 +833,13 @@ final class TextInjector: TextInjecting {
                 collapseSelection(of: focused, to: caret.location)
                 return "internal error: refusing to post Delete with an empty selection"
             }
+            guard focusIsStill(focused) else {
+                collapseSelection(of: focused, to: caret.location)
+                Self.log.notice(
+                    "Repair refused: FOCUS MOVED between the verified selection and the repair keystroke (delete branch); nothing was posted."
+                )
+                return Self.focusMovedRefusal
+            }
             guard postDeleteKey() else {
                 collapseSelection(of: focused, to: caret.location)
                 return "could not post the delete keystroke. Check Accessibility permission in System Settings."
@@ -690,6 +849,13 @@ final class TextInjector: TextInjecting {
                 "Repair fallback: deleted a \(target.length, privacy: .public)-unit selection with one Delete (no clipboard borrow)."
             )
         } else {
+            guard focusIsStill(focused) else {
+                collapseSelection(of: focused, to: caret.location)
+                Self.log.notice(
+                    "Repair refused: FOCUS MOVED between the verified selection and the repair keystroke (paste branch); the transcript never reached the clipboard."
+                )
+                return Self.focusMovedRefusal
+            }
             switch borrowPasteboardAndPasteV(text) {
             case .failed(let reason):
                 // The borrow released itself and nothing was posted.
@@ -718,8 +884,8 @@ final class TextInjector: TextInjecting {
         // The receipt. Without it this function would return `nil` on nothing
         // more than "we posted a key event", and the caller would write `text`
         // into its ledger whether or not the document ever changed.
-        let echo = selection(of: focused, becomes: collapsed,
-                             within: Self.repairEchoTimeout)
+        let echoBudget = remainingPoll(Self.repairEchoTimeout)
+        let echo = selection(of: focused, becomes: collapsed, within: echoBudget)
         if let echo, echo.location == collapsed.location, echo.length == 0 {
             return nil
         }
@@ -745,7 +911,7 @@ final class TextInjector: TextInjecting {
         // the "a selection is active" guard at the top of this function, and
         // the user should learn why from the first message.
         Self.log.notice(
-            "Repair fallback posted but was not echoed back within \(Int(Self.repairEchoTimeout * 1000), privacy: .public) ms; refusing and leaving the selection standing."
+            "Repair fallback posted but was not echoed back within \(Int(echoBudget * 1000), privacy: .public) ms (of a \(Int(Self.repairEchoTimeout * 1000), privacy: .public) ms budget, clipped by the poll ceiling); refusing and leaving the selection standing."
         )
         return "the repair keystroke was not confirmed by the field; the stale text is left "
             + "SELECTED rather than deleted (so a late paste still lands correctly) and "
@@ -1011,9 +1177,18 @@ final class TextInjector: TextInjecting {
     ///
     /// Two honest side effects of the blocking. A pending clipboard restore
     /// from a PREVIOUS injection cannot run while we are here, so that borrow
-    /// can stretch from 700 ms to roughly 1.1 s in the worst case. And each
-    /// poll is an AX round trip capped by `axMessagingTimeout`, so a wedged
-    /// target can overshoot `timeout` by one message timeout.
+    /// can stretch from 700 ms to roughly 1.1 s in the worst case — and a
+    /// restore task that resumes past its own deadline is exactly the case the
+    /// final `changeCount` check in `scheduleReceiptSequencedRestore` exists
+    /// for; without it, this blocking would let us write a stale snapshot over
+    /// a clipboard the user had claimed in the meantime. And each poll is an AX
+    /// round trip capped by the element's messaging timeout, so a wedged target
+    /// can overshoot `timeout` by one of those.
+    ///
+    /// The total is now bounded rather than merely per-call: `replaceLastInserted`
+    /// passes each of its three settles whatever is left of `repairPollBudget`,
+    /// so they cannot stack. See that constant for why the ceiling lives there
+    /// and not in the individual budgets.
     private func settledSelection(of element: AXUIElement, within timeout: TimeInterval,
                                   until satisfied: (CFRange) -> Bool) -> CFRange? {
         let deadline = Date().addingTimeInterval(timeout)
@@ -1047,6 +1222,48 @@ final class TextInjector: TextInjecting {
         settledSelection(of: element, within: timeout) {
             !($0.location == anchor.location && $0.length == anchor.length)
         }
+    }
+
+    /// Is `expected` STILL the element holding keyboard focus?
+    ///
+    /// This is the guard that separates path A from path B, and it exists
+    /// because the two write mechanisms have completely different targeting.
+    /// Every check in `replaceLastInserted` — settable, caret, kAXValue,
+    /// `expecting`, the clamped read-back — runs against `focused`, an
+    /// `AXUIElement` captured once at entry. Writing through that reference is
+    /// focus-INDEPENDENT by construction: it lands in the element we verified,
+    /// or it fails. Before the repair fallback existed that was the only write
+    /// this function could perform, and the whole class of bug below could not
+    /// occur.
+    ///
+    /// A synthesised keystroke has no such property. `postDeleteKey` and
+    /// `postCommandV` post to `.cghidEventTap`, which delivers to whatever has
+    /// keyboard focus AT THE MOMENT THE EVENT IS DELIVERED. And the window
+    /// between the last check and the post is not small: reaching path B at all
+    /// requires the `movesOff` poll to have burned its full budget, because that
+    /// is what "the AX write is inert" means — so in the target apps the window
+    /// is 400 ms GUARANTEED, and 500-800 ms typical once the range settle is
+    /// counted. A Cmd+Tab, a Spotlight invocation, or a dialog stealing focus
+    /// inside that window leaves our captured element still reading `target`
+    /// unchanged — the poll concludes "inert" from a perfectly honest read —
+    /// and the bare Delete then lands in the OTHER app at a collapsed caret,
+    /// deleting one cluster of text the user typed by hand. That breaks the
+    /// first invariant of this file ("never delete more than this app typed")
+    /// in the worst available way: in a document we never even looked at.
+    ///
+    /// One AX round trip, at `repairMessagingTimeout`. An UNREADABLE answer is
+    /// treated as a mismatch, not as a pass: a systemwide focused-element read
+    /// that fails means the target is wedged or gone, which is the more
+    /// dangerous case, and defaulting to "post anyway" there would aim the
+    /// keystroke at exactly the situation we cannot see.
+    private func focusIsStill(_ expected: AXUIElement) -> Bool {
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, Self.repairMessagingTimeout)
+        guard let current = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute)
+        else { return false }
+        // AX elements are CFTypes and compare by CFEqual, not by pointer: the
+        // same underlying UI element can come back as a different CFTypeRef.
+        return CFEqual(current, expected)
     }
 
     /// Put the caret back where we found it, collapsed, after deciding not to
@@ -1199,6 +1416,41 @@ final class TextInjector: TextInjecting {
                 }
             }
             guard let self, generation == self.restoreGeneration else { return }
+            // FINAL anti-clobber check. The loop above already checks
+            // `changeCount` every 50 ms, but falling out of it is NOT proof that
+            // the last check was recent — and the restore is the destructive
+            // half, so it must be gated by a check of its own rather than by the
+            // loop's history.
+            //
+            // Two ways the loop's checks go stale, both real here:
+            //
+            //   • The task is a `@MainActor` task, so its `Task.sleep`
+            //     continuation cannot resume while the main actor is blocked.
+            //     `replaceLastInserted`'s settle loops block it for up to
+            //     `repairPollBudget` plus the prologue's AX round trips, so a
+            //     PREVIOUS injection's restore can sit mid-loop for ~1 s. On
+            //     resume `Date() < deadline` is already false, the loop exits
+            //     immediately, and without this check we would write our
+            //     snapshot back having verified nothing for the whole stall.
+            //   • `since: postedAt` anchors the deadline at the keystroke, not
+            //     at the task's first run — deliberately, so the borrow is never
+            //     longer than `pasteSettleTimeout`. But it means a task that is
+            //     scheduled behind a blocking poll can have its FIRST evaluation
+            //     of `Date() < deadline` already be false, in which case the
+            //     loop body never executes and the guard inside it never runs at
+            //     all. That variant has no other check anywhere.
+            //
+            // Either way the user's Cmd+C in that window would be silently
+            // overwritten by a pre-dictation snapshot. `restoring: false` still
+            // releases the borrow and drops the snapshot, so the bookkeeping is
+            // unchanged — only the write is skipped.
+            if NSPasteboard.general.changeCount != self.ourChangeCount {
+                Self.log.info(
+                    "Pasteboard changed while the restore task was stalled past its deadline; skipping restore (no clobber)."
+                )
+                self.completeRestore(generation: generation, restoring: false)
+                return
+            }
             self.completeRestore(generation: generation, restoring: true)
         }
     }
@@ -1272,18 +1524,41 @@ final class TextInjector: TextInjecting {
     func snapshotPasteboard(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
         var snapshot: [[NSPasteboard.PasteboardType: Data]] = []
         var budget = Self.maxSnapshotBytes
+        // TIME budget as well as a byte budget. The byte budget bounds how much
+        // we copy; it does not bound how long we wait, and forcing a promise is
+        // a synchronous IPC into the providing app. This runs on the main actor
+        // in the same window as the repair's settle loops, and that window now
+        // has a ceiling (`repairPollBudget`), so an unbounded wait here would
+        // simply move the main-thread stall to a place nobody was measuring.
+        //
+        // Precise about what this does NOT do: AppKit exposes no timeout on
+        // `data(forType:)`, so one hostile or beachballing provider can still
+        // overrun the deadline by exactly one fetch. All that is bounded is the
+        // decision to START another fetch — same shape as the byte budget above
+        // it, and the same honest limit.
+        let deadline = Date().addingTimeInterval(Self.snapshotTimeBudget)
+        var ranOutOfTime = false
 
         for item in pasteboard.pasteboardItems ?? [] {
             var representations: [NSPasteboard.PasteboardType: Data] = [:]
             for type in prioritize(item.types) {
-                // Check the budget *before* fetching, so one oversized
-                // representation cannot drag the rest in behind it.
+                // Check both budgets *before* fetching, so one oversized or one
+                // slow representation cannot drag the rest in behind it.
                 guard budget > 0 else { break }
+                guard Date() < deadline else { ranOutOfTime = true; break }
                 guard let data = item.data(forType: type) else { continue }
                 representations[type] = data
                 budget -= data.count
             }
             if !representations.isEmpty { snapshot.append(representations) }
+            if ranOutOfTime { break }
+        }
+        if ranOutOfTime {
+            // Worth a line: it means the user's clipboard is coming back short,
+            // and the cause is a slow provider rather than a big one.
+            Self.log.notice(
+                "Clipboard snapshot hit its \(Int(Self.snapshotTimeBudget * 1000), privacy: .public) ms budget; some representations were not captured and will not be restored."
+            )
         }
         return snapshot
     }
