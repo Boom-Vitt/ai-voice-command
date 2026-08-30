@@ -1,0 +1,131 @@
+diff --git a/MicTest/Sources/MicTest/FalClient.swift b/MicTest/Sources/MicTest/FalClient.swift
+index 3caa13b..e416e07 100644
+--- a/MicTest/Sources/MicTest/FalClient.swift
++++ b/MicTest/Sources/MicTest/FalClient.swift
+@@ -184,8 +184,21 @@ struct FalClient: Sendable {
+ 
+     /// Where the key lives, relative to the user's home directory.
+     private static let keyFileComponents = [".config", "thaidictate", "env"]
+-    /// The variable we look for inside that file.
+-    private static let keyName = "FAL_KEY"
++    /// The variable we look for inside that file. Not `private`: it is the
++    /// default argument of ``loadKey(from:name:)``, so it has to be at least
++    /// as visible as that function.
++    static let keyName = "FAL_KEY"
++    /// The *optional* admin-scoped variable that file may carry.
++    ///
++    /// VESTIGIAL AS SHIPPED, and named as such so nobody wires against it
++    /// expecting a live feature: its only consumer was the fal credit-balance
++    /// probe, which was deleted when Gemini replaced fal as the cloud pass
++    /// (see the cloud-provider note in `main.swift`). ``FalBillingClient`` is
++    /// retained on disk but wholly unreferenced. Kept — rather than removed —
++    /// only because the fal path as a whole is retained to make that swap
++    /// reversible; if fal is ever unretired, this is where its second key
++    /// name lives. Nothing reads it today.
++    static let adminKeyName = "FAL_ADMIN_KEY"
+ 
+     // MARK: - Stored state
+ 
+@@ -240,15 +253,36 @@ struct FalClient: Sendable {
+         return url
+     }
+ 
+-    /// Parses `FAL_KEY=<value>` out of a dotenv-style file.
++    /// Parses `<name>=<value>` out of a dotenv-style file.
+     ///
+     /// Tolerates comments, blank lines, `export ` prefixes, surrounding
+     /// quotes, and spaces around the `=`. Everything else is ignored.
+     ///
++    /// The parser is deliberately variable-name-agnostic, and that generality
++    /// is now load-bearing for a different reason than it was written for: the
++    /// shipping cloud pass is Gemini, and ``GeminiClient`` reads its own
++    /// `GOOGLE_API_KEY` out of this same file through this same function. The
++    /// original motive — a second `FAL_ADMIN_KEY` line for the fal balance
++    /// probe — is gone with that probe (see ``adminKeyName``).
++    ///
++    /// CALLERS MUST PASS `name:` EXPLICITLY when they are not the fal path.
++    /// The default is ``keyName`` (`FAL_KEY`), so an omitted label silently
++    /// hands back the *fal* secret; a caller that then puts it in a Google
++    /// auth header would ship one vendor's key to another. ``GeminiClient``
++    /// passes it explicitly and says so at its call site.
++    ///
++    /// - Parameters:
++    ///   - url: The dotenv-style file to read.
++    ///   - name: Which assignment to return. Defaults to ``keyName``.
+     /// - Throws: ``ClientError/missingKey(_:)``, carrying the path, for every
+     ///   failure — absent file, unreadable file, no assignment, empty value.
+-    ///   Never traps, and never returns an empty string.
+-    static func loadKey(from url: URL) throws -> String {
++    ///   Never traps, and never returns an empty string. Note the thrown
++    ///   message names `FAL_KEY` literally, which is now wrong for every
++    ///   caller except the retained-but-unwired fal path. ``GeminiClient``
++    ///   therefore does not propagate it: it catches and re-throws its own
++    ///   ``GeminiClient/ClientError/missingKey(_:)`` naming `GOOGLE_API_KEY`,
++    ///   so the user is told to create the key they actually lack.
++    static func loadKey(from url: URL, name: String = keyName) throws -> String {
+         // `Data(contentsOf:)` rather than `String(contentsOf:)`: the String
+         // overload without an explicit encoding is deprecated on current SDKs.
+         guard let data = try? Data(contentsOf: url) else {
+@@ -262,8 +296,11 @@ struct FalClient: Sendable {
+             if line.hasPrefix("export ") { line = String(line.dropFirst(7)) }
+ 
+             guard let eq = line.firstIndex(of: "=") else { continue }
+-            let name = line[..<eq].trimmingCharacters(in: .whitespaces)
+-            guard name == keyName else { continue }
++            // `assigned`, not `name`: the parameter owns that identifier now.
++            // Shadowing it here would silently turn the guard into a tautology
++            // and hand back whichever assignment came first in the file.
++            let assigned = line[..<eq].trimmingCharacters(in: .whitespaces)
++            guard assigned == name else { continue }
+ 
+             var value = line[line.index(after: eq)...]
+                 .trimmingCharacters(in: .whitespaces)
+@@ -338,14 +375,14 @@ struct FalClient: Sendable {
+ 
+         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+         guard (200...299).contains(status) else {
+-            throw ClientError.http(status, redacting(Self.snippet(of: data)))
++            throw ClientError.http(status, Self.snippet(of: data, redact: redacting))
+         }
+ 
+         let decoded: ResponseBody
+         do {
+             decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
+         } catch {
+-            throw ClientError.decoding(redacting(Self.snippet(of: data)))
++            throw ClientError.decoding(Self.snippet(of: data, redact: redacting))
+         }
+ 
+         // `type` is "word" for transcript segments and "spacing" for the
+@@ -471,13 +508,26 @@ struct FalClient: Sendable {
+         text.replacingOccurrences(of: apiKey, with: "<redacted>")
+     }
+ 
+-    /// A short, printable prefix of a response body.
+-    private static func snippet(of data: Data) -> String {
++    /// A short, printable prefix of a response body, with the key already removed.
++    ///
++    /// ORDER IS LOAD-BEARING: this decodes the WHOLE body, hands it to `redact` to
++    /// scrub, and truncates only afterwards. The obvious arrangement — truncate first,
++    /// scrub the prefix — has a hole: a key echoed back so that it straddles the
++    /// `errorBodyPrefix` cut is severed, and `redacting(_:)` then finds no occurrence of
++    /// the whole key to replace, so the surviving head of it escapes into the error
++    /// string and from there into the log. That is the exact leak this scrubber exists
++    /// to make impossible, so the scrub must see text no shorter than what is printed.
++    /// `FalBillingClient` and `GeminiClient` compose theirs the same way; keep all three
++    /// in step. Taking `redact` as a parameter (rather than reading `apiKey`) is what
++    /// lets this stay `static` while still scrubbing an instance's key.
++    private static func snippet(of data: Data, redact: (String) -> String) -> String {
+         guard !data.isEmpty else { return "<empty body>" }
+-        let text = String(decoding: data.prefix(errorBodyPrefix), as: UTF8.self)
++        let full = String(decoding: data, as: UTF8.self)
+             .trimmingCharacters(in: .whitespacesAndNewlines)
+-        if text.isEmpty { return "<\(data.count) bytes of non-text>" }
+-        return data.count > errorBodyPrefix ? text + "…" : text
++        if full.isEmpty { return "<\(data.count) bytes of non-text>" }
++        let scrubbed = redact(full)
++        if scrubbed.count <= errorBodyPrefix { return scrubbed }
++        return String(scrubbed.prefix(errorBodyPrefix)) + "…"
+     }
+ 
+     /// `Duration` → milliseconds. Same conversion ``WhisperClient`` uses, so
