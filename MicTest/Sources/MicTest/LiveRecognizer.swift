@@ -242,6 +242,22 @@ final class LiveRecognizer: @unchecked Sendable {
         /// and the flushing-ness can never disagree. `append` stops feeding this session's
         /// request the instant this is set, which is what makes the handover sample-exact.
         var flushStartedAt: DispatchTime?
+        /// `lastPartialLength` frozen AT THE INSTANT OF THE FLUSH, latched by
+        /// `beginFlushRotation` in the same critical section that sets `flushStartedAt` and
+        /// records the replay window.
+        ///
+        /// WHY THIS IS NOT `lastPartialLength` READ LATER. `endAudio()` stops `append`
+        /// feeding this request, but it does NOT stop Speech refining the audio the request
+        /// already holds: partials keep arriving between the flush and the final, and each
+        /// one walks `lastPartialLength` up toward the final's length. Measuring the seam
+        /// against the live field therefore subtracts the post-flush refinement from the
+        /// very quantity the seam line exists to report, making every `+N` a LOWER BOUND —
+        /// and it let the flush line and the final line print different numbers under the
+        /// same name `last partial`. (`TEST-2026-08-30-seam.md` caught the extreme case in
+        /// its own table: a "last partial" of 184 against a final of 183, which is only
+        /// possible when the baseline moved after the flush.) This field is the one both
+        /// lines now quote, so they agree by construction.
+        var flushBaseline = 0
         /// Whether this flush's single outcome line has been claimed. A flush has three
         /// racing reporters — the flushed final in `handle`, the error path when the flush
         /// answers 1110 instead, and the 2 s net in `beginFlushRotation` — and exactly one
@@ -937,7 +953,15 @@ final class LiveRecognizer: @unchecked Sendable {
                 // mid-flush" — an ordinary utterance-boundary final, the common case.
                 let flushStartedAt = session.flushOutcomeReported ? nil : session.flushStartedAt
                 if flushStartedAt != nil { session.flushOutcomeReported = true }
-                let flushBaseline = session.lastPartialLength
+                // ── MEASURED FROM THE FLUSH, NOT FROM NOW ────────────────────────────
+                // Two figures, because the GAP between them is what used to corrupt this
+                // metric: `flushBaseline` is frozen at the flush and is what `+N` is
+                // computed from; `lastPartialLength` is wherever the partial stream has
+                // since walked. This line used to read only the live field, which
+                // silently subtracted the post-flush refinement from the recovery it was
+                // trying to report. See `Session.flushBaseline`.
+                let flushBaseline = session.flushBaseline
+                let partialAtFinal = session.lastPartialLength
                 lock.unlock()
 
                 // Emitted before the delivery/suppression fork below, because it measures
@@ -955,10 +979,25 @@ final class LiveRecognizer: @unchecked Sendable {
                     // (silence, or a wedge) — then `gained` is the whole final, which is NOT
                     // seam recovery and must never be averaged in with the real numbers.
                     let baselineNote = flushBaseline == 0 ? " [no partial yet — not seam loss]" : ""
+                    // Reported ONLY when it is non-zero, so an ordinary seam keeps the short
+                    // line. This is exactly the quantity the old final-time baseline used to
+                    // subtract from `gained` without saying so: text Speech added to the
+                    // partial AFTER `endAudio()`, by refining audio the request already held.
+                    // A negative value is not an error — Speech may retract as well as
+                    // extend — so it is reported with its sign rather than clamped away.
+                    let drift = partialAtFinal - flushBaseline
+                    let driftNote = drift == 0 ? "" :
+                        "; partial then moved \(drift > 0 ? "+" : "")\(drift) after the "
+                        + "flush, to \(partialAtFinal)"
+                    // "partial at flush" rather than the old "last partial": the two names
+                    // used to denote different instants while reading as one quantity, which
+                    // is the whole of review finding 3. Grep strings in TEST-2026-08-30.md
+                    // and TEST-2026-08-30-seam.md were updated to match.
                     Self.trace("rotation: flushed final after "
                         + "\(String(format: "%.0f", ms)) ms, "
-                        + "+\(gained) chars beyond last partial "
-                        + "(final \(text.count) vs last partial \(flushBaseline))"
+                        + "+\(gained) chars beyond partial at flush "
+                        + "(final \(text.count) vs partial at flush \(flushBaseline))"
+                        + driftNote
                         + baselineNote)
                 }
 
@@ -1503,15 +1542,25 @@ final class LiveRecognizer: @unchecked Sendable {
             if pendingReplayFrom == nil {
                 pendingReplayFrom = replayRing.totalSamplesWritten
             }
+            // Latched with the flush mark and the replay window, for the same reason those
+            // two are set together: the seam's three figures — where the replay starts,
+            // when the flush began, and what the final is measured against — must all
+            // describe the SAME instant, or they describe no instant at all. See
+            // `Session.flushBaseline` for what reading this later instead would cost.
+            session.flushBaseline = session.lastPartialLength
         }
-        let baseline = session.lastPartialLength
+        // Deliberately the latched field, not `lastPartialLength`: this is the number the
+        // flushed-final line quotes back as `partial at flush`, and the two must match.
+        // Meaningless when `live` is false, which is why `guard live` stands between this
+        // and its only use.
+        let baseline = session.flushBaseline
         lock.unlock()
 
         guard live else { return }
 
         Self.trace("rotation: flushing owner \(session.generation) at "
             + "\(String(format: "%.0f", Self.sessionRotationSeconds)) s (endAudio); "
-            + "last partial len \(baseline)")
+            + "partial at flush len \(baseline)")
         session.request.endAudio()
 
         // ── THE NET ──────────────────────────────────────────────────────────────────

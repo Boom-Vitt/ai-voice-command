@@ -158,6 +158,54 @@ final class TextInjector: TextInjecting {
     private static let axSelectionSettleTimeout: TimeInterval = 0.4
     private static let axSelectionPollInterval: TimeInterval = 0.025
 
+    /// Settle budget for the three AX read-backs that follow a write whose
+    /// IMMEDIATE re-read disagreed with what was just written.
+    ///
+    /// A TENTH of `axSelectionSettleTimeout`, and deliberately not that
+    /// constant: these three sites absorb a one-runloop-turn application lag in
+    /// the target app, they do not wait out a field that is actively refusing.
+    /// Reaching for the 0.4 s constant merely because it is adjacent would make
+    /// the worst case 400 ms at three more sites on the main actor, a 10×
+    /// regression for a case that resolves in single-digit milliseconds when it
+    /// resolves at all.
+    ///
+    /// Each of the three was an unconditional `usleep(40_000)` followed by
+    /// exactly one re-read: 40 ms of blocked main actor and two AX round trips,
+    /// every single time the immediate read disagreed. Polling instead lets a
+    /// field that applies at 5 ms be believed at 5 ms — the identical argument
+    /// the note above `axSelectionSettleTimeout` already makes for the refusal
+    /// budget ("a native app matches on the FIRST read and pays nothing at
+    /// all").
+    ///
+    /// THE EXACT COST, because "the same 40 ms ceiling" would be wrong.
+    /// `settledSelection` tests its deadline BEFORE it sleeps, so against a
+    /// 25 ms poll interval this budget reads at t=0, t=25 and t=50 ms and then
+    /// returns:
+    ///
+    ///     healthy field   1 round trip,    0 ms blocked   (was 2, and 40 ms)
+    ///     wedged field    3 round trips,  50 ms blocked   (was 2, and 40 ms)
+    ///
+    /// The common case — which recurs on every partial that finds a standing
+    /// selection — gets the whole 40 ms back. A field that is genuinely not
+    /// settling costs 10 ms and one round trip MORE than it used to. That trade
+    /// is the point of the change; it is not a wash, and it is not free.
+    ///
+    /// Deliberately NOT lowered to 0.025, which the arithmetic above would let
+    /// us do for a 25 ms / 2 round-trip worst case. That moves the last read
+    /// from t=50 back to t=25 and narrows the window the old code had at t=40:
+    /// a field applying between 25 and 40 ms would newly be declared a no-op,
+    /// and at the `movesOff` site that means pasting the user's text a second
+    /// time. Widening the window (reads at 0, 25 AND 50) is the safe direction —
+    /// every field the old code caught is still caught, and some it missed are
+    /// now caught too. Latency is the thing to trade here; detection is not.
+    ///
+    /// The BLOCKING is deliberate and must stay. Making these paths `async` to
+    /// get the main actor back would let other main-actor work interleave in the
+    /// middle of a read-modify-write against the focused element; the side
+    /// effects `settledSelection` documents depend on exactly that not
+    /// happening. Reducing the stall is the fix here, not yielding.
+    private static let axAsyncApplySettleTimeout: TimeInterval = 0.04
+
     /// How long we wait for a synthesised repair keystroke (Cmd+V, or a bare
     /// Delete) to come back as a collapsed caret at exactly the offset a
     /// correct replacement would produce.
@@ -553,11 +601,12 @@ final class TextInjector: TextInjecting {
         // runloop turn late, and concluding "the field refused" from the
         // immediate read alone is the mistake `insertViaAccessibility`'s
         // comment block documents at length.
-        var applied = selectedTextRange(of: focused)
-        if !(applied?.location == collapsed.location && applied?.length == 0) {
-            usleep(40_000)   // 40 ms settle; AX set is IPC, application can lag a runloop turn
-            applied = selectedTextRange(of: focused)
-        }
+        //
+        // `becomes` rather than sleep-then-read-once: nothing but the exact
+        // collapsed caret will do here, and a field that produces it on the
+        // first read now pays nothing instead of a flat 40 ms of main actor.
+        let applied = selection(of: focused, becomes: collapsed,
+                                within: Self.axAsyncApplySettleTimeout)
         guard let applied, applied.location == collapsed.location, applied.length == 0 else {
             return Self.standingSelectionRefusal
         }
@@ -654,14 +703,29 @@ final class TextInjector: TextInjecting {
                 // clipboard fallback then pastes the SAME text a second time.
                 // So wait one beat and re-read once; only a caret that is
                 // STILL unchanged is solid evidence of a no-op.
-                usleep(40_000)   // 40 ms settle; AX set is IPC, application can lag a runloop turn
-                guard let settled = selectedTextRange(of: focused) else {
+                // `movesOff`, because ANY movement is proof the write landed:
+                // an async-applying field that moves the caret at 5 ms is
+                // believed at 5 ms, and only a field that genuinely did nothing
+                // burns the full budget.
+                //
+                // THE NIL BRANCH BELOW IS LOAD-BEARING — do not fold it into the
+                // comparison that follows. `settledSelection` returns nil only
+                // when its LAST read failed, which still means "we could not
+                // read", never "nothing happened", and this path's rule is that
+                // an unreadable answer trusts the `.success`. Letting nil fall
+                // through to the equality test would report a no-op for an
+                // insertion that DID land, sending it to the clipboard fallback
+                // to paste the user's text a second time — the outcome the block
+                // above calls the worst in this file.
+                let settledOrNil = selection(of: focused, movesOff: before,
+                                             within: Self.axAsyncApplySettleTimeout)
+                guard let settled = settledOrNil else {
                     // The re-read failed: no solid evidence of a no-op, so per
                     // the rule above we trust the .success.
                     return true
                 }
                 if before.location == settled.location && before.length == settled.length {
-                    Self.log.notice("AX reported kAXSelectedText settable but the caret did not move (even after a 40 ms settle); treating as a no-op.")
+                    Self.log.notice("AX reported kAXSelectedText settable but the caret did not move (even after polling it for 40 ms); treating as a no-op.")
                     return false
                 }
             }
@@ -1364,12 +1428,13 @@ final class TextInjector: TextInjecting {
         // production ("the field clamped the selection" on a field that had
         // accepted the very same insertions) — so on mismatch, wait one beat
         // and re-read once before concluding the field really clamped it.
-        func readBack() -> CFRange? { selectedTextRange(of: focused) }
-        var applied = readBack()
-        if !(applied?.location == target.location && applied?.length == target.length) {
-            usleep(40_000)   // 40 ms settle; AX set is IPC, application can lag a runloop turn
-            applied = readBack()
-        }
+        // `becomes` rather than sleep-then-read-once: a clamp is only provable
+        // against the exact range we asked for. This function is NOT inside
+        // `replaceLastInserted`'s `repairPollBudget` scope — that ceiling and
+        // its `remainingPoll` helper are local to that function — so this budget
+        // stands alone and stacks with nothing.
+        let applied = selection(of: focused, becomes: target,
+                                within: Self.axAsyncApplySettleTimeout)
         guard let applied,
               applied.location == target.location, applied.length == target.length else {
             // Restore the caret so we do not leave a surprise selection behind.
