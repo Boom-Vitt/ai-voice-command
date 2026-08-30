@@ -293,6 +293,13 @@ final class TextInjector: TextInjecting {
         "keyboard focus moved after the selection was verified; the repair keystroke was NOT "
         + "posted and nothing was changed"
 
+    /// The refusal returned when a selection is standing in the target field
+    /// and the field would not collapse it. Hoisted next to `focusMovedRefusal`
+    /// for the same reason: `main.swift` classifies refusals by matching on
+    /// their text, so there must be exactly ONE spelling of each of them.
+    private static let standingSelectionRefusal =
+        "a selection is standing in the field and could not be collapsed; not typing over it"
+
     // MARK: - Clipboard restore bookkeeping
 
     /// A flattened copy of every representation of every item that was on the
@@ -347,7 +354,30 @@ final class TextInjector: TextInjecting {
     /// - Returns: `nil` on success, otherwise a short human-readable reason
     ///   suitable for showing in the HUD. Never throws; every runtime failure
     ///   comes back as a string.
+    ///
+    /// WHY THIS IS TWO METHODS AND NOT ONE WITH A DEFAULT ARGUMENT. The obvious
+    /// spelling is `inject(_ text: String, collapseStandingSelection: Bool =
+    /// false)` — one method, existing call sites untouched. It does not
+    /// compile: Swift matches protocol witnesses by FULL name, that method's
+    /// name is `inject(_:collapseStandingSelection:)`, and `TextInjecting`
+    /// requires `inject(_:)`. swiftc says "type 'TextInjector' does not conform
+    /// to protocol 'TextInjecting'" and offers to add a stub. So the
+    /// one-argument overload below IS the conformance, and it is also the
+    /// documented default — which is why no default value is spelled on the
+    /// parameter of the two-argument form: with the forwarder present, a
+    /// default there would make `inject(x)` resolvable two ways for no gain.
     func inject(_ text: String) -> String? {
+        inject(text, collapseStandingSelection: false)
+    }
+
+    /// - Parameter collapseStandingSelection: when `true`, a selection standing
+    ///   in the focused field is collapsed to its END before anything is
+    ///   written, and the injection is REFUSED if it cannot be. Read
+    ///   `collapseStandingSelectionToEnd` before changing anything about it:
+    ///   the direction is load-bearing and the caller — not this file — is the
+    ///   one that knows whether a standing selection is the user's or a mess
+    ///   left by a refused repair.
+    func inject(_ text: String, collapseStandingSelection: Bool) -> String? {
         guard !text.isEmpty else {
             // Nothing to deliver is not a failure — an empty transcript just
             // means the user held the hotkey and said nothing.
@@ -372,6 +402,57 @@ final class TextInjector: TextInjecting {
                 + "Privacy & Security > Accessibility, then try again."
         }
 
+        // A standing selection is a hazard BOTH paths below would silently
+        // consume, and neither of them could tell you afterwards. Path A writes
+        // `kAXSelectedText`, whose documented semantics are "replace the
+        // selection, or insert at the caret when there is none" — the second
+        // half is what makes it an append, the first half eats the selection.
+        // Path B's Cmd+V replaces a selection for the same reason. Both replace
+        // functions in this file refuse outright on `caret.length != 0`
+        // ("a selection is active; not replacing"); this one never had that
+        // guard because until the re-anchor change no caller could reach it
+        // with a selection standing.
+        //
+        // One can now. Path B of a refused repair DELIBERATELY leaves the stale
+        // tail selected rather than collapsing the caret (see the closing
+        // comment of `replaceLastInserted` — a late paste must still land over
+        // it), and that was safe under its old contract, in which the caller
+        // stopped typing for the rest of the utterance. The caller re-anchors
+        // and keeps typing now, so the very next append would arrive with the
+        // selection still standing and swallow the whole selected span.
+        //
+        // The CALLER decides, because refusing is not always right: the first
+        // injection of an utterance should keep replace-the-selection
+        // semantics, since dictating over text the user selected by hand is a
+        // feature, not an accident.
+        //
+        // COST, since this runs on every partial the caller asks it for: a
+        // second systemwide focused-element copy (`insertViaAccessibility`
+        // takes its own) plus one selection read — two AX round trips, which
+        // this file's own measurements put in the sub-millisecond band even in
+        // Electron. The 40 ms settle inside the helper is only ever paid when a
+        // selection is ACTUALLY standing, which is once per refused repair.
+        if collapseStandingSelection {
+            let systemWide = AXUIElementCreateSystemWide()
+            AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
+            if let focused = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute) {
+                AXUIElementSetMessagingTimeout(focused, Self.axMessagingTimeout)
+                if let reason = collapseStandingSelectionToEnd(focused) {
+                    // Return HERE. Falling through would reach the clipboard
+                    // path, which pastes over exactly the selection we just
+                    // failed to clear — the outcome this guard exists for.
+                    Self.log.notice(
+                        "Refusing injection: a selection is standing in the focused field and the field would not collapse it."
+                    )
+                    return reason
+                }
+            }
+            // No focused element to ask. Proceed: that is unchanged behaviour
+            // (the clipboard path needs no AX element and often still works),
+            // and refusing on an AX tree we cannot copy would turn one
+            // unreadable attribute into "dictation does not work in this app".
+        }
+
         let target = frontmostAppInfo()
         let targetID = target?.bundleID ?? "unknown"
 
@@ -388,6 +469,103 @@ final class TextInjector: TextInjecting {
             "AX direct insertion unavailable for \(targetID, privacy: .public) (expected for Electron apps); falling back to clipboard paste"
         )
         return injectViaClipboard(text, targetID: targetID)
+    }
+
+    /// Collapse a selection standing in `focused` to its END, so an append
+    /// cannot eat it.
+    ///
+    /// - Returns: `nil` when there was nothing to collapse, when the collapse
+    ///   is confirmed, or when the field's selection could not be read at all;
+    ///   the refusal reason when a selection IS standing and the field would
+    ///   not clear it.
+    ///
+    /// ── Why END, and why it is not a preference ─────────────────────────────
+    ///
+    /// The selection this exists for is the stale tail that a refused repair
+    /// targeted and left selected. That text is STILL IN THE DOCUMENT, and the
+    /// caller's re-anchored ledger is built on exactly that assumption: it
+    /// treats the stale tail as part of what precedes the new text. Collapsing
+    /// to the selection's START would put every subsequent append BEFORE the
+    /// stale text, producing a document the ledger cannot describe — and the
+    /// next repair's content check would then compare `expecting` against a
+    /// tail that has the stale span sitting after it. Collapsing to the END
+    /// keeps document order and ledger order the same. So a field that
+    /// collapses somewhere else of its own accord (several collapse to the
+    /// selection start on a caret write) must be REFUSED rather than accepted,
+    /// which is why the read-back below demands the exact offset instead of
+    /// merely "no selection any more".
+    ///
+    /// ── What this does NOT protect against (accepted, and bounded) ──────────
+    ///
+    /// The selection was left standing precisely because a repair keystroke —
+    /// a Cmd+V or a Delete — was posted and never confirmed within the echo
+    /// budget. "Late" has no hard bound, so that keystroke can still land AFTER
+    /// this collapse: the paste then inserts at the collapsed caret instead of
+    /// over the selection (document gains the replacement text an extra time),
+    /// or the Delete removes one unit at the caret instead of the selection.
+    /// Either way the document and the ledger diverge by a BOUNDED amount, and
+    /// the divergence is detected — not silently carried — by the very next
+    /// repair's `expecting` check, which refuses and lets the caller re-anchor
+    /// on a bounded stale count. That is strictly better than the behaviour
+    /// this replaces, where the same late keystroke was possible AND the
+    /// ordinary case silently ate the entire selected span with nothing
+    /// detecting it afterwards.
+    ///
+    /// It also cannot help a field whose selection we cannot read; see the
+    /// first guard for why proceeding is the right answer there.
+    private func collapseStandingSelectionToEnd(_ focused: AXUIElement) -> String? {
+        guard let standing = selectedTextRange(of: focused) else {
+            // Cannot guard what cannot be read. This is today's behaviour for
+            // every field whose range read fails — `inject` has never asked —
+            // and refusing instead would break dictation into every app whose
+            // selection attribute is unreadable, to protect against a hazard we
+            // have no evidence is present.
+            Self.log.debug(
+                "Standing-selection check: kAXSelectedTextRange was unreadable; proceeding without it."
+            )
+            return nil
+        }
+        // `length == 0` is the ordinary caret: nothing to do. A NEGATIVE length
+        // is a malformed read rather than a selection, and `location + length`
+        // would move the caret BACKWARD — a document change made on garbage
+        // input — so it is treated exactly like the unreadable case above.
+        guard standing.length > 0 else {
+            if standing.length < 0 {
+                Self.log.debug(
+                    "Standing-selection check: field reported a negative selection length; proceeding without it."
+                )
+            }
+            return nil
+        }
+
+        var collapsed = CFRange(location: standing.location + standing.length, length: 0)
+        guard let rangeValue = AXValueCreate(.cfRange, &collapsed) else {
+            return Self.standingSelectionRefusal
+        }
+        guard AXUIElementSetAttributeValue(
+            focused, kAXSelectedTextRangeAttribute as CFString, rangeValue
+        ) == .success else {
+            return Self.standingSelectionRefusal
+        }
+
+        // Read back, with the one-beat settle both replace paths already use:
+        // an AX set is synchronous IPC but the application can apply it a
+        // runloop turn late, and concluding "the field refused" from the
+        // immediate read alone is the mistake `insertViaAccessibility`'s
+        // comment block documents at length.
+        var applied = selectedTextRange(of: focused)
+        if !(applied?.location == collapsed.location && applied?.length == 0) {
+            usleep(40_000)   // 40 ms settle; AX set is IPC, application can lag a runloop turn
+            applied = selectedTextRange(of: focused)
+        }
+        guard let applied, applied.location == collapsed.location, applied.length == 0 else {
+            return Self.standingSelectionRefusal
+        }
+
+        Self.log.notice(
+            "collapsed a standing \(standing.length, privacy: .public)-unit selection to its end before appending (left by a refused repair)"
+        )
+        return nil
     }
 
     // MARK: - Frontmost application
@@ -617,33 +795,133 @@ final class TextInjector: TextInjecting {
         }
         guard caret.length == 0 else { return "a selection is active; not replacing" }
 
-        // Read the element's text to convert grapheme count -> UTF-16 range.
-        var valueRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            focused, kAXValueAttribute as CFString, &valueRef
-        ) == .success, let valueRef, CFGetTypeID(valueRef) == CFStringGetTypeID() else {
-            return "could not read the field's text to verify the range"
+        // Convert the caller's grapheme `count` into the UTF-16 span sitting
+        // immediately before the caret. Two reads can answer that, and which
+        // one runs first is a correctness decision, not an optimisation.
+        //
+        // ── PRIMARY: kAXStringForRange, a PARAMETERIZED attribute ───────────
+        //
+        // It takes a range and returns that range's text, and — this is the
+        // entire point — parameterized text attributes are indexed in the SAME
+        // coordinate space as `kAXSelectedTextRange`. `kAXValue` is not always
+        // in that space: web and Electron text controls routinely report a
+        // value string whose offsets differ from selection offsets by a base
+        // amount (surrounding content the accessibility tree folds into the
+        // value). Slicing `kAXValue` at `caret.location` there reads a tail
+        // from the WRONG PLACE, `expecting` therefore does not match it, and
+        // the repair refuses systematically — in exactly the apps whose repairs
+        // have to go through path B, which is where this function's whole
+        // 158/158 story comes from.
+        //
+        // Anchoring on the caret cancels the offset by construction: the same
+        // unknown base is present in the range we read and in the range we
+        // write, so it never appears in the arithmetic. `replaceRecentText`
+        // reached the same conclusion from the other end (see its "Target is
+        // expressed CARET-RELATIVE" note, which converts a value-space hit into
+        // a caret-relative range); this does it one step earlier by never
+        // leaving selection space at all.
+        //
+        // ── FALLBACK: the original kAXValue block, kept verbatim ─────────────
+        //
+        // Native AppKit fields are proven correct on it — the two spaces
+        // coincide there — and not every element implements the parameterized
+        // attribute at all. A negative `caret.location` also lands here, and
+        // the guard inside it owns that refusal.
+        //
+        // ── Window size ─────────────────────────────────────────────────────
+        //
+        // Thai grapheme clusters run 1-4 UTF-16 units, so `4 * count` bounds
+        // the units the `count` clusters we want can occupy. The +64 slack
+        // keeps `suffix(count)` clear of the window's LEADING edge, which can
+        // and does cut a cluster in half; a truncated first cluster changes the
+        // window's Character sequence at its start, never at its end.
+        //
+        // ── One check that could not come across, stated plainly ────────────
+        //
+        // The `kAXValue` path refuses when `caret.location` does not land on a
+        // Character boundary of the value string ("caret is mid-cluster"). That
+        // question cannot be ASKED of a windowed read: the caret is always at
+        // the window's end, and a string's end index is always a valid boundary
+        // of that string. Probing the unit AFTER the caret was considered and
+        // rejected — it fails at end-of-text, which is the normal dictation
+        // case, and a field that clamps rather than fails would make the probe
+        // silently always-pass, i.e. protection that is not there. The residual
+        // is a grapheme extender sitting immediately after the caret that
+        // MicTest did not type, which needs an external writer mid-dictation;
+        // when it happens, the range read-back below refuses in any field that
+        // normalises selections to cluster boundaries. `tail` is still sliced
+        // on the window's own grapheme boundaries, so nothing here can split a
+        // cluster it can see.
+        let len16: Int
+        let windowLen16 = min(caret.location, 4 * count + 64)
+        // The read is hoisted out of the condition on purpose: the fallback
+        // below has to be able to say WHICH of the two ways it got here, and
+        // they mean opposite things. "Attribute unavailable" is the expected,
+        // permanent shape of a field that never implements it. "Window returned
+        // a different length" means the field DOES implement it and answered
+        // something we cannot do arithmetic on — which would make this whole
+        // fix a silent no-op in exactly the apps it exists for, and that must
+        // be visible in the trace rather than inferred from repairs that keep
+        // refusing.
+        let window = windowLen16 > 0
+            ? axString(of: focused,
+                       location: caret.location - windowLen16,
+                       length: windowLen16)
+            : nil
+        if let window, window.utf16.count == windowLen16 {
+            // The exact-length check is not pedantry: everything below assumes
+            // the window ENDS at the caret. A field that returned a different
+            // number of units than it was asked for has not answered that
+            // question, so we ask `kAXValue` instead of guessing.
+            guard window.count >= count else {
+                return "fewer characters before the caret than expected (field changed?)"
+            }
+            let tail = window.suffix(count)
+            if let expecting, String(tail) != expecting {
+                return "text before the caret is not what MicTest typed (focus moved?)"
+            }
+            len16 = tail.utf16.count
+            Self.log.debug(
+                "Repair content check: parameterized caret-relative read (\(windowLen16, privacy: .public) UTF-16 units before the caret)."
+            )
+        } else {
+            // Read the element's text to convert grapheme count -> UTF-16 range.
+            var valueRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                focused, kAXValueAttribute as CFString, &valueRef
+            ) == .success, let valueRef, CFGetTypeID(valueRef) == CFStringGetTypeID() else {
+                return "could not read the field's text to verify the range"
+            }
+            let full = (valueRef as! CFString) as String
+            let utf16 = full.utf16
+            guard caret.location >= 0, caret.location <= utf16.count else {
+                return "caret position is outside the field's text"
+            }
+            guard let caretIdx = String.Index(String.Index(utf16Offset: caret.location, in: full),
+                                              within: full) else {
+                // Caret sits inside a surrogate pair / combining sequence -- the
+                // field changed under us. Do nothing.
+                return "caret is mid-cluster; field changed underneath us"
+            }
+            let prefix = full[full.startIndex..<caretIdx]
+            guard prefix.count >= count else {
+                return "fewer characters before the caret than expected (field changed?)"
+            }
+            let tail = prefix.suffix(count)
+            if let expecting, String(tail) != expecting {
+                return "text before the caret is not what MicTest typed (focus moved?)"
+            }
+            len16 = tail.utf16.count
+            let why: String
+            if windowLen16 <= 0 {
+                why = "nothing before the caret to window"
+            } else if let window {
+                why = "kAXStringForRange returned \(window.utf16.count) units, asked for \(windowLen16)"
+            } else {
+                why = "kAXStringForRange unavailable"
+            }
+            Self.log.debug("Repair content check: kAXValue fallback (\(why, privacy: .public)).")
         }
-        let full = (valueRef as! CFString) as String
-        let utf16 = full.utf16
-        guard caret.location >= 0, caret.location <= utf16.count else {
-            return "caret position is outside the field's text"
-        }
-        guard let caretIdx = String.Index(String.Index(utf16Offset: caret.location, in: full),
-                                          within: full) else {
-            // Caret sits inside a surrogate pair / combining sequence -- the
-            // field changed under us. Do nothing.
-            return "caret is mid-cluster; field changed underneath us"
-        }
-        let prefix = full[full.startIndex..<caretIdx]
-        guard prefix.count >= count else {
-            return "fewer characters before the caret than expected (field changed?)"
-        }
-        let tail = prefix.suffix(count)
-        if let expecting, String(tail) != expecting {
-            return "text before the caret is not what MicTest typed (focus moved?)"
-        }
-        let len16 = tail.utf16.count
 
         var target = CFRange(location: caret.location - len16, length: len16)
         guard let rangeValue = AXValueCreate(.cfRange, &target) else {
@@ -1161,6 +1439,33 @@ final class TextInjector: TextInjecting {
         guard withUnsafeMutablePointer(to: &range, { AXValueGetValue(axValue, .cfRange, $0) })
         else { return nil }
         return range
+    }
+
+    /// Read the text of `element` over `[location, location + length)` via the
+    /// `kAXStringForRange` PARAMETERIZED attribute.
+    ///
+    /// Units are UTF-16 code units, in the same coordinate space as
+    /// `kAXSelectedTextRange` — which is the whole reason this sits next to
+    /// that reader rather than being folded into the `kAXValue` read it
+    /// competes with. Those two spaces are not always the same space; see the
+    /// long comment in `replaceLastInserted`.
+    ///
+    /// Returns `nil` for every answer that is not a non-empty string: attribute
+    /// unsupported, range rejected, non-string reply, or an empty reply where
+    /// we asked for at least one unit. Each of those means "ask `kAXValue`
+    /// instead", never "there is no text there" — this function deliberately
+    /// cannot report an empty window, because it is only ever called with a
+    /// positive length.
+    private func axString(of element: AXUIElement, location: Int, length: Int) -> String? {
+        guard location >= 0, length > 0 else { return nil }
+        var range = CFRange(location: location, length: length)
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var result: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element, kAXStringForRangeParameterizedAttribute as CFString, rangeValue, &result
+        ) == .success, let result, CFGetTypeID(result) == CFStringGetTypeID() else { return nil }
+        let string = (result as! CFString) as String
+        return string.isEmpty ? nil : string
     }
 
     /// Block until `kAXSelectedTextRange` reads back as `expected`, or until
