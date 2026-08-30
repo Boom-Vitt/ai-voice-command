@@ -26,12 +26,39 @@
 //
 //    * LiveRecognizer (on-device SFSpeechRecognizer, th-TH) drives the live text.
 //      It emits a *growing* partial: the whole utterance so far, every time. We track
-//      what we have already typed and inject only the new suffix.
-//    * fal Scribe v2 can run an accuracy pass on each finalized utterance — OPT-IN,
-//      default OFF: the user explicitly declined auto-correction in favour of realtime
-//      speed, so the chunk loop that feeds it is not even started unless the menubar
-//      toggle was switched on. See `noteFinalChunk` for the gate that stops it
-//      laundering hallucinations when it does run.
+//      what we have already typed and inject only the new suffix. It keeps that job
+//      because nothing else was fast enough when this was written: Gemini's earlier
+//      streaming model was measured needing 25 s before its first output, against
+//      on-device word-by-word. See the engine selector below for what changed.
+//    * Gemini 3.5 Flash (`GeminiClient`) runs an accuracy pass on each finalized
+//      ~10 s chunk — OPT-IN, default OFF, because it sends audio off the machine.
+//      It REPLACED fal Scribe v2 at the user's instruction, and the fal client and its
+//      billing probe have since been deleted outright; see the cloud section.
+//      Whether its result is APPLIED to the typed text is a second toggle, and that
+//      one now defaults ON — also the user's choice, recorded at `autoCorrectEnabled`.
+//      See `noteFinalChunk` for the gate that stops it laundering hallucinations.
+//
+//  ── TWO live engines, and Apple is the default ─────────────────────────────────
+//
+//  `GeminiLiveRecognizer` is a second engine for the LIVE pass, selectable from the
+//  menubar and persisted at `UserDefaults["dictationEngine"]`. It streams audio to
+//  `gemini-3.5-transcribe-live` over a WebSocket and answers one complete phrase per
+//  silence-delimited turn (measured: 0.30 s after each pause, 97.6% character accuracy
+//  on Thai) — which is the same utterance model this file already consumes, so nothing
+//  downstream of `RecognizerEventBox` knows or cares which engine produced the text.
+//
+//  APPLE STAYS THE DEFAULT, and the reason is not latency. Selecting Gemini Live sends
+//  the microphone to Google CONTINUOUSLY for as long as dictation is running — not the
+//  ~10 s chunks the accuracy pass sends when it is switched on, but everything. Apple's
+//  engine never leaves the Mac. That difference is the user's to make deliberately, so
+//  it is opt-in, it is stated in the menu item's title and tooltip rather than buried,
+//  and `nil` in UserDefaults means Apple.
+//
+//  ONE CONSEQUENCE WORTH STATING HERE. The watchdog ladder in `tickStatus` (bounce ->
+//  capture restart -> `pkill localspeechrecognition`) is Apple-specific to its third
+//  rung: it kills a macOS system service that a WebSocket to Google does not use. It
+//  stands down entirely while Gemini Live is the active engine; a Gemini stall surfaces
+//  through that engine's own `.unavailable` instead.
 //
 //  ── In-place repair, read this before touching the injection code ──────────────
 //
@@ -67,8 +94,8 @@
 //  statements at the very bottom are the process entry point.
 //
 //  This file consumes types authored elsewhere in the same module — do not redefine
-//  them: AudioPipeline, LiveRecognizer, TextInjector, HotkeyMonitor, DictationHUD,
-//  FalClient, WhisperClient.
+//  them: AudioPipeline, LiveRecognizer, GeminiLiveRecognizer, TextInjector,
+//  HotkeyMonitor, DictationHUD, GeminiClient, WhisperClient.
 //
 
 import AppKit
@@ -77,15 +104,20 @@ import AVFoundation
 // MARK: - Constants
 
 /// Technical vocabulary, used for BOTH halves of the recognition stack:
-///   * handed to `FalClient.transcribe(wav:keyterms:)` so the cloud pass biases towards
+///   * handed to `GeminiClient.transcribe(wav:keyterms:)` so the cloud pass biases towards
 ///     these spellings instead of transliterating them into Thai phonetics, and
 ///   * handed to `LiveRecognizer.setContextualStrings` so the on-device pass biases the
 ///     same way and the live text does not have to be undone by the cloud text.
 ///
 /// THIS IS THE LIST TO EDIT — it is the single knob that decides whether "commit" comes
-/// back as `commit` or as `คอมมิต`. Keep entries short (fal caps a keyterm at 50
-/// characters and the list at 100 entries) and keep them to words that are genuinely
-/// ambiguous in a Thai sentence.
+/// back as `commit` or as `คอมมิต`. Keep entries short and keep them to words that are
+/// genuinely ambiguous in a Thai sentence.
+///
+/// The "short, ~100 entries" shape started as fal's hard API cap (50 characters per
+/// keyterm, 100 entries). That cap left with fal: `GeminiClient` carries these into a
+/// prompt, so the ceiling is now a token budget rather than a documented limit. Treat
+/// the old numbers as house style, not as a constraint anyone has re-measured — a list
+/// long enough to crowd the prompt is a list that costs accuracy on every request.
 let cloudKeyterms: [String] = [
     "deploy", "commit", "branch", "main", "refactor",
     "push", "merge", "rebase", "pull request", "API",
@@ -119,6 +151,29 @@ let accessibilityPaneURL = "x-apple.systempreferences:com.apple.preference.secur
 let microphonePaneURL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
 let speechPaneURL = "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
 
+/// The two Google pages this app can usefully send someone to. TWO, where fal needed one:
+/// fal put credit, keys and spend on a single billing page, and Google splits the same
+/// job across a Cloud console (does this key exist, is the API switched on for it) and AI
+/// Studio (what is my quota, what have I used). Sending a user to the wrong one of those
+/// is a dead end, so each failure names the page that can actually resolve it.
+///
+/// Named once each because several things point at them — `describeCloudError`'s
+/// key-rejected and quota messages, and the clickable usage line — and a URL repeated in
+/// three strings is a URL that eventually disagrees with itself.
+let googleCredentialsURL = "https://console.cloud.google.com/apis/credentials"
+let googleQuotaURL = "https://aistudio.google.com/app/apikey"
+
+/// `~/.config/thaidictate/env`, with the home directory folded back into a tilde.
+///
+/// Derived from `GeminiClient.defaultKeyFileURL()` rather than written out as a literal,
+/// so there is exactly one definition of where that file lives;
+/// `abbreviatingWithTildeInPath` then puts it back into the form the user would type. A
+/// function, not a global `let`, because top-level bindings in this file initialise in
+/// source order and `describeCloudError` is reachable from a stored-property initialiser.
+func cloudEnvDisplayPath() -> String {
+    (GeminiClient.defaultKeyFileURL().path as NSString).abbreviatingWithTildeInPath
+}
+
 /// How long the audio engine keeps running after the hotkey is released.
 ///
 /// `AudioPipeline` finalises an utterance on trailing silence. If we tore the engine down
@@ -129,14 +184,31 @@ let speechPaneURL = "x-apple.systempreferences:com.apple.preference.security?Pri
 let releaseDrainSeconds: TimeInterval = 0.9
 
 /// How long one in-flight cloud request may hold the one-request gate shut before a NEW
-/// final chunk is allowed to supersede it. A healthy fal round trip settles in ~1-3 s;
-/// only a hung request (dropped network, waiting on FalClient's much longer timeout) ever
-/// reaches this age. The stakes: while the gate is held shut, every refused chunk's
+/// final chunk is allowed to supersede it. A healthy fal round trip settled in ~1-3 s;
+/// only a hung request (dropped network, waiting on the client's much longer timeout) ever
+/// reached this age.
+///
+/// IT HAS NOW BEEN RE-MEASURED, AND THE INHERITED 5 s WAS TOO TIGHT. A 9.46 s / 302 KB
+/// Thai WAV through `gemini-3.5-flash` settled in ~4.0 s of pure inference on a fast link
+/// — leaving 1.0 s of headroom under the old threshold, against fal's 2-4 s. Upload is
+/// what closes that gap: a 10 s chunk is ~320 KB of WAV, ~427 KB once base64'd into the
+/// request body, so on a 1-2 Mbps uplink 2-3 s of transfer lands on top of the 4.0 s and
+/// the round trip crosses 5 s while still perfectly healthy. The gate would then cancel a
+/// request that was about to succeed, and — because the refused chunk's ledger snapshot
+/// was already consumed — that span becomes permanently uncorrectable. 12 s is 3x the
+/// measured median, still far below the client's 15 s request timeout, and still short
+/// enough that a genuinely dropped connection is superseded rather than waited out.
+///
+/// Re-derive this if the model or the chunk length changes; the number is a latency
+/// measurement, not a preference. `presumed hung` lines in the trace against requests
+/// that later look ordinary are the signal that it is too tight again.
+///
+/// The stakes: while the gate is held shut, every refused chunk's
 /// typed-span ledger snapshot has ALREADY been consumed by `noteFinalChunk`, so each
 /// refused span becomes permanently uncorrectable. Past this age the gate cancels the
 /// hung request (cancellation routes to `applyCloudFailure(cancelled: true)`, which does
 /// not count an error) and lets the new chunk through.
-let cloudSupersedeAfterSeconds: TimeInterval = 5.0
+let cloudSupersedeAfterSeconds: TimeInterval = 12.0
 
 // NOTE: there is deliberately NO minimum-hold / tap-debounce logic in this file. A
 // proposal to filter short presses here was rejected: premature or chattering releases
@@ -225,24 +297,78 @@ func describePipelineError(_ error: Error) -> String {
     return "\(ns.domain) code \(ns.code) — \(ns.localizedDescription)"
 }
 
-/// Flatten a `FalClient` failure into something printable, and separately surface the key
-/// path when the failure is "there is no key", because that path is the one thing the user
-/// can act on. Nothing here ever renders the key itself.
-func describeFalError(_ error: Error) -> (summary: String, missingKeyPath: String?) {
-    if let ce = error as? FalClient.ClientError {
+/// Flatten a `GeminiClient` failure into something printable, and separately surface the
+/// key path when the failure is "there is no key", because that path is the one thing the
+/// user can act on. Nothing here ever renders the key itself.
+///
+/// ── Why the HTTP status comes back as a third member ──────────────────────────────────
+/// `applyCloudFailure` has to recognise a 429 (quota) to auto-disable the cloud pass, and
+/// it never sees the `Error` — `cloudPass` catches on a detached task and hops a String
+/// across. The two candidate designs were (a) a second `as? GeminiClient.ClientError`
+/// cast at the failure site, and (b) this. (b) wins on one argument: classifying a
+/// `ClientError` is already this function's entire job, and putting a second, partial copy
+/// of that knowledge in a bookkeeping method is how the two drift — the day someone adds a
+/// meaning for 409 here, the other site keeps quietly treating it as generic. The tuple
+/// SHAPE is unchanged across the fal → Gemini swap for the same reason it was extended
+/// rather than reshaped when it grew: both call sites read named members.
+///
+/// ── Why these messages are not the fal ones with a name swapped ───────────────────────
+/// Google's statuses do not mean what fal's meant. THERE IS NO 402 HERE AT ALL — fal
+/// signalled "out of credit" with one, Google signals the same condition with a 429, so a
+/// ported 402 branch would have been unreachable code pretending to be a safety net.
+/// Conversely 400 is worth its own line here in a way it never was there.
+///
+/// Everything outside these branches keeps the generic string verbatim — inventing prose
+/// for a status we have never seen would be guessing at the user.
+func describeCloudError(_ error: Error) -> (summary: String, missingKeyPath: String?, httpStatus: Int?) {
+    if let ce = error as? GeminiClient.ClientError {
         switch ce {
         case .missingKey(let path):
-            return ("no fal API key — expected FAL_KEY in \(path)", path)
+            return ("no Google API key — expected \(GeminiClient.keyName) in \(path)", path, nil)
         case .http(let status, let body):
-            return ("fal HTTP \(status) — \(body.prefix(200))", nil)
+            switch status {
+            case 400:
+                // NOT THE USER'S PROBLEM, and saying so is the whole point of this branch.
+                // A 400 means this app built a request Google would not parse — wrong audio
+                // encoding, a malformed part, a bad model name. No amount of key-checking or
+                // topping-up fixes it, so any message that hints at those wastes the user's
+                // afternoon. Name the app as the culprit and point at the trace.
+                return ("MicTest sent Gemini a malformed request (HTTP 400) — this is a bug "
+                        + "in the app, not a problem with your key or quota; "
+                        + "see /tmp/mictest_trace.txt", nil, status)
+            case 401, 403:
+                // ONE BRANCH FOR BOTH, deliberately — and this is a reversal of the fal-era
+                // rule, which split them precisely because they had different next steps
+                // (bad key vs. account not entitled to the model). With Google they do not:
+                // 401 is a rejected/expired key and 403 is most often "the Generative
+                // Language API is not enabled for this key's project", and BOTH are settled
+                // on the credentials page. Splitting a distinction the user cannot act on
+                // differently is how you make two half-answers out of one whole one.
+                return ("Gemini rejected the key (HTTP \(status)) — check \(GeminiClient.keyName) "
+                        + "in \(cloudEnvDisplayPath()), and that the API is enabled for it at "
+                        + googleCredentialsURL, nil, status)
+            case 429:
+                // Quota OR rate limit — Google uses one status for both and this app cannot
+                // tell them apart from the status alone, so the message must not claim to.
+                // Also the status that drives the auto-disable; see `consecutive429s`.
+                return ("Gemini quota or rate limit hit (HTTP 429) — retry shortly, or check "
+                        + "your quota at \(googleQuotaURL)", nil, status)
+            case 500...599:
+                // Nothing on this machine is wrong and nothing on this machine can help.
+                // Named so the user does not go hunting through their key for a server fault.
+                return ("Gemini server error (HTTP \(status)) — transient on Google's side; "
+                        + "the on-device text is unaffected", nil, status)
+            default:
+                return ("Gemini HTTP \(status) — \(body.prefix(200))", nil, status)
+            }
         case .decoding(let snippet):
-            return ("fal response could not be parsed — \(snippet.prefix(160))", nil)
+            return ("Gemini response could not be parsed — \(snippet.prefix(160))", nil, nil)
         case .transport(let reason):
-            return ("could not reach fal — \(reason)", nil)
+            return ("could not reach Gemini — \(reason)", nil, nil)
         }
     }
     let ns = error as NSError
-    return ("\(ns.domain) code \(ns.code) — \(ns.localizedDescription)", nil)
+    return ("\(ns.domain) code \(ns.code) — \(ns.localizedDescription)", nil, nil)
 }
 
 /// Handed back from `noteFinalChunk` across the MainActor hop so the chunk loop knows which
@@ -274,9 +400,27 @@ final class LevelBox: @unchecked Sendable {
     private var rms: Float = 0
     private var frames: UInt64 = 0
 
-    func store(rms newValue: Float, frameCount: Int) {
+    /// Largest |sample| seen since the last `drainPeak()`. A running MAXIMUM, not a
+    /// snapshot, and that is the whole point of it. `rms` is overwritten by every buffer,
+    /// so a reader sampling it at 0.2 Hz sees one ~10 ms window out of every five seconds
+    /// and can only describe the room at that instant. Trace 14:26:19-14:41:25 is what that
+    /// costs: a 906 s capture produced exactly ONE rms sample, and it could not answer the
+    /// question the whole post-mortem turned on — did the Speech service wedge, or did mic
+    /// input go attenuated? A peak held across the reporting window answers it. An
+    /// attenuated, muted or misrouted input cannot produce a loud sample ANYWHERE in five
+    /// seconds; a wedged recogniser is indifferent to how loud the room is.
+    ///
+    /// A NaN sample cannot poison it: `NaN > peak` is false, so it is simply not taken.
+    /// `+inf` IS taken, and unlike the `noiseFloor` tracker — which rejects it, because the
+    /// speech gate ACTS on that value — this one keeps it deliberately. Nothing anywhere
+    /// branches on `peak`, so `peak=inf` in the trace is an honest report that the tap
+    /// delivered a non-finite sample, and the next `drainPeak()` clears it.
+    private var peak: Float = 0
+
+    func store(rms newValue: Float, peak peakValue: Float, frameCount: Int) {
         lock.lock()
         rms = newValue
+        if peakValue > peak { peak = peakValue }
         frames &+= UInt64(frameCount)
         lock.unlock()
     }
@@ -291,9 +435,25 @@ final class LevelBox: @unchecked Sendable {
         return v
     }
 
+    /// Returns the peak since the previous call and clears it, so the value always
+    /// describes the window between two consecutive readings.
+    ///
+    /// It is deliberately NOT part of `read()`. `read()` has three callers; a
+    /// consume-and-reset folded into it would mean each one silently shortens the window
+    /// the others report, which is the kind of bug a trace line exists to rule out. One
+    /// consumer only: the periodic LEVEL line in `tickStatus`.
+    func drainPeak() -> Float {
+        lock.lock()
+        let v = peak
+        peak = 0
+        lock.unlock()
+        return v
+    }
+
     func reset() {
         lock.lock()
         rms = 0
+        peak = 0
         frames = 0
         lock.unlock()
     }
@@ -320,36 +480,100 @@ enum RecognizerEvent: Sendable {
 ///
 /// So callbacks append to this lock-protected FIFO and the main-thread UI timer drains it
 /// in order. Same shape as `LevelBox`, same honesty about `@unchecked Sendable`.
+///
+/// ── WHAT THE OVERFLOW POLICY GUARANTEES, AND WHY THE PREVIOUS ONE DID NOT ────────────
+/// This used to justify itself with "partials supersede each other, so dropping the oldest
+/// loses nothing that a later partial does not already contain" — and then drop the oldest
+/// events of ANY kind. The premise is true only of `.partial`. A `.state(.listening)` is
+/// the utterance boundary that resets `injectedForUtterance`; drop one and the ledger goes
+/// on describing an utterance that is over, so the next partial shares no prefix with it
+/// and the app deletes a whole utterance to type the replacement's first word — the exact
+/// failure spelled out at the `.listening` reset in `handleRecognizerState`. A dropped
+/// `.final` loses the reconciliation outright. Neither was visible: both were folded into
+/// one `dropped` number that read like harmless partial churn.
+///
+/// The policy now, in order:
+///   1. COALESCE AT POST. An incoming `.partial` whose predecessor is also a `.partial`
+///      REPLACES it in place — O(1), and lossless because each partial carries the whole
+///      utterance so far and `deliver` diffs it against the ledger rather than
+///      accumulating deltas. This is what makes overflow nearly unreachable: a wedged main
+///      thread now costs one queued partial, not one per recogniser callback.
+///   2. DROP A PARTIAL, NEVER A STATE OR A FINAL. Past the soft cap the FIRST `.partial`
+///      from the front is removed and counted as `droppedPartials` — the one kind of loss
+///      the "a later partial already contains it" argument actually covers.
+///   3. PATHOLOGICAL FLOOR. If there is no partial left to sacrifice (a queue that is all
+///      `.state`/`.final`, i.e. the main thread has been wedged across many recogniser
+///      restarts), the queue is allowed to GROW to `hardCapacity` rather than corrupt the
+///      ledger in order to stay small. Only past that does the oldest event go regardless
+///      of kind, counted separately as `droppedCritical` so the drain can say so out loud.
+/// Memory is still bounded; ledger-relevant events are now lost only in a state the app
+/// reports instead of hiding.
 final class RecognizerEventBox: @unchecked Sendable {
-    /// Ceiling so a wedged main thread cannot turn a stuck recognizer into unbounded memory.
-    /// Partials supersede each other, so dropping the oldest loses nothing that a later
-    /// partial does not already contain.
+    /// Soft ceiling. Past this, partials are sacrificed to keep the queue bounded — which
+    /// is nearly unreachable now that `post` coalesces them.
     private static let capacity = 512
+    /// Hard ceiling, reached only when `capacity` consecutive events are `.state`/`.final`.
+    /// Four times the soft cap is a few hundred kilobytes at worst, and it buys the ledger
+    /// a large margin before anything load-bearing is thrown away.
+    private static let hardCapacity = 2048
 
     private let lock = NSLock()
     private var events: [RecognizerEvent] = []
-    private var dropped = 0
+    private var droppedPartials = 0
+    private var droppedCritical = 0
+    private var coalescedAtPost = 0
 
     func post(_ event: RecognizerEvent) {
         lock.lock()
-        events.append(event)
-        if events.count > Self.capacity {
-            let excess = events.count - Self.capacity
-            events.removeFirst(excess)
-            dropped += excess
+        defer { lock.unlock() }
+
+        // (1) Coalesce. Only a partial may replace a partial: a `.state` or `.final` at the
+        // tail is a boundary the incoming partial has to be interpreted AFTER, so it stays
+        // where it is and the partial is appended behind it.
+        if case .partial = event, let last = events.last, case .partial = last {
+            events[events.count - 1] = event
+            coalescedAtPost += 1
+            return          // count unchanged, so there is nothing to overflow
         }
-        lock.unlock()
+
+        events.append(event)
+        guard events.count > Self.capacity else { return }
+
+        // (2) Exactly one event was added, so removing one restores the invariant.
+        if let victim = events.firstIndex(where: { e -> Bool in
+            if case .partial = e { return true }
+            return false
+        }) {
+            events.remove(at: victim)
+            droppedPartials += 1
+            return
+        }
+
+        // (3) Nothing droppable is left. Grow first; only past the hard cap does a
+        // ledger-relevant event go, and then it is counted where the drain will shout.
+        if events.count > Self.hardCapacity {
+            events.removeFirst()
+            droppedCritical += 1
+        }
     }
 
-    /// Returns the queued events in order, plus how many were dropped since the last drain.
-    func drain() -> (events: [RecognizerEvent], dropped: Int) {
+    /// Returns the queued events in order, plus what became of the ones that are not in it.
+    /// Three separate counts on purpose: `coalescedAtPost` and `droppedPartials` are
+    /// routine bookkeeping, `droppedCritical` is an integrity warning, and a single total
+    /// would make the warning unreadable — which is how the old `dropped` hid it.
+    func drain() -> (events: [RecognizerEvent], droppedPartials: Int,
+                     droppedCritical: Int, coalescedAtPost: Int) {
         lock.lock()
-        let e = events
-        let d = dropped
+        let queued = events
+        let dp = droppedPartials
+        let dc = droppedCritical
+        let ca = coalescedAtPost
         events.removeAll(keepingCapacity: true)
-        dropped = 0
+        droppedPartials = 0
+        droppedCritical = 0
+        coalescedAtPost = 0
         lock.unlock()
-        return (e, d)
+        return (queued, dp, dc, ca)
     }
 
     /// Discard anything left over from a previous session so a late partial cannot be
@@ -357,8 +581,129 @@ final class RecognizerEventBox: @unchecked Sendable {
     func clear() {
         lock.lock()
         events.removeAll(keepingCapacity: true)
-        dropped = 0
+        droppedPartials = 0
+        droppedCritical = 0
+        coalescedAtPost = 0
         lock.unlock()
+    }
+}
+
+// MARK: - Dictation engines
+
+/// Which engine turns microphone audio into live text. Raw values ARE the
+/// `UserDefaults["dictationEngine"]` strings — one spelling, so a typo cannot make the
+/// stored preference and the code disagree about what "geminiLive" means.
+enum DictationEngineKind: String, Sendable {
+    /// `LiveRecognizer` — Apple's on-device `SFSpeechRecognizer`. THE DEFAULT, and the
+    /// only one that keeps every sample of the user's voice on this Mac.
+    case apple
+    /// `GeminiLiveRecognizer` — streams microphone audio to Google over a WebSocket for
+    /// as long as dictation is running. Opt-in, never a default: see `toggleEngine`.
+    case geminiLive
+
+    /// What the menu calls it. The parenthetical is not decoration — it is the whole
+    /// privacy difference, and it belongs in the item's TITLE rather than only in the
+    /// tooltip, because a title is the part a user reads without hovering.
+    var menuName: String {
+        switch self {
+        case .apple: return "Apple (on-device)"
+        case .geminiLive: return "Gemini Live (cloud)"
+        }
+    }
+
+    /// The noun used in messages that name the recogniser to the user. "On-device
+    /// recogniser" is a lie the instant the active engine is streaming to Google, and a
+    /// lie about where someone's voice is going is the one class of wrong string in this
+    /// app that is not merely cosmetic.
+    var recognizerNoun: String {
+        switch self {
+        case .apple: return "On-device recogniser"
+        case .geminiLive: return "Gemini Live recogniser"
+        }
+    }
+}
+
+/// The consumer-facing shape shared by `LiveRecognizer` and `GeminiLiveRecognizer`.
+///
+/// ── WHY A PROTOCOL, AND WHY IT LOOKS LIKE THIS ────────────────────────────────────────
+/// The two types already expose the same eight members (`onPartial`/`onFinal`/`onState`/
+/// `isSupported`/`start`/`stop`/`append`/`setContextualStrings`), so an
+/// `enum Engine { case apple(...), gemini(...) }` with switch-based forwarding would mean
+/// eight switches whose only content is "call the same method on whichever payload" — the
+/// churn a protocol exists to remove. Conformance is declared here in extensions rather
+/// than on the types themselves precisely so neither engine file has to change.
+///
+/// ONE MEMBER IS NOT A PASS-THROUGH, and it is the reason this protocol has a `bindEvents`
+/// instead of an `onState` property. The two engines carry DISTINCT `State` enums with
+/// identical cases, so no single property signature can satisfy both — and an extension
+/// cannot add a member named `onState` to a type that already has one. Rather than invent
+/// a third state type and rewrite every consumer, the callback wiring is the protocol
+/// requirement and `LiveRecognizer.State` stays the currency: `GeminiLiveRecognizer`'s
+/// cases are mapped to it at the one point they cross into the app. That keeps
+/// `RecognizerEvent`, `RecognizerEventBox`, `handlePartial`, `handleFinal`,
+/// `handleRecognizerState`, `deliver` and the entire injection path bit-for-bit unchanged,
+/// which is the whole point: this file's hard-won utterance bookkeeping is not being asked
+/// to learn a second vocabulary.
+///
+/// `Sendable` is a REQUIREMENT, not a courtesy: `beginCapture` captures the resolved engine
+/// in the `@Sendable` tap closure and `processTap` calls `append` from the realtime audio
+/// thread. Both concrete types are already `@unchecked Sendable` with no actor isolation,
+/// so the existential inherits exactly the guarantee `processTap` documents.
+protocol DictationEngine: AnyObject, Sendable {
+    var isSupported: Bool { get }
+    func start() throws
+    func stop()
+    func append(_ buffer: AVAudioPCMBuffer)
+    func setContextualStrings(_ terms: [String])
+    /// Point this engine's three callbacks at the app's event queue. Called on the main
+    /// actor for the ACTIVE engine only (see `wireRecognizer`).
+    func bindEvents(to box: RecognizerEventBox)
+    /// Drop the callbacks, so a stopped engine that keeps talking — a reconnect loop, a
+    /// late retry report — cannot post into a session it is not running.
+    func unbindEvents()
+}
+
+extension LiveRecognizer: DictationEngine {
+    func bindEvents(to box: RecognizerEventBox) {
+        // Verbatim what `wireRecognizer` used to inline, moved rather than rewritten: the
+        // closures are `@Sendable`, run on Speech's own queue, capture only the box, and
+        // touch neither `self` nor the main actor nor `trace()`.
+        onPartial = { text in box.post(.partial(text)) }
+        onFinal = { text in box.post(.final(text)) }
+        onState = { state in box.post(.state(state)) }
+    }
+
+    func unbindEvents() {
+        onPartial = nil
+        onFinal = nil
+        onState = nil
+    }
+}
+
+extension GeminiLiveRecognizer: DictationEngine {
+    func bindEvents(to box: RecognizerEventBox) {
+        onPartial = { text in box.post(.partial(text)) }
+        onFinal = { text in box.post(.final(text)) }
+        // THE ONE TRANSLATION IN THIS FILE. Two enums, three identical cases, and the
+        // exhaustive switch is deliberate: if `GeminiLiveRecognizer.State` ever grows a
+        // fourth case, this stops compiling and someone has to decide what the consumer
+        // should do with it — which is strictly better than a `default:` quietly mapping
+        // a new failure mode onto `.idle`.
+        onState = { state in
+            let mapped: LiveRecognizer.State
+            switch state {
+            case .idle: mapped = .idle
+            case .listening: mapped = .listening
+            case .unavailable(let reason): mapped = .unavailable(reason)
+            }
+            box.post(.state(mapped))
+        }
+    }
+
+    func unbindEvents() {
+        onPartial = nil
+        onFinal = nil
+        onState = nil
     }
 }
 
@@ -482,12 +827,25 @@ private struct TraceCounters {
     /// deliberately left untouched. This is the number that matters when judging whether
     /// the focused app can host live revision at all.
     var divergencesRefused = 0
+    /// Revisions whose stale tail was too long to strand (see `reanchorMaxStaleChars`) and
+    /// which were answered instead by typing the whole transcript again after a separator.
+    /// Each one leaves visibly duplicated text in the user's document, so this is the price
+    /// of the strand cap: it is the number to read if the cap ever needs re-tuning, and a
+    /// large value against a small `divergencesRefused` means the refusals are arriving at
+    /// `lcp == 0` rather than mid-word.
+    var freshStarts = 0
     var secureInputRefusals = 0
     var finalChunks = 0
     var cloudSent = 0
     var cloudApplied = 0
     var cloudUnapplied = 0
     var cloudErrors = 0
+    /// Chunks the cloud answered with an empty transcript — silence, not failure. Split out
+    /// of `cloudErrors` because Google returns empty by design for a quiet span and billed
+    /// it normally: folding the two together made every capture ending on silence read as a
+    /// failing account. A single total cannot tell "the request broke" from "there was
+    /// nothing to hear", and those call for opposite reactions.
+    var cloudEmpty = 0
     var cloudSkipped = 0
 }
 
@@ -502,6 +860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
 
     private let dictationItem = NSMenuItem()
+    private let engineItem = NSMenuItem()
     private let cloudItem = NSMenuItem()
     private let autoCorrectItem = NSMenuItem()
     private let daemonRestartItem = NSMenuItem()
@@ -512,11 +871,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let activityItem = NSMenuItem()
     private let copyTranscriptItem = NSMenuItem()
     private let copyCloudItem = NSMenuItem()
+    /// The BUTTON to Google's quota/usage page, labelled with the one usage number this
+    /// app can actually vouch for.
+    ///
+    /// Under fal this line showed a live credit balance fetched from an API. Google has no
+    /// equivalent an API key may read — Cloud Billing wants OAuth — so there is nothing to
+    /// fetch and the probe machinery that fetched it is gone (see the cloud section note).
+    /// What survives is the affordance, because "how much have I used" still has an answer;
+    /// it just lives one click away instead of in the menu. The number on the line is this
+    /// Mac's own tally, which is why it deliberately says "this Mac" and not "your account".
+    private let creditItem = NSMenuItem()
+    /// What this Mac has sent to Gemini, lifetime. Pure read-out, hidden until there is
+    /// something to report.
+    private let spendItem = NSMenuItem()
 
     // ---- Machinery -----------------------------------------------------------------
     private let hotkey = HotkeyMonitor()
     private let injector = TextInjector()
     private let recognizer = LiveRecognizer()
+    /// The opt-in second engine. Constructed unconditionally at init, exactly as
+    /// `cloudSetup` is, because construction is inert: nothing connects to Google until
+    /// `start()`, and a lazily-built engine would only move the same allocation to the
+    /// first capture that selects it — in the middle of the hotkey's latency budget.
+    private let geminiRecognizer = GeminiLiveRecognizer()
     private let events = RecognizerEventBox()
     private let levelBox = LevelBox()
 
@@ -531,6 +908,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// typing just stopped, with the recogniser eventually reporting "No speech detected".
     private var watchdogLastFrames: UInt64 = 0
     private var watchdogStalledTicks = 0
+
+    /// State for the unconditional LEVEL line in `tickStatus`. That method runs at 1 Hz, so
+    /// the counter is literally "ticks since the last line" and 5 means ~5 s;
+    /// `levelLineLastFrames` is the previous line's frame count, so each line can print a
+    /// DELTA (240000 per line at 48 kHz is exactly 5 s of audio — anything less is a
+    /// stalling tap, and that is readable at a glance in a way a running total is not).
+    ///
+    /// WHY AN UNCONDITIONAL LINE EXISTS AT ALL. `levelTrace` was wired only to watchdog
+    /// strikes and to `finishCapture` — both of them paths that never ran during the
+    /// 14:26:19-14:41:25 failure — so a 906 s capture produced exactly ONE rms sample, taken
+    /// twelve minutes after the recogniser had stopped producing text. Was the room loud?
+    /// Was the floor climbing? Were loud ticks accumulating? Was audio still arriving? Every
+    /// question the post-mortem needed to ask was unanswerable from the trace. A measurement
+    /// that only prints once something is already wrong cannot describe how it got there.
+    private var levelLineTicks = 0
+    private var levelLineLastFrames: UInt64 = 0
+
+    /// Running maximum of the per-tick peaks since the last LEVEL line. The peak is drained
+    /// from `LevelBox` every tick because the speech gate needs THIS second's value, so the
+    /// five-second window the LEVEL line reports has to be reassembled here rather than left
+    /// to accumulate in the box. Zeroed with the other two in `beginCapture`.
+    private var levelLinePeak: Float = 0
 
     /// Recogniser-liveness watchdog (see `tickStatus`). The audio watchdog above only
     /// catches a dead ENGINE (frames stop). The complementary failure -- recogniser dead
@@ -596,6 +995,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// text once.
     private var lastRealPartialAt = Date.distantPast
 
+    /// Wall time of the last REAL recogniser output — partial OR final — this launch.
+    /// Diagnostics only: the periodic LEVEL line in `tickStatus` prints the age of this
+    /// stamp, and nothing anywhere branches on it.
+    ///
+    /// DELIBERATELY SEPARATE FROM `lastRealPartialAt` directly above, which it otherwise
+    /// looks like a duplicate of. Folding the two together would be a silent behaviour
+    /// change, not a tidy-up: that stamp is tier 3's arming condition — the gate on
+    /// `kill -9` of a system service — and widening it to finals would arm that kill from an
+    /// event class it was never measured against. A trace stamp is free to be the broader of
+    /// the two precisely because nothing acts on it.
+    private var lastRealOutputAt = Date.distantPast
+
     /// Rate limiter for tier 3: never kill the system speech daemon more than once per
     /// two minutes, no matter how the counters land. `distantPast` so the first wedge
     /// after launch is never blocked.
@@ -610,6 +1021,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// counterfactual kill, which is the quantity a human re-litigating the default wants
     /// to count. Only ever written on the toggle-OFF path, so the ON path is untouched.
     private var lastTier3WouldFireLoggedAt = Date.distantPast
+
+    /// Rate limiter for the full capture restart that `LiveRecognizer`'s
+    /// `persistent recognition failure` report triggers — see the `.unavailable` branch of
+    /// `handleRecognizerState`. That file re-emits the report on every retry cycle for as
+    /// long as the failure lasts, at a backoff capped at 8 s, so an unlimited restart per
+    /// report is a restart loop. 15 s sits comfortably above that cap: at most one restart
+    /// per window no matter how often the report arrives, and the window is short enough
+    /// that a genuinely recoverable wedge is retried promptly rather than waited out.
+    /// `distantPast` so the first report after launch is never blocked.
+    private var lastPersistentFailureRestartAt = Date.distantPast
+    private nonisolated static let persistentFailureRestartInterval: TimeInterval = 15
 
     /// The room's measured noise floor, in the same RMS units the tap stores, tracked
     /// asymmetrically over the 1 Hz `tickStatus` samples. It is what decides which samples
@@ -641,10 +1063,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// coefficients were committed:
     ///   - 60 ticks of UNBROKEN speech 30 dB up lifts the floor to 8.95x its start, putting
     ///     the threshold at 0.0805 while the speech is at 0.0948 — still ticking. The gate
-    ///     does go deaf at tick 75 of speech with NO gap at all, which is unreachable in
-    ///     practice twice over: three ticks arm the ladder and it acts at six, and real
+    ///     does go deaf at tick 75 of speech with NO gap at all, which is out of reach for
+    ///     two independent reasons: three ticks arm the ladder and it acts at six, and real
     ///     speech has inter-word gaps where the 0.1 fall rate claws back 19% of the
     ///     excursion every two seconds.
+    ///
+    ///     THE FIRST OF THOSE TWO REASONS IS CONDITIONAL, and this paragraph used to assert
+    ///     it flatly. "Arms at three, acts at six" is only true while the tick count
+    ///     ACCUMULATES monotonically across a wedge — and it did not, because the `.state`
+    ///     branch of the event pump used to zero the counter. The 20 s request rotation
+    ///     emits a `.state` every cycle, so under continuous speech the ladder re-armed
+    ///     from zero inside each 20 s window while this rise coefficient lifted the floor
+    ///     underneath it, and it never reached three. That is not a hypothetical: capture
+    ///     14:26:19-14:41:25 held a hot microphone for twelve minutes after the recogniser
+    ///     stopped producing text, with ZERO strikes in ~725 ticks. The reset is gone (see
+    ///     the `.state` branch, which spells out the proof), the counter now clears only on
+    ///     real output, on a strike, or at a session boundary, and only with that true does
+    ///     the arithmetic above describe the shipped gate. Do not re-add a clear anywhere
+    ///     that is not one of those three; it silently invalidates this whole paragraph.
     ///   - a genuine 5x STEP in ambient (aircon switching on) ticks spuriously for exactly
     ///     37 ticks until the floor catches up. That window can reach a tier-1 bounce and,
     ///     at most once, a tier-2 restart; it cannot reach tier 3, which additionally needs
@@ -653,10 +1089,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// KNOWN BLIND SPOT, written down so it is diagnosable instead of surprising: at ratio
     /// 3.0 an ambient of 0.004 puts the threshold at 0.012, above the sub-0.01 quiet speech
     /// this mic measures — a quiet speaker in a moderately noisy room stops arming the
-    /// watchdog. Dictation itself is unaffected; only the watchdog goes to sleep. Every
-    /// watchdog trace line and the "capture stopped" line now print `rms`/`floor`/`thr`,
-    /// which is how this will be recognised if it ever happens. Do not add a compensating
-    /// gate on a hunch — get the numbers out of the trace first.
+    /// watchdog. Dictation itself is unaffected; only the watchdog goes to sleep. The
+    /// periodic LEVEL line in `tickStatus` is what makes this recognisable: it prints
+    /// `rms`/`floor`/`thr` (and the loud-tick count) every ~5 s of every capture, whereas
+    /// the watchdog's own lines print only when the watchdog FIRES — which is precisely
+    /// what a sleeping watchdog never does, so they cannot evidence their own absence. Do
+    /// not add a compensating gate on a hunch — get the numbers out of the trace first.
     private var noiseFloor: Float = 0
 
     /// False until the first tick of a capture that carried real audio.
@@ -714,6 +1152,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// See `noiseFloor` for the one case where there is not.
     private nonisolated static let speechOverFloorRatio: Float = 3.0
 
+    /// The peak counterpart to the ratio above, for the second arming path in `tickStatus`.
+    /// Higher than 3.0 because it is compared against a per-second MAXIMUM rather than a
+    /// single-buffer average, and broadband room noise already has a crest factor of roughly
+    /// 4-8 — a peak gate at the rms ratio would arm on ambient alone.
+    ///
+    /// 8.0 is read off the measurements quoted at the gate: with `floor` at 0.00425 this
+    /// puts the peak threshold at 0.034, against dictation peaks of 0.10-0.17. That is a
+    /// 3-5x margin on the speech side, and it sits above the crest range of an ambient whose
+    /// rms is the floor itself. It is deliberately the LESS sensitive of the two ratios: the
+    /// rms path is unchanged and still arms on its own, so this one only has to catch the
+    /// case rms provably misses — peaky speech sampled in the gaps between words.
+    private nonisolated static let peakOverFloorRatio: Float = 8.0
+
     /// Per-tick tracking coefficients — fast down, slow up. Derived on `noiseFloor`, along
     /// with the two worst cases they were chosen against.
     private nonisolated static let noiseFloorFall: Float = 0.1
@@ -728,12 +1179,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         max(Self.absoluteQuietFloor, noiseFloor * Self.speechOverFloorRatio)
     }
 
-    /// The `rms=… floor=… thr=…` group, so every watchdog trace and the "capture stopped"
-    /// line carry the same three numbers in the same shape. Five decimals because four
-    /// leaves barely two significant digits at these magnitudes. The previous debugging
-    /// round climbed all three tiers and killed a system service twice without one line
-    /// anywhere recording what the gate had measured; this is the fix for that, and it is a
-    /// requirement of the design, not a convenience.
+    /// The gate for the peak arming path — same shape as `speechThreshold` and for the same
+    /// reason (one definition, so the trace can never print a threshold the gate did not
+    /// use). The floor under it is scaled by the same 4x that separates the two ratios, so a
+    /// near-silent room where `noiseFloor` never seeds does not leave this path riding a
+    /// value calibrated for single-buffer averages.
+    private var peakSpeechThreshold: Float {
+        max(Self.absoluteQuietFloor * 4, noiseFloor * Self.peakOverFloorRatio)
+    }
+
+    /// The `rms=… floor=… thr=…` group, so every watchdog trace, the "capture stopped" line
+    /// and the periodic LEVEL line carry the same three numbers in the same shape. Five
+    /// decimals because four leaves barely two significant digits at these magnitudes. The
+    /// previous debugging round climbed all three tiers and killed a system service twice
+    /// without one line anywhere recording what the gate had measured; this is the fix for
+    /// that, and it is a requirement of the design, not a convenience.
+    ///
+    /// The third caller is the reason the first two are no longer sufficient. Both of them
+    /// fire only on an EVENT — a strike, a teardown — so between events they say nothing,
+    /// and a 906 s capture in which no event ever fired (14:26:19-14:41:25) produced exactly
+    /// one sample of these numbers, twelve minutes after the fact. `tickStatus` now emits
+    /// this group unconditionally while capturing; see `levelLineTicks`.
     ///
     /// `floor` prints `(never measured)` rather than `0.00000` when the tracker has not
     /// seeded (review finding): those are different facts and only one of them is a
@@ -779,6 +1245,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var engine: AVAudioEngine?
     private var pipeline: AudioPipeline?
     private var isCapturing = false
+
+    /// Non-nil only when MICTEST_AUDIO_FILE named a decodable file at capture start. While it
+    /// is non-nil the microphone's own buffers are discarded in the tap closure and this
+    /// object feeds the file in their place — see SyntheticAudioSource.swift for why that is
+    /// the only way the 20 s seam can be measured without a person in the room.
+    private var syntheticSource: SyntheticAudioSource?
 
     /// Authoritative "the user wants to be dictating right now".
     ///
@@ -832,12 +1304,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// have recovered by then. A repair that succeeds does not set this.
     private var utteranceDiverged = false
 
-    /// True once this session learned the focused app cannot do AX in-place replacement
-    /// (Chromium/Electron and friends). From then on partials are NOT typed live -- only
-    /// each utterance FINAL is injected, so divergence repair is never needed and the user
-    /// gets complete sentences instead of a stale 3-char stump. Reset per session: focus
-    /// usually changes between sessions, so the next app gets live typing again.
+    /// True once this session learned the focused app STRUCTURALLY cannot do AX in-place
+    /// replacement (Chromium/Electron and friends). From then on partials are NOT typed
+    /// live -- only each utterance FINAL is injected, so divergence repair is never needed
+    /// and the user gets complete sentences instead of a stale 3-char stump. Reset per
+    /// session: focus usually changes between sessions, so the next app gets live typing
+    /// again.
+    ///
+    /// ONLY a structural refusal sets this -- see `refusalIsStructural`. It used to latch
+    /// on ANY refusal from `replaceLastInserted`, and the trace caught the cost: a single
+    /// "a selection is active; not replacing" -- the user's own cursor, for one frame --
+    /// downgraded the whole capture to lumps-at-utterance-boundaries, which is exactly the
+    /// hitching the user reported. That is the same mistake already recorded on
+    /// `injectionBlockedReason` below, one screen down: latching a transient failure for a
+    /// whole session turns it into "typing stops and never resumes".
     private var finalOnlyInjection = false
+
+    /// Consecutive TRANSIENT repair refusals that were answered by doing NOTHING —
+    /// no re-anchor, no write — in the expectation that the next partial will simply
+    /// succeed. Reset wherever the app learns the document and the ledger agree again:
+    /// a repair that lands, an append that lands, a fresh start that lands, and every
+    /// utterance boundary.
+    ///
+    /// WHY DEFERRING IS SAFE, and it is the same mechanical argument `deliver` already
+    /// makes for retrying a failed `inject()`: a refused `replaceLastInserted` returns
+    /// BEFORE anything is written and before the ledger is touched, so
+    /// `injectedForUtterance` still describes the document exactly. The next partial
+    /// recomputes its common prefix against the truth and tries again. Nothing is
+    /// stranded, nothing is pretended.
+    ///
+    /// WHY IT IS BOUNDED. A transient that keeps recurring is not transient — it is a
+    /// structural refusal this app's classifier has not learned to name (and
+    /// `refusalIsStructural` deliberately fails SAFE into this class). After
+    /// `maxTransientRepairSkips` in a row the app stops waiting for it to clear and
+    /// treats it like the structural case, which is what keeps "retry on the next
+    /// partial" from becoming "never type again", the exact failure the mute-removal
+    /// work exists to prevent.
+    private var transientRepairSkips = 0
+
+    /// How many consecutive transient refusals may be deferred before the revision is
+    /// resolved anyway. Three: at the ~2-4 partials per second th-TH produces this is
+    /// under a second of waiting, short enough that a real hiccup (focus moving mid-
+    /// partial, a one-frame selection, a secure-input leak) clears inside it, and short
+    /// enough that a misclassified structural refusal costs almost nothing before the
+    /// K-bounded path takes over.
+    private nonisolated static let maxTransientRepairSkips = 3
+
+    /// The largest stale tail, in grapheme clusters, that may be STRANDED in the user's
+    /// document by `reanchorAfterUnrepairedRevision`. Anything longer takes the fresh-start
+    /// path instead.
+    ///
+    /// TEN, and the reasoning is the measured shapes rather than a round number. The
+    /// re-anchor design was justified on "typically the 3-7 characters the trace shows" —
+    /// a word-merge or tone-mark revision — and a Thai pre-posed vowel (เ แ โ ใ ไ) revising
+    /// its own cluster is smaller still, 1-3. Ten sits comfortably above both, so every
+    /// revision the mechanism was actually designed for still re-anchors exactly as
+    /// before. What it excludes is the shape that has nothing to do with revision: `lcp ==
+    /// 0`, where `staleCount` is the WHOLE utterance — up to twenty seconds of speech —
+    /// and a momentary AX refusal ("no focused element" in the trace) would otherwise
+    /// strand all of it permanently. There is no continuum between the two: a real
+    /// revision is a few clusters, a whole-utterance rewrite is dozens to hundreds.
+    private nonisolated static let reanchorMaxStaleChars = 10
 
     /// True once a cloud correction has been applied for the current utterance. The
     /// on-device FINAL can arrive AFTER the (faster, more accurate) cloud result --
@@ -908,19 +1435,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastOutcome: String?
 
     // ---- Cloud ----------------------------------------------------------------------
+    //
+    // The cloud pass is Gemini 3.5 Flash (`GeminiClient`). It replaced fal Scribe v2 on the
+    // user's instruction, and BOTH fal files — `FalClient.swift` and `FalBillingClient.swift`
+    // — have now been DELETED, also on the user's instruction. They were retained for a
+    // while so the swap stayed reversible without a trip through git history; that is what
+    // git history is for, and keeping a vendor's client compiled in after the app stopped
+    // talking to it made "which provider does this app use" a question with two answers.
+    //
+    // What survived the deletion, because `GeminiClient` and `GeminiLiveRecognizer` were
+    // reusing it rather than growing second copies, is the trio `FalClient` happened to
+    // host: the key-file path, the dotenv parser and the keyterm clamp. Those are now
+    // `CloudKeyFile`, which is named after the file it reads instead of after a vendor.
+    //
+    // `WhisperClient` is a DIFFERENT case and was deliberately not touched: it is dormant
+    // and unreferenced, but it was never superseded by anything — no instruction covers it.
+    //
+    // No request from this app reaches fal.ai any more, and no code for one remains.
 
-    /// Constructed once, at init. `FalClient.init()` throws when there is no key on disk,
-    /// and that is a perfectly ordinary state — it must disable the toggle and name the file
-    /// to create, not crash and not silently do nothing.
-    private let falSetup: (client: FalClient?, error: String?, keyPath: String?) = {
+    /// Constructed once, at init. `GeminiClient.init()` throws when there is no key on
+    /// disk, and that is a perfectly ordinary state — it must disable the toggle and name
+    /// the file to create, not crash and not silently do nothing.
+    private let cloudSetup: (client: GeminiClient?, error: String?, keyPath: String?) = {
         do {
-            return (try FalClient(), nil, nil)
+            return (try GeminiClient(), nil, nil)
         } catch {
-            let d = describeFalError(error)
+            let d = describeCloudError(error)
             return (nil, d.summary, d.missingKeyPath)
         }
     }()
-    private var cloudAvailable: Bool { falSetup.client?.isConfigured == true }
+    private var cloudAvailable: Bool { cloudSetup.client?.isConfigured == true }
+
+    // ---- Which engine drives the live text -------------------------------------------
+    //
+    // Same nil-means-default UserDefaults idiom as the three toggles below, with the
+    // default spelled `.apple`: an unset key, a key holding a string nobody recognises,
+    // and a key holding "apple" all mean the on-device engine. The privacy-preserving
+    // choice is the one that survives every reading failure, which is the only direction
+    // a default of this kind may fail in.
+
+    private nonisolated static let engineDefaultsKey = "dictationEngine"
+
+    /// The user's EFFECTIVE choice — what the next capture will start. Clamped to `.apple`
+    /// at launch when there is no Google key on disk, exactly as `cloudEnabled` is clamped
+    /// by `cloudAvailable`; the stored preference is deliberately NOT rewritten by that
+    /// clamp, so restoring the key restores the choice.
+    private var selectedEngineKind: DictationEngineKind = {
+        let d = UserDefaults.standard
+        guard let raw = d.string(forKey: AppDelegate.engineDefaultsKey),
+              let kind = DictationEngineKind(rawValue: raw) else { return .apple }
+        return kind
+    }()
+
+    /// The engine the CURRENT capture session is actually running, resolved once per
+    /// capture in `beginCapture`'s full start and never re-read from `selectedEngineKind`
+    /// until the next one.
+    ///
+    /// THIS SPLIT IS WHAT MAKES "takes effect at the next capture" STRUCTURAL rather than
+    /// a convention. Every mid-session caller — the drain-cancel resume, `endCapture`,
+    /// `finishCapture`, the watchdog's stand-down gate, the trace lines — reads
+    /// `activeEngine`, so there is no code path that can hand a live session's audio to
+    /// one engine and its `stop()` to another. Mirrors `toggleCloud`'s precedent, where
+    /// the chunk loop's existence is likewise decided once at session start.
+    private var activeEngineKind: DictationEngineKind = .apple
+
+    /// The engine object for `activeEngineKind`. A two-case switch on a stored enum, on
+    /// the main actor — NEVER on the audio thread: `beginCapture` resolves it once into a
+    /// local that the tap closure captures (see `processTap`).
+    private var activeEngine: any DictationEngine {
+        switch activeEngineKind {
+        case .apple: return recognizer
+        case .geminiLive: return geminiRecognizer
+        }
+    }
+
+    /// Can Gemini Live be chosen at all? Both halves are load-bearing: `cloudAvailable`
+    /// answers "is there a `GOOGLE_API_KEY` on disk" — the same key, in the same file, as
+    /// the accuracy pass reads, which is also what lets the menu name the path to create —
+    /// and `isSupported` is the engine's own veto for anything else that would stop it
+    /// running here.
+    private var geminiLiveAvailable: Bool { cloudAvailable && geminiRecognizer.isSupported }
+
+    /// Rate limiter for the watchdog's stand-down line, in the shape of
+    /// `lastTier3WouldFireLoggedAt` and for the same reason: the ladder's strike branch can
+    /// be reached every ~13 s, and a line that says "still standing down" at that cadence
+    /// would bury the events it is meant to be read beside.
+    private var lastEngineStandDownTracedAt = Date.distantPast
 
     /// "Cloud accuracy pass" menu toggle — REALTIME-FIRST, default OFF. The user's explicit
     /// directive: "I don't need auto-correction. I need realtime and fast dictation." The
@@ -929,24 +1529,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// nil-means-OFF semantics: a stored explicit value (a previous menubar toggle) wins,
     /// so opting in survives relaunches. The effective value is computed at launch
     /// (`applicationDidFinishLaunching`) because it also requires `cloudAvailable`, which
-    /// depends on the `falSetup` stored property and so cannot be read in a property
+    /// depends on the `cloudSetup` stored property and so cannot be read in a property
     /// initializer here.
+    ///
+    /// UNCHANGED BY THE MOVE TO GEMINI, deliberately. This toggle is not about which vendor
+    /// gets the audio, it is about whether audio leaves the machine at all — the only
+    /// network egress in this app. A provider swap is no reason to opt someone in.
     private nonisolated static let cloudPassDefaultsKey = "cloudPassEnabled"
     private var cloudEnabled = false
 
-    /// "Auto-correct from cloud" menu toggle — default OFF, same realtime-first reasoning
-    /// and same nil-means-OFF UserDefaults semantics as the master toggle above (an
-    /// explicit stored choice wins). When ON, a fal result that differs from the span
-    /// typed for its audio chunk is applied IN PLACE via
+    /// "Auto-correct from cloud" menu toggle — nil-means-ON. When ON, a cloud result that
+    /// differs from the span typed for its audio chunk is applied IN PLACE via
     /// `TextInjector.replaceRecentText(find:with:)`; when OFF (or when the replace
     /// refuses) the result falls back to the display-only park under "Copy cloud
-    /// correction", exactly the pre-toggle behaviour. Persisted in UserDefaults so the
-    /// choice survives relaunches (same pattern as the hotkey override).
+    /// correction". Persisted in UserDefaults, and an explicit stored choice still wins, so
+    /// either decision survives relaunches (same pattern as the hotkey override).
+    ///
+    /// DEFAULT FLIPPED TO ON AT THE USER'S EXPLICIT REQUEST, alongside the move to Gemini:
+    /// asked what they wanted, they chose "Apple live + Gemini chunks" — i.e. corrections
+    /// that are actually applied, not merely offered. The paragraph this replaces argued
+    /// the other way, on the user's earlier directive ("I don't need auto-correction. I
+    /// need realtime and fast dictation."), and that reasoning is recorded here rather than
+    /// deleted because nothing about the ENGINEERING changed: an applied correction is
+    /// still a rewrite of text already sitting in someone else's document, seconds after
+    /// they typed it.
+    ///
+    /// So this default is a user preference, not an engineering conclusion — the same
+    /// standing as `daemonRestartEnabled` below. One click of the menubar item reverts it,
+    /// and every safety gate in `applyCloudResult` (span ≥ 10 graphemes, size sanity,
+    /// secure-input refusal, verified-match-or-nothing) is untouched by the flip: this
+    /// changes how often that path RUNS, never how carefully it runs.
     private nonisolated static let autoCorrectDefaultsKey = "cloudAutoCorrect"
     private var autoCorrectEnabled: Bool = {
         let d = UserDefaults.standard
         return d.object(forKey: AppDelegate.autoCorrectDefaultsKey) == nil
-            ? false
+            ? true
             : d.bool(forKey: AppDelegate.autoCorrectDefaultsKey)
     }()
 
@@ -967,21 +1584,129 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Unlike the cloud pass, this is read on the MainActor at the instant the tier fires,
     /// so flipping it takes effect immediately — no session restart needed.
     private nonisolated static let daemonRestartDefaultsKey = "restartSpeechServiceWhenWedged"
+    /// DEFAULT FLIPPED TO ON AT THE USER'S EXPLICIT REQUEST (2026-08-28), and the paragraph
+    /// above is left standing rather than rewritten, because it is still the honest reading
+    /// of the evidence and it argues AGAINST this default. Recorded plainly so the next
+    /// person does not mistake this for a finding:
+    ///
+    ///   * the one field record of tier 3 firing remains a failure — `pkill` restored
+    ///     nothing and was followed by `kAFAssistantErrorDomain` 1107 throttling;
+    ///   * the failure the user was actually hitting on the day they asked was NOT a
+    ///     systemic wedge. Trace 14:36 shows captures ending on hotkey release, no give-up,
+    ///     no tier-3 arming; the mute was `finalOnlyInjection` and the blind gate.
+    ///
+    /// So this default is a user preference, not an engineering conclusion. `nil` now means
+    /// ON, an explicit stored choice still wins, and one click of the menubar item reverts
+    /// it — which is the right escape hatch to leave, given the record above.
+    ///
+    /// ONE COMPOUNDING EFFECT, STATED BECAUSE NOTHING ELSE IN THE FILE DOES. The same
+    /// change set drops `backoffCeiling` from 48 s to a toggle-independent 12 s (it had to:
+    /// any ceiling at or above the 20 s rotation cadence is unsatisfiable). That makes
+    /// watchdog strikes fire more often, and `suppressedBouncesSinceRestart` — tier 3's
+    /// arming counter — only increments inside the strike branch. So the unattended
+    /// `kill -9` of `localspeechrecognition` is more reachable now than in EITHER
+    /// previously shipped configuration. Each change is individually correct and the
+    /// default was explicitly requested; the combination is new and unmeasured, against a
+    /// tier whose only field trial was a failure. If tier 3 starts firing in traces,
+    /// this pairing is the first thing to look at.
     private var daemonRestartEnabled: Bool = {
         let d = UserDefaults.standard
         return d.object(forKey: AppDelegate.daemonRestartDefaultsKey) == nil
-            ? false
+            ? true
             : d.bool(forKey: AppDelegate.daemonRestartDefaultsKey)
     }()
 
     /// One cloud request in flight at a time. A second concurrent request would race the
-    /// first to update the same HUD line, and fal is billed per call.
+    /// first to update the same HUD line, and every call is billed.
     private var cloudTask: Task<Void, Never>?
 
     /// When the in-flight `cloudTask` was registered; nil exactly when `cloudTask` is nil
     /// (set in `registerCloudTask`, cleared wherever the task is cleared). Read only by
     /// `noteFinalChunk`'s supersede rule — see `cloudSupersedeAfterSeconds`.
     private var cloudTaskStartedAt: Date?
+
+    // ---- Spend ledger ----------------------------------------------------------------
+    //
+    // NO BALANCE PROBE LIVES HERE ANY MORE. Under fal this section had a sibling: a
+    // background task that asked fal's billing endpoint what was left on the account and
+    // decorated one menu line with the answer. Google exposes no equivalent an API key may
+    // read — Cloud Billing is an OAuth-only surface — so there is nothing to ask, and the
+    // whole probe (`refreshBalance`, `applyBalanceOutcome`, the six pieces of state they
+    // shared, their four trigger sites and their `BILLING:` traces) was deleted rather than
+    // left pointing at a host this app no longer talks to. `FalBillingClient.swift` itself
+    // has since been deleted as well — see the note at the top of the cloud section.
+    //
+    // What is left is a ledger of what THIS MAC sent, which was always the honest half: it
+    // is measured here, not reported by a vendor, and it never claimed to be an invoice.
+
+    /// Audio seconds and request count SENT from this Mac, lifetime, persisted.
+    ///
+    /// COUNTED AT DISPATCH, and that is the whole point of them. The provider serves — and,
+    /// we must assume, bills for — requests whose results this app then throws away: the
+    /// id-guards at the top of `applyCloudResult`/`applyCloudFailure` discard superseded
+    /// results before any completion-side counter could run, and `noteFinalChunk`
+    /// deliberately cancels a hung request the far end may already be halfway through.
+    /// Counting on the way back would therefore under-report real usage, silently, in
+    /// exactly the situations where usage is highest. A figure that reads LOW is worse than
+    /// no figure. (Written for fal, and every word of it still holds for Gemini.)
+    ///
+    /// No nil-means-X ceremony (unlike the Bool toggles above): `double(forKey:)` and
+    /// `integer(forKey:)` return 0 for an absent key, which is precisely the right starting
+    /// value for a lifetime counter.
+    private nonisolated static let cloudSecondsDefaultsKey = "cloudAudioSecondsSent"
+    private nonisolated static let cloudRequestsDefaultsKey = "cloudRequestsSent"
+    private var cloudAudioSecondsSent =
+        UserDefaults.standard.double(forKey: AppDelegate.cloudSecondsDefaultsKey)
+    private var cloudRequestsSent =
+        UserDefaults.standard.integer(forKey: AppDelegate.cloudRequestsDefaultsKey)
+
+    /// Audio tokens billed to this Mac, lifetime, persisted — Gemini's EXACT unit, read
+    /// straight off `GeminiClient.Result.audioTokens` rather than derived from anything.
+    ///
+    /// COUNTED ON SUCCESS ONLY, which is the opposite rule to the two counters above, and
+    /// the asymmetry is forced rather than chosen: a token count exists only inside a
+    /// response, so a request that was cancelled, timed out, or never reached Google has no
+    /// token figure to add — not a zero, an unknown. THE CONSEQUENCE, STATED SO NOBODY
+    /// DEBUGS IT AS A BUG: tokens read LOW relative to requests whenever requests are
+    /// cancelled (the supersede path does exactly that), so `req` and `audio tokens` on the
+    /// spend line will not stay in proportion. That is unavoidable, and it is why the
+    /// seconds/requests counters keep counting at dispatch instead of moving here.
+    ///
+    /// Counted for EVERY response that arrives, including ones the stale-guards then
+    /// discard — see `applyCloudResult`, where the accumulation deliberately sits above
+    /// those guards. A response that arrived was served, and a served response was billed
+    /// whether or not this app had any further use for it.
+    private nonisolated static let cloudTokensDefaultsKey = "cloudAudioTokensSent"
+    private var cloudAudioTokensSent =
+        UserDefaults.standard.integer(forKey: AppDelegate.cloudTokensDefaultsKey)
+
+    /// Consecutive settled HTTP 429s. Any other settled failure resets it; see
+    /// `applyCloudFailure` for why cancellations do neither.
+    private var consecutive429s = 0
+
+    /// How many consecutive 429s turn the cloud pass off. Two, not one: a single 429 could
+    /// easily be a transient answer, and turning a user's feature off on one data point is
+    /// the kind of "help" that reads as a bug.
+    ///
+    /// THIS RULE IS LESS PRECISE THAN THE 402 RULE IT REPLACES, and the difference is worth
+    /// knowing before trusting it. fal's 402 meant one thing: out of credit, every further
+    /// request a guaranteed failure. Google returns 429 for a per-minute RATE limit and for
+    /// an exhausted QUOTA alike, and nothing in the status distinguishes them — so where two
+    /// 402s in a row could not be coincidence, two 429s in a row genuinely can be: this app
+    /// fires a request roughly every 10 s, which is quite fast enough to collect two
+    /// rate-limit refusals during a burst that would have cleared on its own.
+    ///
+    /// Kept at two anyway, because the failure modes are lopsided. Auto-disabling early
+    /// costs one menubar click, is announced in the menu (`cloudAutoDisabledReason`) and in
+    /// the trace, and leaves the stored opt-in untouched; NOT disabling on a real quota wall
+    /// means every subsequent utterance uploads audio to be refused, indefinitely. The
+    /// escape hatch is the toggle, and it is one click.
+    private nonisolated static let max429sBeforeAutoDisable = 2
+
+    /// Non-nil while the cloud pass is off because THIS PROCESS turned it off, rather than
+    /// because the user did. Shown in the menu, so an off toggle the user did not touch is
+    /// never mysterious. Cleared by any deliberate flip of the toggle.
+    private var cloudAutoDisabledReason: String?
 
     private var chunkTask: Task<Void, Never>?
 
@@ -1014,16 +1739,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cloudEnabled = cloudAvailable && storedCloudChoice
         if cloudAvailable {
             trace(cloudEnabled
-                ? "fal: configured; cloud pass ON (stored menubar opt-in; keyterms: \(cloudKeyterms.count))"
-                : "fal: configured; cloud pass OFF by default (enable from the menubar)")
+                ? "gemini: configured (\(GeminiClient.model)); cloud pass ON "
+                    + "(stored menubar opt-in; keyterms: \(cloudKeyterms.count))"
+                : "gemini: configured (\(GeminiClient.model)); cloud pass OFF by default "
+                    + "(enable from the menubar)")
         } else {
-            trace("fal: NOT configured — \(falSetup.error ?? "unknown reason"); cloud pass disabled")
+            trace("gemini: NOT configured — \(cloudSetup.error ?? "unknown reason"); cloud pass disabled")
         }
-        trace("auto-correct from cloud: \(autoCorrectEnabled ? "ON (stored opt-in)" : "OFF (default)")")
+        // Both halves say whether the state is the default or a stored choice, in BOTH
+        // directions — the shape `daemonRestartEnabled`'s line below already uses. A trace
+        // that hardcodes "(default)" against one value silently lies the day the default
+        // flips, which is exactly what this line did before auto-correct became nil-means-ON.
+        let autoCorrectStored = UserDefaults.standard.object(forKey: Self.autoCorrectDefaultsKey) != nil
+        trace("auto-correct from cloud: "
+            + (autoCorrectEnabled
+                ? "ON \(autoCorrectStored ? "(stored opt-in)" : "(default — user's choice, see autoCorrectEnabled)")"
+                : "OFF \(autoCorrectStored ? "(stored opt-out)" : "(default)")"))
         trace("restart macOS speech service when wedged: "
             + (daemonRestartEnabled
-                ? "ON (stored opt-in) — watchdog tier 3 may pkill localspeechrecognition"
-                : "OFF (default) — watchdog tier 3 detects and logs only"))
+                ? "ON (default) — watchdog tier 3 may pkill localspeechrecognition"
+                : "OFF (stored opt-out) — watchdog tier 3 detects and logs only"))
+
+        // The engine, clamped and named. Clamping here rather than at capture time is the
+        // `cloudEnabled` idiom above, and it is sound for the same reason: `cloudSetup` is
+        // built once at init, so the key cannot appear or vanish mid-run and there is
+        // nothing later to re-evaluate. The trace says which engine the run used, in both
+        // directions and never a key — two runs whose numbers are compared without knowing
+        // this are two runs of different apps.
+        let storedEngineRaw = UserDefaults.standard.string(forKey: Self.engineDefaultsKey)
+        if selectedEngineKind == .geminiLive && !geminiLiveAvailable {
+            selectedEngineKind = .apple
+            trace("dictation engine: Gemini Live was stored but is unavailable — "
+                + "\(cloudSetup.error ?? "no GOOGLE_API_KEY"); falling back to Apple "
+                + "(on-device). The stored preference is left alone, so restoring the key "
+                + "restores the choice.")
+        } else {
+            trace("dictation engine: \(selectedEngineKind.menuName) "
+                + (storedEngineRaw == nil
+                    ? "(default — nil means Apple, and audio never leaves this Mac)"
+                    : "(stored choice \"\(storedEngineRaw!)\")")
+                + (selectedEngineKind == .geminiLive
+                    ? " — microphone audio is streamed to Google for the whole of every capture"
+                    : ""))
+        }
 
         buildStatusItem()
         wireHUD()
@@ -1040,9 +1798,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Contextual strings before the first start(), so the very first utterance already
         // biases towards the technical vocabulary rather than only later ones.
+        //
+        // BOTH engines, unconditionally, and not just the selected one: the keyterms are
+        // the same list, seeding is cheap and idempotent, and doing it here means a
+        // mid-run engine switch cannot produce one capture that has never been told the
+        // vocabulary. The alternative — re-seeding inside `beginCapture` — would put a
+        // list copy on the hotkey's latency path for no benefit.
         recognizer.setContextualStrings(cloudKeyterms)
-        trace("recognizer: isSupported=\(recognizer.isSupported) "
-            + "contextualStrings=\(cloudKeyterms.count)")
+        geminiRecognizer.setContextualStrings(cloudKeyterms)
+        // Built in pieces, deliberately. As one five-way interpolated `+` chain this line
+        // made the compiler give up outright ("unable to type-check this expression in
+        // reasonable time") — each `+` on interpolated strings multiplies the overload
+        // space it has to search. Assigning to typed `let`s first collapses that. If a
+        // sixth field is ever added here, add it the same way rather than extending the
+        // chain.
+        let engineField = "engine=\(selectedEngineKind.rawValue)"
+        let appleField: String = "appleSupported=\(recognizer.isSupported)"
+        let geminiField: String = "geminiLiveSupported=\(geminiRecognizer.isSupported)"
+        let availField: String = "geminiLiveAvailable=\(geminiLiveAvailable)"
+        let termsField: String = "contextualStrings=\(cloudKeyterms.count)"
+        trace("recognizer: \(engineField) \(appleField) \(geminiField) "
+            + "\(availField) \(termsField)")
 
         requestPermissions()
 
@@ -1072,6 +1848,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusTimer = st
 
         refreshMenu()
+
         maybeArmAutostart()
     }
 
@@ -1142,6 +1919,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dictationItem.action = #selector(toggleDictation)
         menu.addItem(dictationItem)
 
+        // Directly under "Dictation", above the cloud pass: this item decides what the
+        // dictation line itself does, where the two cloud items only decorate its output.
+        engineItem.title = "Dictation engine"
+        engineItem.target = self
+        engineItem.action = #selector(toggleEngine)
+        menu.addItem(engineItem)
+
         cloudItem.title = "Cloud accuracy pass"
         cloudItem.target = self
         cloudItem.action = #selector(toggleCloud)
@@ -1164,6 +1948,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             line.isEnabled = false
             menu.addItem(line)
         }
+
+        // Usage belongs with the read-outs, but it cannot go through the loop above: that
+        // loop disables what it adds, and this one is clickable in every state it is
+        // visible in. Hidden until this Mac has sent something (`refreshCreditItems`).
+        creditItem.target = self
+        creditItem.action = #selector(openCloudQuota)
+        creditItem.isHidden = true
+        menu.addItem(creditItem)
+
+        // Spend is a plain read-out — no action, so menu validation disables it on its own;
+        // saying so explicitly matches the loop above. Hidden until this Mac has actually
+        // sent something, because "0 req, 0.0 min, 0 audio tokens" is a line about nothing.
+        spendItem.isEnabled = false
+        spendItem.isHidden = true
+        menu.addItem(spendItem)
 
         menu.addItem(.separator())
 
@@ -1212,6 +2011,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Refreshed every time the menu is about to open, so the numbers are never stale.
+    ///
+    /// Nothing is fetched here any more. Under fal this opened with a rate-limited billing
+    /// probe so the credit line could render fresh; every number the menu now shows is
+    /// local state, already current, and a menu open is no longer a network event.
     func menuNeedsUpdate(_ menu: NSMenu) {
         refreshMenu()
     }
@@ -1222,13 +2025,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             : "Dictation: OFF"
         dictationItem.state = dictationEnabled ? .on : .off
 
+        // ── The engine line ───────────────────────────────────────────────────────────
+        // NOT a checkmark toggle. `.state` on this item would have to answer "on for
+        // WHICH engine", and both answers are wrong: there is no off. The title carries
+        // the whole state instead, which is also why it always names the mode the app is
+        // in rather than the one a click would move to.
+        //
+        // The tooltip is where the consequence is spelled out, and it is set in BOTH
+        // states on purpose. A warning that only exists once the risky mode is already
+        // selected is a warning nobody reads before selecting it.
+        if geminiLiveAvailable {
+            engineItem.title = "Dictation engine: \(selectedEngineKind.menuName)"
+            engineItem.isEnabled = true
+            switch selectedEngineKind {
+            case .geminiLive:
+                engineItem.toolTip =
+                    "Gemini Live streams your microphone audio to Google continuously "
+                    + "for as long as you are dictating. Apple (on-device) never sends "
+                    + "any audio off this Mac. Click to switch back to Apple; the change "
+                    + "takes effect at the next capture."
+            case .apple:
+                engineItem.toolTip =
+                    "Apple (on-device) does all recognition on this Mac — no audio leaves "
+                    + "it. Click to switch to Gemini Live, which streams your microphone "
+                    + "audio to Google continuously while you dictate; the change takes "
+                    + "effect at the next capture."
+            }
+        } else {
+            // Same shape as the cloud-pass line below, because it is the same missing key
+            // in the same file: name the file to create and the assignment to put in it.
+            engineItem.title = "Dictation engine: Apple (on-device) — Gemini Live "
+                + (cloudSetup.keyPath.map { "unavailable: create \($0) with \(GeminiClient.keyName)=…" }
+                    ?? (cloudAvailable
+                        ? "unavailable: the engine reports it cannot run here"
+                        : (cloudSetup.error ?? "unavailable: no \(GeminiClient.keyName)")))
+            engineItem.isEnabled = false
+            engineItem.toolTip = "Apple (on-device) does all recognition on this Mac — "
+                + "no audio leaves it."
+        }
+
         if cloudAvailable {
-            cloudItem.title = cloudEnabled ? "Cloud accuracy pass: on" : "Cloud accuracy pass: off"
+            if !cloudEnabled, let reason = cloudAutoDisabledReason {
+                // An off toggle nobody switched off needs to say why, or the next thing
+                // the user does is file a bug about the cloud pass "randomly stopping".
+                cloudItem.title = "Cloud accuracy pass: off (auto-disabled — \(reason))"
+            } else {
+                cloudItem.title = cloudEnabled ? "Cloud accuracy pass: on" : "Cloud accuracy pass: off"
+            }
             cloudItem.state = cloudEnabled ? .on : .off
             cloudItem.isEnabled = true
         } else {
             cloudItem.title = "Cloud accuracy pass unavailable — "
-                + (falSetup.keyPath.map { "create \($0) with FAL_KEY=…" } ?? (falSetup.error ?? "no key"))
+                + (cloudSetup.keyPath.map { "create \($0) with \(GeminiClient.keyName)=…" }
+                    ?? (cloudSetup.error ?? "no key"))
             cloudItem.state = .off
             cloudItem.isEnabled = false
         }
@@ -1264,6 +2113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         else if utteranceDiverged { activity = "Typed text is stale — see HUD" }
         else if let outcome = lastOutcome { activity = outcome }
         activityItem.title = activity
+
+        refreshCreditItems()
 
         copyTranscriptItem.isEnabled = !lastTranscript.isEmpty
         copyCloudItem.isEnabled = !unappliedCloudText.isEmpty
@@ -1341,15 +2192,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Recognizer wiring
 
-    /// These three closures are `@Sendable` and run on Speech's own queue. They capture the
-    /// event box — a lock-protected `@unchecked Sendable` class — and nothing else. In
-    /// particular they do not capture `self`, do not touch the main actor, and do not call
-    /// `trace()` (a file write per partial would be both slow and a privacy leak).
+    /// Point exactly ONE engine at the event box, and disconnect the other.
+    ///
+    /// The three closures are `@Sendable` and run on the engine's own queue (Speech's, or
+    /// the Gemini socket's). They capture the event box — a lock-protected
+    /// `@unchecked Sendable` class — and nothing else: not `self`, not the main actor, and
+    /// never `trace()` (a file write per partial would be both slow and a privacy leak).
+    /// See `DictationEngine.bindEvents(to:)` for the bodies, which are unchanged from the
+    /// three lines that used to be inline here.
+    ///
+    /// WHY THE OTHER ENGINE IS EXPLICITLY UNBOUND, rather than left connected on the
+    /// argument that a stopped engine emits nothing. `LiveRecognizer` demonstrably does
+    /// emit after being told to stop — it re-reports `persistent recognition failure` on
+    /// every retry cycle at an 8 s backoff — and a WebSocket client with a reconnect loop
+    /// has every reason to do the same. One late `.unavailable` from the engine the user
+    /// just switched AWAY from would land in the box mid-session, reach
+    /// `handleRecognizerState`, and paint the HUD red about a recogniser that is not
+    /// running. Unbinding closes that structurally instead of trusting a promise made in
+    /// another file.
+    ///
+    /// Called at launch and again from `beginCapture`'s full start, which is where the
+    /// active engine is actually decided.
     private func wireRecognizer() {
         let box = events
-        recognizer.onPartial = { text in box.post(.partial(text)) }
-        recognizer.onFinal = { text in box.post(.final(text)) }
-        recognizer.onState = { state in box.post(.state(state)) }
+        switch activeEngineKind {
+        case .apple:
+            geminiRecognizer.unbindEvents()
+            recognizer.bindEvents(to: box)
+        case .geminiLive:
+            recognizer.unbindEvents()
+            geminiRecognizer.bindEvents(to: box)
+        }
     }
 
     // MARK: - Hotkey wiring
@@ -1376,6 +2249,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hotkey.onPressStart = { [weak self] in
             guard let self else { return }
             self.wantsDictation.toggle()
+            // Trace the EDGE, not just its consequence. Without this line a physical tap is
+            // invisible: the only evidence is `endCapture(reason: "hotkey released")`, which
+            // is the same sentence `syncDictation()` prints for every other route to
+            // `wantsDictation == false`. A capture that stops because the user tapped the key
+            // then reads exactly like one that stopped because something failed — and in
+            // toggle mode the stray-tap case is easy to hit, because the tap stays armed
+            // during headless MICTEST_AUTOSTART runs and silently ends them early (measured
+            // 2026-08-30: a 45 s hold cut to 36 s, which also skipped the second rotation and
+            // made the seam machinery look broken when it was not).
+            trace("HOTKEY: tap — wantsDictation -> \(self.wantsDictation) (toggle mode)")
             Task { @MainActor [weak self] in self?.syncDictation() }
         }
 
@@ -1521,8 +2404,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // The engine is still live but the recogniser was stopped on release; restart
                 // it so the new utterance gets its own session rather than silently producing
                 // no partials at all.
+                //
+                // `activeEngine`, and deliberately NOT `selectedEngineKind`: this branch
+                // CONTINUES the session that is still draining, so switching the engine
+                // from the menu inside the release window and immediately re-pressing the
+                // hotkey resumes the engine the session started with. That is the correct
+                // reading of "takes effect at the next capture" — this is not one — and it
+                // matters concretely, because the audio tap installed below in the full
+                // start is still feeding whichever engine it captured.
                 do {
-                    try recognizer.start()
+                    try activeEngine.start()
                     // A fresh recognition request has, by definition, produced no events
                     // yet. Stamp the liveness clock so a timestamp left over from before
                     // the release cannot bounce this brand-new, healthy recogniser on the
@@ -1547,7 +2438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     // TEARDOWN FIRST, error display second — the order is load-bearing.
                     // On this path the engine, tap, pipeline, and chunk loop are all still
                     // LIVE (the drain was cancelled, not completed). `fail()` alone would
-                    // leave the microphone hot and chunks still uploading to fal while the
+                    // leave the microphone hot and chunks still uploading to the cloud while the
                     // HUD claims failure, with `wantsDictation` forced false so the next
                     // tap is a no-op — the user would need three taps to actually stop.
                     // `finishCapture` tears all of that down; its deferred syncDictation
@@ -1555,8 +2446,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     // the last write, so the user sees the recogniser error, not idle.
                     finishCapture(reason: "drain-cancel restart failed")
                     let desc = describeRecognizerError(error)
-                    fail("On-device recogniser could not restart: \(desc)",
-                         context: "beginCapture(drain): recognizer.start() threw — \(desc)")
+                    fail("\(activeEngineKind.recognizerNoun) could not restart: \(desc)",
+                         context: "beginCapture(drain): \(activeEngineKind.rawValue) "
+                            + "start() threw — \(desc)")
                 }
                 return
             }
@@ -1585,6 +2477,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        // Resolve the synthetic source here, BEFORE the tap and the engine, for the same
+        // reason the pipeline is built here: a failure must return from a state with nothing
+        // installed and nothing started. It is also the earliest point at which `format` —
+        // the real tap format it has to match — is known to be valid.
+        //
+        // A NAMED-BUT-UNUSABLE FILE IS A HARD STOP, NOT A FALLBACK. Silently carrying on with
+        // the live microphone would hand back a run full of `+0 chars` seams that look exactly
+        // like the silent-room result this harness exists to escape — a false negative dressed
+        // as a measurement. Better to refuse the capture and say why.
+        var synth: SyntheticAudioSource?
+        if let audioFile = ProcessInfo.processInfo.environment["MICTEST_AUDIO_FILE"],
+           !audioFile.isEmpty {
+            do {
+                synth = try SyntheticAudioSource(path: audioFile, tapFormat: format)
+            } catch {
+                fail("MICTEST_AUDIO_FILE is set but unusable: \(error)",
+                     context: "beginCapture: SyntheticAudioSource init failed — \(error)")
+                return
+            }
+        }
+
         // Build the pipeline BEFORE installing the tap. If its init throws we want to return
         // from a state with no tap installed and no engine started — a tap left attached to
         // an abandoned node is precisely what makes the *next* start raise the double-install
@@ -1602,6 +2515,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         events.clear()
         levelBox.reset()
+        // The periodic LEVEL line's baseline, and it obeys the same adjacency rule as the
+        // block below for a sharper reason: `levelBox.reset()` zeroes `frames`, so a
+        // baseline left behind by the previous capture would make the first line of this
+        // one subtract a larger number from a smaller one. Unsigned, so it would print
+        // ~1.8e19 rather than something recognisably wrong. The tick counter is zeroed
+        // alongside it so the first line lands ~5 s into the capture instead of at a random
+        // offset inherited from the last one.
+        levelLineLastFrames = 0
+        levelLineTicks = 0
+        levelLinePeak = 0
         // Adjacent to `levelBox.reset()` on purpose, and it must stay adjacent: the
         // per-capture counters and the `frames` count printed beside them on the same
         // "capture stopped" line are only comparable if they measure the same span of wall
@@ -1635,18 +2558,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         noiseFloorSeeded = false
         nonFiniteRMSTracedThisCapture = false
 
+        // ── THE ONE PLACE THE ENGINE IS CHOSEN ────────────────────────────────────────
+        // Read the user's choice here, at the full start, and nowhere else. Everything
+        // after this line — the tap's captured reference, every `stop()`, the watchdog
+        // gate, both trace summaries — goes through `activeEngine`/`activeEngineKind`, so
+        // a menu click mid-session cannot split one capture across two engines. Same
+        // precedent as the cloud pass's chunk loop, decided once at session start (see the
+        // REALTIME-FIRST GATE below and `toggleCloud`).
+        if activeEngineKind != selectedEngineKind {
+            trace("engine: switching \(activeEngineKind.rawValue) -> \(selectedEngineKind.rawValue) "
+                + "for this capture")
+        }
+        activeEngineKind = selectedEngineKind
+        // Rebind before start(), so the first event the new engine emits already has
+        // somewhere to go — and so the engine we are NOT running is disconnected before it
+        // could post a late reconnect/retry report into this session's queue.
+        wireRecognizer()
         do {
-            try recognizer.start()
+            try activeEngine.start()
         } catch {
             let desc = describeRecognizerError(error)
-            fail("On-device recogniser could not start: \(desc)",
-                 context: "beginCapture: recognizer.start() threw — \(desc)")
+            fail("\(activeEngineKind.recognizerNoun) could not start: \(desc)",
+                 context: "beginCapture: \(activeEngineKind.rawValue) start() threw — \(desc)")
             return
         }
         // A fresh recogniser has produced no events yet; a timestamp inherited from a
         // previous session is stale by definition. Stamp the liveness clock now so the
         // recogniser watchdog cannot bounce a brand-new, healthy request on its first tick.
         lastRecognizerEventAt = Date()
+        // The accumulated loud-tick evidence goes with it, by the same argument the
+        // drain-cancel resume at the top of this method already makes for itself. This line
+        // is not decoration: it took over a job that the `.state` branch of the event pump
+        // used to do by accident before that reset was removed (see it for why it had to
+        // go). The counter is only ever incremented inside `tickStatus`'s `isCapturing`
+        // branch and is otherwise cleared only by real output or by the watchdog's own
+        // strike, so these two `beginCapture` paths are between them the complete set of
+        // session boundaries. Without this, ticks measured while the LAST session's
+        // recogniser was dying would arm the ladder against a brand-new, healthy one.
+        loudTicksSinceRecognizerEvent = 0
         // No partial has been drained for this brand-new session yet.
         // `escalationsThisSession` deliberately does NOT reset here: the watchdog's own
         // escalation lands back in this very path via the self-heal, and resetting would
@@ -1656,13 +2605,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sessionSawPartial = false
 
         // Capture only Sendable collaborators; never self, never UI.
+        //
+        // `rec` is the requirement that keeps the audio thread honest: the active engine is
+        // resolved ONCE, here, into a single stored reference the tap closure captures. The
+        // realtime callback therefore does no lookup, no switch, and above all no
+        // UserDefaults read — it calls `append` on the object it was handed. `activeEngine`
+        // is a two-case switch on a stored enum and this is the only place it is paid for
+        // per capture.
         let box = levelBox
-        let rec = recognizer
+        let rec = activeEngine
+
+        // Captured as a plain `Bool`, resolved once here, for exactly the reason the comment
+        // above gives for `rec`: the realtime thread must never be where a question gets
+        // answered. This is a predicted branch on an immutable capture, not a lookup.
+        let syntheticActive = (synth != nil)
 
         // The `@Sendable` here is load-bearing, not decoration. See AppDelegate.processTap.
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable buffer, _ in
+            // The microphone keeps running under a synthetic source and its buffers are
+            // dropped right here. Discarding rather than never installing is deliberate: it
+            // leaves the engine lifecycle, the tap format, and every line of teardown
+            // identical between a harness run and a real one. See SyntheticAudioSource.swift,
+            // "why the microphone stays open".
+            if syntheticActive { return }
             // Realtime audio thread. Hand the buffer on and store the level, nothing else.
-            AppDelegate.processTap(buffer, into: box, pipeline: pipe, recognizer: rec)
+            AppDelegate.processTap(buffer, into: box, pipeline: pipe, engine: rec)
         }
 
         e.prepare()
@@ -1671,7 +2638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             let ns = error as NSError
             input.removeTap(onBus: 0)   // undo the tap we just installed
-            recognizer.stop()
+            activeEngine.stop()
             fail("Audio engine did not start: \(ns.localizedDescription)",
                  context: "beginCapture: engine.start() threw \(ns.domain) code \(ns.code)")
             return
@@ -1681,6 +2648,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pipeline = pipe
         isCapturing = true
         sessions += 1
+
+        // Started only after the state above is consistent: the first buffer it delivers
+        // reaches `LiveRecognizer.append` immediately, and everything that answers for that
+        // audio downstream assumes a capture is fully begun.
+        syntheticSource = synth
+        synth?.start { [box, pipe, rec] buffer in
+            // The same call the microphone's own buffers make, one line above in the tap
+            // closure, with the same three collaborators resolved at the same moment. That
+            // sameness is the harness's entire claim to validity.
+            AppDelegate.processTap(buffer, into: box, pipeline: pipe, engine: rec)
+        }
 
         captureGeneration &+= 1
         let gen = captureGeneration
@@ -1701,7 +2679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // tolerate the nils: `drainElapsed` flushes via `flushRequest?.request()` and
         // `finishCapture` cancels via `chunkTask?.cancel()`, both optional-chained no-ops.
         if cloudEnabled && cloudAvailable {
-            let cloud = falSetup.client
+            let cloud = cloudSetup.client
             // One flush flag per session, shared with exactly this session's loop.
             let flushBox = FlushRequestBox()
             flushRequest = flushBox
@@ -1732,6 +2710,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Reset the per-utterance injection bookkeeping and put the HUD into listening.
     private func startUtterance() {
         injectedForUtterance = ""
+        // The ledger claims nothing again, so no deferred repair is outstanding.
+        transientRepairSkips = 0
         cloudOwnsUtterance = false
         currentOnDeviceText = ""
         utteranceDiverged = false
@@ -1746,7 +2726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// `releaseDrainSeconds` — see that constant for why.
     private func endCapture(reason: String) {
         guard isCapturing, drainTimer == nil else { return }
-        recognizer.stop()
+        activeEngine.stop()
         trace("endCapture(\(reason)): recogniser stopped; draining audio for "
             + String(format: "%.1f s", releaseDrainSeconds))
 
@@ -1787,6 +2767,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         drainTimer?.invalidate()
         drainTimer = nil
 
+        // Above the `isCapturing` guard on purpose. `finishCapture` returns early on any path
+        // where the capture was already torn down, and a pacing thread left running past that
+        // point would go on calling `append` on a stopped recogniser for the rest of the
+        // process's life. `stop()` is idempotent, so the repeat calls this position invites
+        // are free.
+        syntheticSource?.stop()
+        syntheticSource = nil
+
         guard isCapturing, let e = engine else { return }
         // Remove the tap before stopping — the reverse order can leave a tap attached to a
         // stopped node and trip an exception the next time around.
@@ -1795,13 +2783,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         engine = nil
         pipeline = nil
         isCapturing = false
-        recognizer.stop()
+        activeEngine.stop()
 
         let (rms, frames) = levelBox.read()
         // THIS CAPTURE unprefixed, lifetime in the trailing bracket, and the bracket is
         // labelled because that ambiguity is precisely what made this line lie for as long
         // as it did (see `TraceCounters`). Anything added here must go in one group or the
         // other, never floating between them.
+        //
+        // `engine=` leads the per-capture group because it is the label on everything after
+        // it: partial and final counts from Apple's on-device recogniser and from Gemini
+        // Live are not the same measurement, and two captures compared without it are two
+        // different experiments read as one. It is the SESSION's engine (`activeEngineKind`
+        // is only ever assigned in `beginCapture`'s full start), never the menu's current
+        // selection, so a mid-session switch cannot relabel numbers it did not produce.
         //
         // `rms`/`floor`/`thr` sit in the per-capture group beside `frames` because that is
         // what they are: the room as this capture last measured it. `beginCapture` clears
@@ -1822,28 +2817,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // printed numbers exist to let a reader reason about. So: leave them stale by one
         // tick, say so here, and let `levelTrace` print `floor=(never measured)` instead of
         // rendering "never sampled" as `floor=0.00000`.
-        trace("capture stopped (\(reason)); frames=\(frames) \(levelTrace(rms)) "
+        trace("capture stopped (\(reason)); engine=\(activeEngineKind.rawValue) "
+            + "frames=\(frames) \(levelTrace(rms)) "
             + "partials=\(thisCapture.partialsSeen) coalesced=\(thisCapture.partialsCoalesced) "
             + "finals=\(thisCapture.finalsSeen) injectedChars=\(thisCapture.injectedChars) "
             + "divergencesRepaired=\(thisCapture.divergencesRepaired) "
             + "divergencesRefused=\(thisCapture.divergencesRefused) "
+            + "freshStarts=\(thisCapture.freshStarts) "
             + "injectFailures=\(thisCapture.injectFailures) "
             + "secureInputRefusals=\(thisCapture.secureInputRefusals) "
             + "finalChunks=\(thisCapture.finalChunks) cloudSent=\(thisCapture.cloudSent) "
             + "cloudApplied=\(thisCapture.cloudApplied) "
             + "cloudUnapplied=\(thisCapture.cloudUnapplied) "
-            + "cloudErrors=\(thisCapture.cloudErrors) cloudSkipped=\(thisCapture.cloudSkipped)"
+            + "cloudErrors=\(thisCapture.cloudErrors) cloudEmpty=\(thisCapture.cloudEmpty) cloudSkipped=\(thisCapture.cloudSkipped)"
             + "  [lifetime: sessions=\(sessions) partials=\(lifetime.partialsSeen) "
             + "coalesced=\(lifetime.partialsCoalesced) finals=\(lifetime.finalsSeen) "
             + "injectedChars=\(lifetime.injectedChars) "
             + "divergencesRepaired=\(lifetime.divergencesRepaired) "
             + "divergencesRefused=\(lifetime.divergencesRefused) "
+            + "freshStarts=\(lifetime.freshStarts) "
             + "injectFailures=\(lifetime.injectFailures) "
             + "secureInputRefusals=\(lifetime.secureInputRefusals) "
             + "finalChunks=\(lifetime.finalChunks) cloudSent=\(lifetime.cloudSent) "
             + "cloudApplied=\(lifetime.cloudApplied) "
             + "cloudUnapplied=\(lifetime.cloudUnapplied) "
-            + "cloudErrors=\(lifetime.cloudErrors) cloudSkipped=\(lifetime.cloudSkipped)]")
+            + "cloudErrors=\(lifetime.cloudErrors) cloudEmpty=\(lifetime.cloudEmpty) cloudSkipped=\(lifetime.cloudSkipped)]")
 
         // Settle rather than vanish: the HUD keeps the last text (or the reason nothing was
         // typed) so the user can read it, click it, and copy it from the menu.
@@ -1910,20 +2908,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// runs anywhere", and the signature documents the constraint: a buffer in, `Sendable`
     /// non-isolated collaborators out, no `self`.
     ///
-    /// `AudioPipeline` and `LiveRecognizer` are both `@unchecked Sendable` and carry no actor
+    /// `AudioPipeline` and both engines are `@unchecked Sendable` and carry no actor
     /// isolation of their own, so `append` is safe to call from here — and `LiveRecognizer`
-    /// documents this as the intended caller. Do NOT reach for `nonisolated(unsafe)` or
+    /// documents this as the intended caller. `DictationEngine` refines `Sendable` for
+    /// exactly this reason, so the existential handed in here carries the same guarantee
+    /// the concrete type used to. Do NOT reach for `nonisolated(unsafe)` or
     /// `MainActor.assumeIsolated` to get anything else in here; either one reintroduces the
     /// crash above.
+    ///
+    /// `engine` is ONE reference, resolved once per capture in `beginCapture` and captured
+    /// by the tap closure. The realtime thread must never be the place where "which engine
+    /// is selected" is answered — no dictionary, no switch, and above all no UserDefaults
+    /// read, which takes a lock in another subsystem.
     ///
     /// Keep this boring. Realtime thread rules: no `trace()` (it does file I/O), no UI, no
     /// networking, no lock that could be held long. Hand off, compute, store, return.
     nonisolated static func processTap(_ buffer: AVAudioPCMBuffer,
                                        into box: LevelBox,
                                        pipeline: AudioPipeline,
-                                       recognizer: LiveRecognizer) {
+                                       engine: any DictationEngine) {
         // Recogniser first: it is what the user is watching appear, word by word.
-        recognizer.append(buffer)
+        engine.append(buffer)
         pipeline.append(buffer)
 
         guard let channels = buffer.floatChannelData, buffer.format.channelCount > 0 else { return }
@@ -1931,12 +2936,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard frameCount > 0 else { return }
         let samples = channels[0]
         var sumSquares: Float = 0
+        var peak: Float = 0
         for i in 0..<frameCount {
             let v = samples[i]
             sumSquares += v * v
+            // Peak is folded into the loop that was already touching every sample, so it
+            // costs one compare per frame and no second pass, no allocation, no extra lock
+            // take — which is what "keep this boring" above means in practice. `magnitude`
+            // on Float is plain `abs`. It has to be computed here because here is the only
+            // place the samples exist; everything downstream sees only what this stores.
+            if v.magnitude > peak { peak = v.magnitude }
         }
         let rms = (sumSquares / Float(frameCount)).squareRoot()
-        box.store(rms: rms, frameCount: frameCount)
+        box.store(rms: rms, peak: peak, frameCount: frameCount)
     }
 
     // MARK: - Main-thread pump
@@ -1944,9 +2956,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 30 Hz. Drains the recogniser event queue in order and feeds the HUD meter. This is the
     /// only place `LiveRecognizer`'s output reaches the main actor.
     @objc private func tickUI() {
-        let (batch, dropped) = events.drain()
-        if dropped > 0 {
-            trace("EVENTS: dropped \(dropped) queued recogniser event(s) — main thread fell behind")
+        let drained = events.drain()
+        let batch = drained.events
+        if drained.droppedPartials > 0 {
+            trace("EVENTS: dropped \(drained.droppedPartials) superseded partial(s) — main thread fell behind")
+        }
+        if drained.droppedCritical > 0 {
+            // The precondition for whole-utterance deletion, named at the `.listening`
+            // reset in `handleRecognizerState`: a lost boundary event leaves the ledger
+            // describing an utterance that is already over. It used to happen silently,
+            // counted in with ordinary partial churn. This line is the whole point of
+            // splitting the counters — if it ever appears, the divergence numbers from
+            // that capture cannot be trusted and the trace now says so.
+            trace("EVENT BOX: dropped \(drained.droppedCritical) critical events (state/final) — "
+                + "main thread wedged; ledger integrity not guaranteed this utterance")
+        }
+        if drained.coalescedAtPost > 0 {
+            // Same event as the drain-side skip below — a partial superseded before it
+            // could ever be typed — so it belongs in the same counter rather than a
+            // second one nobody would think to read.
+            lifetime.partialsCoalesced += drained.coalescedAtPost
+            thisCapture.partialsCoalesced += drained.coalescedAtPost
         }
         // Coalesce revision churn: each partial carries the WHOLE utterance so far, so a
         // partial immediately followed by another partial in the same drained batch is
@@ -1954,6 +2984,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // this same tick. Skipping it keeps one injector round-trip per ~33 ms tick.
         // Only consecutive partials collapse; a final (or state change) between partials
         // is never skipped and still sees events in their original order.
+        //
+        // BELT AND BRACES SINCE THE BOX LEARNED TO COALESCE AT POST TIME: `post` never
+        // leaves two partials adjacent, so this loop now almost never finds a pair. It
+        // stays because it is cheap (one enum test per event), because it is the statement
+        // of the invariant at the point where the invariant matters — the typing loop —
+        // and because it keeps working unchanged if the box's policy is ever revised.
         for (index, event) in batch.enumerated() {
             if case .partial = event, index + 1 < batch.count,
                case .partial = batch[index + 1] {
@@ -1966,6 +3002,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 recognizerStalledTicks = 0   // real output — the recogniser is alive
                 loudTicksSinceRecognizerEvent = 0
                 lastRealPartialAt = Date()
+                lastRealOutputAt = Date()
                 sessionSawPartial = true     // evidence of real recognition work: arms the escalation damper
                 suppressedBouncesSinceRestart = 0   // recognition demonstrably works: stand tier 3 down
                 handlePartial(text)
@@ -1973,10 +3010,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 lastRecognizerEventAt = Date()
                 recognizerStalledTicks = 0
                 loudTicksSinceRecognizerEvent = 0
+                lastRealOutputAt = Date()
                 handleFinal(text)
             case .state(let state):
+                // THE STAMP, AND NOTHING ELSE. `loudTicksSinceRecognizerEvent = 0` used to
+                // be on the next line, and it is what cost the 14:26:19-14:41:25 capture its
+                // last twelve minutes. That counter means "loud ticks since the recogniser
+                // last produced REAL OUTPUT", and a `.state` is not output: the 20 s request
+                // rotation emits one every cycle — 14:26:59, :19, :39, 14:28:00, :20, :40,
+                // 14:29:00 and :20 in that trace, every one of them a reset — so under
+                // continuous speech the ladder had to re-arm from zero inside each 20 s
+                // window while `noiseFloorRise` lifted the floor underneath it. It never
+                // reached its arming value of 3, the watchdog fired ZERO times, and the app
+                // held a hot microphone and typed nothing for twelve minutes.
+                //
+                // PROOF this was the binding gate rather than one of several: after the
+                // recogniser gave up at 14:29:20 no event of any kind arrived again, so the
+                // `> 6 s` debounce was satisfied on all ~725 subsequent ticks and the ladder
+                // STILL never fired. `loudTicks >= 3` was the only gate left standing.
+                //
+                // The stamp stays. It debounces a session that has only just started, which
+                // is a claim about elapsed time and not about output, and it is what stops
+                // the watchdog bouncing a brand-new healthy request on its first tick. The
+                // counter is still cleared on every session boundary — `beginCapture` does
+                // it on both the full start and the drain-cancel resume — so no stale
+                // evidence crosses from one capture into the next.
                 lastRecognizerEventAt = Date()
-                loudTicksSinceRecognizerEvent = 0
                 handleRecognizerState(state)
             }
         }
@@ -2078,7 +3137,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // `isFinite` again rather than leaning on the chain above: `nan > thr` is false
             // and harmless, but `+inf > thr` is TRUE, and three of those would arm the whole
             // ladder off samples that never described a room.
-            if rms.isFinite, rms > speechThreshold { loudTicksSinceRecognizerEvent += 1 }
+            // Drained EVERY tick, not only on a LEVEL line, because the gate below needs
+            // THIS tick's peak: a value left to accumulate across five ticks would keep the
+            // gate armed for five seconds off a single door slam. `levelLinePeak` carries
+            // the running maximum instead, so the LEVEL line still describes its full
+            // window. One extra lock take per second, on the main actor, never on the tap.
+            let tickPeak = levelBox.drainPeak()
+            if tickPeak > levelLinePeak { levelLinePeak = tickPeak }
+            // ── WHY THE GATE READS PEAK AS WELL AS RMS ────────────────────────────────
+            // `noiseFloor` documents a known blind spot and closes with "do not add a
+            // compensating gate on a hunch — get the numbers out of the trace first". The
+            // numbers are now in the trace, and they say the blind spot is real and is the
+            // rule rather than the exception for this speaker. Capture 14:36, LEVEL lines,
+            // while Thai was being dictated continuously:
+            //
+            //   rms=0.02239 floor=0.01650 thr=0.04951 peak=0.16546 loudTicksSinceEvent=0
+            //   rms=0.01623 floor=0.00425 thr=0.01276 peak=0.17419 loudTicksSinceEvent=1
+            //   rms=0.00357 floor=0.00425 thr=0.01276 peak=0.12046 loudTicksSinceEvent=0
+            //   rms=0.00416 floor=0.00416 thr=0.01249 peak=0.10116 loudTicksSinceEvent=0
+            //
+            // `rms` here is ONE ~10 ms buffer — whatever the tap happened to store last —
+            // and Thai speech is peaky enough that the sample keeps landing in an
+            // inter-word gap, reading 0.0036 against a 0.0125 threshold. The ladder needs
+            // three ticks and reached zero or one. `peak`, held across the whole second,
+            // never drops below 0.10: an 8x margin on a signal that does not collapse.
+            //
+            // So peak is ADDITIVE, never a replacement. The rms path is left exactly as it
+            // was — this can only make the watchdog easier to arm, never harder, so no
+            // previously-working calibration is put at risk — and the failure mode of the
+            // new path is a spurious tier-1 bounce, which this file already argues costs
+            // nothing and which the bounce backoff and the tier-2 damper both bound.
+            if (rms.isFinite && rms > speechThreshold)
+                || (tickPeak.isFinite && tickPeak > peakSpeechThreshold) {
+                loudTicksSinceRecognizerEvent += 1
+            }
+            // THE PERIODIC LEVEL LINE — unconditional, ~5 s, for the whole of every
+            // capture. This method runs at 1 Hz, so the tick counter IS elapsed seconds;
+            // see `levelLineTicks` for why a measurement that prints only once something
+            // has already gone wrong cannot describe how it got there.
+            //
+            // Placed HERE on purpose: after the floor update and after the loud-tick
+            // increment, but before the strike branch below. So the line reports the exact
+            // numbers the gate used on this tick — including the loud-tick count that the
+            // strike branch is about to zero, which is the one number that separates
+            // "ambient armed the ladder" from "the user talked into a dead recogniser".
+            //
+            // Cheap by construction, and nowhere near the realtime audio thread: it reuses
+            // the `(rms, frames)` already read at the top of this block, takes the LevelBox
+            // lock exactly once more (`drainPeak`), and formats one string per five ticks.
+            // The tap still only stores; nothing was added to its critical path beyond the
+            // one compare per frame that `processTap` folds into its existing loop.
+            levelLineTicks += 1
+            if levelLineTicks >= 5 {
+                levelLineTicks = 0
+                // The window maximum accumulated by the per-tick drain above, NOT a drain of
+                // its own. `LevelBox.drainPeak` consumes and resets, so a second caller here
+                // would silently shorten one of the two windows; the gate needs a per-tick
+                // value and this line needs a per-window one, so the split happens on this
+                // side of the lock instead.
+                let peak = levelLinePeak
+                levelLinePeak = 0
+                // `&-` deliberately. `frames` and this baseline are zeroed together in
+                // `beginCapture`, so it cannot legitimately underflow; if a future edit
+                // ever breaks that pairing, a visibly absurd wrapped number in the trace is
+                // a better outcome than trapping in the middle of a dictation session.
+                let framesDelta = frames &- levelLineLastFrames
+                levelLineLastFrames = frames
+                // 240000 frames per line is exactly 5 s at 48 kHz, so the delta reads as a
+                // pass/fail at a glance in a way a running total does not. This is the
+                // number that proved NEGATIVE in the 14:26:19-14:41:25 capture — total
+                // frames matched wall clock to the sample, so the audio path was healthy
+                // and the recogniser was the thing that had died. That conclusion took a
+                // whole post-mortem and one lucky end-of-capture line; it should take one
+                // glance at any five-second window.
+                //
+                // `peak` beside `rms` is the other half of that: RMS alone cannot tell a
+                // wedged Speech service from an input that went attenuated, and a peak held
+                // across the window can (see `LevelBox.peak`). `sinceRealOutput` is the
+                // recogniser's side of the same question — long and climbing while frames
+                // keep arriving IS the failure signature, stated in one line.
+                let outputAge = lastRealOutputAt == .distantPast
+                    ? "sinceRealOutput=(none this launch)"
+                    : String(format: "sinceRealOutput=%.0f s",
+                             Date().timeIntervalSince(lastRealOutputAt))
+                trace("LEVEL: \(levelTrace(rms)) "
+                    + String(format: "peak5s=%.5f peakThr=%.5f ",
+                             Double(peak), Double(peakSpeechThreshold))
+                    + "loudTicksSinceEvent=\(loudTicksSinceRecognizerEvent) "
+                    + "framesDelta=\(framesDelta) \(outputAge)")
+            }
             let heardSpeechSinceSilence = loudTicksSinceRecognizerEvent >= 3
             // B2 fix (review finding): suppressed bounces every ~7 s for 70 s got this
             // process THROTTLED by the Speech service (kAFAssistantErrorDomain 1107 in the
@@ -2095,13 +3242,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // OFF none of them happen while a wedge persists, so the count ratchets
             // monotonically and pins the backoff at 48 s. Meanwhile `LiveRecognizer` keeps
             // stamping `lastRecognizerEventAt` right through a total wedge: `emitState` is
-            // local and needs no answer from the Speech service, so the 20 s rotation, its
-            // 6 s overlap fallback and the 2 s promote land events at +26/+28 and every 20 s
-            // after. The largest event-free window the guard below can EVER observe is 26 s
-            // straight after a restart and 18 s once the schedule settles. At 48 s the guard
-            // is unsatisfiable forever — and it takes tiers 1 and 2 down with it, so turning
-            // tier 3 off also disabled the cheap recovery that works and the evidence
-            // gathering the toggle exists for. Measured, 30 runs x 4 environments: 1.7-2.0
+            // local and needs no answer from the Speech service, so a rotation seam stamps
+            // even when the Speech service has stopped saying anything at all.
+            //
+            // THE NUMBERS HERE USED TO READ "+26/+28", from the 20 s rotation plus a 6 s
+            // overlap fallback and a 2 s promote. Both of those mechanisms are gone with
+            // the overlapped rotation. Under flush-then-replay the seam is effectively ONE
+            // event: the flushed FINAL and the successor's `.listening` land together at
+            // +20 s (`sessionRotationSeconds`), stretching to ~+22 s only in the case where
+            // the flush yields neither final nor error and `finalFlushTimeoutSeconds`' 2 s
+            // net restarts in their place. So the largest event-free window the guard below
+            // can EVER observe is ~20 s, ~22 s worst case.
+            //
+            // THE 12 s CONCLUSION SURVIVES THE RENUMBERING, with more margin than it had.
+            // The direction is what matters: the guard fires when the observed gap EXCEEDS
+            // the ceiling, so the ceiling must sit BELOW the largest event-free window.
+            // 12 s against ~20 s clears that more comfortably than 12 s against the old
+            // settled 18 s did. The ~22 s figure is the DEGENERATE seam only — a flush that
+            // answers with neither a final nor an error — so the steady-state cadence any
+            // ceiling has to be chosen against is 20 s, and the paragraph further down
+            // ("any ceiling at or above 20 s … can never produce") stands exactly as
+            // written. The extra 2 s widens the margin under a 12 s ceiling; it does not
+            // rehabilitate a 20 s one.
+            //
+            // At 48 s the guard is unsatisfiable forever — and it takes tiers 1 and 2 down
+            // with it, so turning tier 3 off also disabled the cheap recovery that works
+            // and the evidence gathering the toggle exists for. Measured, 30 runs x 4 environments: 1.7-2.0
             // `WOULD FIRE` lines and then total silence for the remaining ~1050 s.
             //
             // Simulated against that stamping model, 1200 s, user quiet 60 s in every 300 s
@@ -2109,8 +3275,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // cadence): ceilings of 18/20/24/26/48 s all go permanently silent — last ladder
             // line at 306/307/297/122/122 s. 16 s survives (60 bounces), 12 s survives (77),
             // 6 s survives (139). 12 s is chosen because it is the highest EXISTING rung of
-            // the 6/12/24/48 ladder that clears the 18 s worst case with margin, and because
-            // rung 6 is the one that produced the ~7 s bounce cadence that got this process
+            // the 6/12/24/48 ladder that clears the worst-case event-free window with
+            // margin — 18 s under the stamping model that simulation was run against, ~20 s
+            // under flush rotation, which only widens the margin — and because rung 6 is
+            // the one that produced the ~7 s bounce cadence that got this process
             // throttled: capping there would reinstate the defect the backoff exists to
             // prevent. At 12 s the observed cadence is ~13 s minimum, ~15 s mean — one rung
             // slower than the measured-throttling cadence, permanently.
@@ -2121,16 +3289,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // the `loudTicks` capture below exists to fix. A derived, unprinted quantity is
             // the safe thing to clamp.
             //
-            // The ON path keeps 48 s exactly. There the ratchet is self-limiting — reaching
-            // the armed state fires the kill, which resets the counter — so the pin is only
-            // reachable inside the 120 s window after a kill, and this commit deliberately
-            // does not perturb the path that `kill -9`s a system service. That residual pin
-            // is real and is left standing knowingly; if the toggle is ever promoted to
-            // default-ON, this ceiling has to come with it.
-            let backoffCeiling: Double = daemonRestartEnabled ? 48 : 12
+            // The paragraph above used to end "the ON path keeps 48 s exactly … if the
+            // toggle is ever promoted to default-ON, this ceiling has to come with it."
+            // The toggle HAS now been promoted to default-ON (see `daemonRestartEnabled`),
+            // so the ceiling comes with it, exactly as that sentence required.
+            //
+            // 48 s was never merely aggressive — at this cadence it is UNSATISFIABLE, which
+            // is worse. The window is measured from `lastRecognizerEventAt`, and the 20 s
+            // request rotation emits a `.state` that re-stamps it on every cycle
+            // (`sessionRotationSeconds`). Any ceiling at or above 20 s therefore describes a
+            // silence that a rotating recogniser can never produce, and the ladder is gated
+            // off entirely — precisely in the half-dead case it exists for, where `.state`
+            // still flows but no partial ever does. Under the old default the 12 s rung sat
+            // safely inside the cadence and tiers 1 and 2 fired; flipping the toggle without
+            // this line would have silently disabled the watchdog this same change set was
+            // repairing.
+            //
+            // So the ceiling is now the toggle-independent 12 s. Tier 3 is unaffected: it is
+            // armed by `suppressedBouncesSinceRestart` and rate-limited by its own 120 s
+            // window, neither of which is derived from this value.
+            let backoffCeiling: Double = 12
             let bounceBackoff: Double = min(backoffCeiling,
                                             6 * pow(2, Double(min(suppressedBouncesSinceRestart, 3))))
             if heardSpeechSinceSilence, Date().timeIntervalSince(lastRecognizerEventAt) > bounceBackoff {
+                // ── ENGINE GATE: THE LADDER BELOW IS APPLE'S, ALL THREE RUNGS ──────────
+                // Tier 3 `kill -9`s `localspeechrecognition.xpc`, a macOS system service
+                // that a WebSocket to Google does not touch — so against a Gemini stall it
+                // is not merely useless, it is an unattended kill of an unrelated daemon
+                // that may be transcribing for some other app. Tiers 1 and 2 are no better
+                // founded: "bounce the request, then rebuild the engine" is the recovery
+                // measured against SFSpeech wedges (14:02), and `LiveRecognizer` is what
+                // guarantees the `persistent recognition failure` contract the whole
+                // escalation is written against. None of that is knowledge about a socket.
+                //
+                // So the ladder stands down entirely, and the state it would have touched
+                // is left alone — no strike, no `recognizerStalledTicks`, no
+                // `suppressedBouncesSinceRestart`, so nothing this session accumulates can
+                // arm tier 3 for the NEXT one. What IS reset is the same debounce a strike
+                // would have consumed, which stops this branch from re-entering every tick.
+                //
+                // A Gemini stall is not left undetected: that engine reports it through its
+                // own `.unavailable`, which arrives via the same event box and is handled
+                // in `handleRecognizerState` like any other.
+                guard activeEngineKind == .apple else {
+                    // Read BEFORE the reset two lines down, for the reason the strike
+                    // branch below states at length: the accumulated loud-tick count is
+                    // the number that separates "ambient armed it" from "the user talked
+                    // into a dead engine", and the reset destroys it.
+                    let levels = levelTrace(rms, loudTicks: loudTicksSinceRecognizerEvent)
+                    lastRecognizerEventAt = Date()
+                    loudTicksSinceRecognizerEvent = 0
+                    if Date().timeIntervalSince(lastEngineStandDownTracedAt) > 120 {
+                        lastEngineStandDownTracedAt = Date()
+                        trace("RECOGNIZER WATCHDOG: standing down — active engine is "
+                            + "\(activeEngineKind.rawValue), and tiers 1-3 (bounce, capture "
+                            + "restart, pkill localspeechrecognition) are specific to "
+                            + "Apple's on-device service. \(levels) A stall on this engine "
+                            + "surfaces as its own .unavailable state. Rate-limited to one "
+                            + "line per 120 s.")
+                    }
+                    return
+                }
                 // Every trace this ladder emits carries the three numbers the gate actually
                 // used. Non-negotiable: the previous round climbed all three tiers and
                 // killed a system service twice with nothing anywhere recording what had
@@ -2349,10 +3568,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Live text -> keystrokes
 
+    /// Collapse every RUN of line breaks into exactly one space; return the string
+    /// untouched when there is nothing to collapse.
+    ///
+    /// WHY THE LEDGER NEEDS THIS. `injectedForUtterance` is a claim about what is in the
+    /// user's document, and the whole repair path is prefix arithmetic over that claim. A
+    /// single-line field — a search box, a one-line `NSTextField`, most web inputs —
+    /// SWALLOWS a newline it is handed: the app types "a\nb", the field ends up holding
+    /// "ab", and from that instant every common-prefix computation is done against a
+    /// document one character shorter than the ledger says. Nothing recovers from it
+    /// before the next `.listening`, and every repair in between deletes the wrong range.
+    /// Substituting a space costs one character of fidelity and removes the entire class.
+    ///
+    /// A RUN BECOMES ONE SPACE, not one space per scalar: "\r\n" is two scalars and a
+    /// single line break, so a per-scalar substitution would insert two spaces and produce
+    /// the same off-by-one desync in the opposite direction. `CharacterSet.newlines` is
+    /// the membership test because it already names all six (\n, \r, \r\n, U+0085,
+    /// U+2028, U+2029) — do not hand-roll that list.
+    ///
+    /// THIS DELIBERATELY DOES NOT LIVE INSIDE `TextInjector`. That type's contract is to
+    /// type exactly what its caller asked for: `replaceRecentText` later searches the
+    /// document for text this app claims to have written, so an injector that silently
+    /// rewrote its argument would send that search hunting for a string that was never
+    /// typed. Normalising is a decision about the LEDGER, so it belongs to the ledger's
+    /// owner — here, applied once at the point the text enters the app, before the
+    /// document, the ledger, the HUD and the cloud-search span can disagree about it.
+    ///
+    /// This runs on every partial, so the common path must not allocate: the membership
+    /// scan is over `unicodeScalars` and hands back the original string.
+    private func normalizeForInjection(_ s: String, kind: String) -> String {
+        guard s.unicodeScalars.contains(where: { CharacterSet.newlines.contains($0) }) else {
+            return s
+        }
+        var out = ""
+        out.reserveCapacity(s.count)
+        var replaced = 0
+        var inRun = false
+        for scalar in s.unicodeScalars {
+            if CharacterSet.newlines.contains(scalar) {
+                replaced += 1
+                if !inRun {
+                    out.unicodeScalars.append(" ")
+                    inRun = true
+                }
+            } else {
+                out.unicodeScalars.append(scalar)
+                inRun = false
+            }
+        }
+        // Counts and a source label only — the trace file is world-readable and never sees
+        // transcript text. Traced ONLY when something changed, so a silent trace is itself
+        // the evidence that on-device th-TH does not emit line breaks (both request sites
+        // set `addsPunctuation = true`); a line here names which source did.
+        trace("NORMALIZED: replaced \(replaced) newline(s) in \(kind) text")
+        return out
+    }
+
     /// `onPartial` delivers the WHOLE growing transcription each time, not a delta. We inject
     /// only the part we have not injected yet.
     private func handlePartial(_ raw: String) {
         guard isCapturing || drainTimer != nil else { return }
+        // Shadowed before ANY use, so the ledger, the document, the HUD and (via
+        // `noteFinalChunk`) the cloud-search span all see one string. See
+        // `normalizeForInjection`.
+        let raw = normalizeForInjection(raw, kind: "partial")
         lifetime.partialsSeen += 1; thisCapture.partialsSeen += 1
         currentOnDeviceText = raw
         hud.set(.transcribing(raw.isEmpty ? "…" : raw))
@@ -2360,6 +3639,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func handleFinal(_ raw: String) {
+        // Same shadow, same reason, and it must precede the `raw.count` in the FINAL trace
+        // below so the two counts printed there still describe the same string.
+        let raw = normalizeForInjection(raw, kind: "final")
         lifetime.finalsSeen += 1; thisCapture.finalsSeen += 1
         // isFinal: the utterance FINAL must attempt to reconcile even after a failed
         // partial repair — extending and/or replacing via the same LCP logic — rather
@@ -2390,7 +3672,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             trace("recogniser state: idle")
         case .listening:
             // A new recognition request just stood up (initial start, pause auto-restart,
-            // error restart, or the ~60 s rotation). Its partials start FROM SCRATCH, so
+            // error restart, or the 20 s rotation). Its partials start FROM SCRATCH, so
             // the typed-count high-water mark of the previous utterance must not survive
             // into it -- carrying it over silently ate the first N characters of every
             // sentence after the first pause (the "not continuous" bug). The error-restart
@@ -2398,7 +3680,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !injectedForUtterance.isEmpty {
                 trace("utterance boundary: reset typed high-water mark (was \(injectedForUtterance.count) chars)")
             }
+            // WHY THE RESET IS SOUND under flush-then-replay rotation, which is a DIFFERENT
+            // argument from the one that stood here before. The old "overlapped" rotation
+            // never actually overlapped (measured 21/21 same-second deaths), so the reset
+            // was sound because the successor transcribed from scratch. That machinery is
+            // gone. Under `beginFlushRotation` the seam is sample-partitioned instead:
+            // the outgoing request is flushed with `endAudio()` and its FINAL — covering
+            // everything up to the flush instant t0 — is delivered and typed via
+            // `deliver(isFinal: true)` BEFORE this `.listening` arrives (the final is
+            // emitted from the Speech callback before `restart` runs; ordering is inherent,
+            // not scheduled). The successor then replays the ring from exactly t0. So the
+            // audio behind this reset's "from scratch" assumption is audio the old request
+            // NEVER transcribed — no duplication, no gap, by construction. The one bounded
+            // exception: `append` may land at most one tap buffer (~21 ms) on both sides
+            // of the mark; sub-phoneme, accepted and documented at the seam in
+            // LiveRecognizer. If anyone widens the replay window to start BEFORE the
+            // flushed final's coverage (e.g. "a little extra context"), this reset becomes
+            // a text-DUPLICATION bug and must be revisited here first.
+            //
+            // Skipping the reset at a cutover was considered and REJECTED. Keeping the old
+            // high-water mark leaves the replacement's first partial sharing no prefix with
+            // it, so `deliver` takes the divergence branch with lcp == 0, `repairDivergence`
+            // computes staleCount == injectedForUtterance.count, and the app DELETES THE
+            // ENTIRE UTTERANCE in order to type the replacement's first word.
             injectedForUtterance = ""
+            // Same boundary rule as the two latches below, and sound for the same reason
+            // the divergence latch's clear is: the ledger was just emptied, so a repair
+            // deferred against the PREVIOUS utterance's text has nothing left to describe
+            // and must not spend this utterance's deferral budget.
+            transientRepairSkips = 0
             cloudOwnsUtterance = false
             // Same boundary rule for the injection latch: an `inject()` failure blocks
             // the rest of the UTTERANCE it happened in, never the session. Secure-input
@@ -2412,17 +3722,187 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 trace("utterance boundary: cleared injection-blocked latch")
                 injectionBlockedReason = nil
             }
+            // ── AND THE DIVERGENCE LATCH, FOR A REASON THE OTHER TWO DO NOT SHARE ──────
+            // `utteranceDiverged` suppresses partials (see the guard in `deliver`) and was
+            // documented as self-clearing: "live typing resumes once a final reconciles".
+            //
+            // THE HISTORY IS WHY THE FLAG WAS RETIRED. Under the OLD overlapped rotation
+            // that sentence was simply false: on-device th-TH delivered no final at all —
+            // `finals=0` in ALL EIGHT capture summaries across three consecutive launches —
+            // because the outgoing request was cancelled WITHOUT `endAudio()`, and Speech's
+            // own VAD final does not arrive for continuous speech. So the flag's only other
+            // exits were `startUtterance()` (toggle off/on) and a capture restart: one
+            // unrepairable revision muted live typing until the user noticed and
+            // power-cycled the hotkey. Trace 14:36 is that failure end to end — a refusal
+            // 2 s in, then `injectedChars=7`, `55`, `0`.
+            //
+            // THE PRESENT IS WHY IT STAYS RETIRED. Finals exist again: flush-then-replay
+            // rotation delivers exactly one per 20 s seam (`beginFlushRotation`), and it is
+            // delivered before this `.listening`. That does not reopen the removal, and the
+            // design must not start depending on it in either direction. Trace 14:36 was an
+            // 11 s capture with no seam before the hotkey was released, so "wait for the
+            // final" would still have meant "wait for something that never came"; in a
+            // longer capture it means suppressing up to a full window of partials to pay
+            // for a refusal that may have lasted milliseconds. Correct under frequent
+            // finals AND under a single window that produces none — suppression-until-final
+            // is neither.
+            //
+            // Clearing it here is the same boundary rule the latch above already states,
+            // and it is safe for a concrete reason rather than an optimistic one:
+            // `injectedForUtterance` was just reset to "" three lines up, so the ledger and
+            // the document agree again by construction (the ledger claims nothing, and
+            // nothing is what the next partial will be diffed against).
+            //
+            // READ THIS BEFORE TRUSTING THE FLAG: `utteranceDiverged` is now INERT.
+            // No CODE in this file assigns it true any more (a grep for the assignment
+            // matches only prose, this paragraph included) — because the refusal path
+            // stopped suppressing altogether
+            // (`reanchorAfterUnrepairedRevision` keeps typing through a revision it could
+            // not apply). Its guard in `deliver` and its remaining readers are therefore
+            // dead branches, and this clear is a no-op kept for symmetry with the latch
+            // above it.
+            //
+            // It is retained rather than deleted only to keep this change set to behaviour
+            // that was actually measured; it SHOULD be removed along with its readers.
+            // Documented here so the next post-mortem does not go hunting for a suppression
+            // path that no longer exists — which is exactly how the previous round lost
+            // twelve minutes to a watchdog everyone assumed was armed.
+            if utteranceDiverged {
+                trace("utterance boundary: cleared divergence latch; live typing resumes")
+                utteranceDiverged = false
+            }
             utteranceSeq &+= 1
             trace("recogniser state: listening")
         case .unavailable(let reason):
             trace("recogniser state: unavailable — \(reason)")
-            // The ~60 s request rotation and its quick retries are routine plumbing, not
-            // user-facing failures -- flashing the HUD red for them reads as "it broke".
-            if reason.contains("rotating request") || reason.contains("retry")
-                || reason.contains("promoting warm replacement") {
+            // THIS TEST MUST STAY ABOVE THE ROUTINE SUPPRESSIONS BELOW. The ordering is
+            // load-bearing, not stylistic: `reason` ends with the vendor's
+            // `localizedDescription`, which is outside our control, and a Speech error
+            // whose text happens to contain "retry" — entirely plausible for a throttling
+            // or timeout message — would be swallowed as plumbing by the next branch and
+            // this escalation would silently never run. The specific token is matched
+            // first so no vendor wording can mask it. `LiveRecognizer` guarantees the
+            // token appears verbatim on every emission of this state and on no other
+            // message; that guarantee is written down beside the emission itself.
+            //
+            // WHY THIS BRANCH EXISTS AT ALL. Handling used to end at the red HUD below —
+            // no `endCapture`, no `recognizer.start()`, nothing that could recover. That is
+            // why capture 14:26:19-14:41:25 held a hot microphone and typed nothing for
+            // twelve minutes after the recogniser declared itself dead: the app was TOLD
+            // and did nothing with it. `LiveRecognizer` no longer gives up (it retries
+            // indefinitely at an 8 s backoff cap), but it owns no audio engine, so the one
+            // recovery ever observed to revive this failure — a full capture restart that
+            // rebuilds the engine and its session — can only be performed from here.
+            if reason.contains("persistent recognition failure") {
+                let (rms, frames) = levelBox.read()
+                // Same four numbers every ladder line carries, for the same reason: an
+                // escalation nobody can reconstruct afterwards is unfalsifiable. `frames`
+                // rides along because in this exact failure it is the discriminator — audio
+                // still arriving while the recogniser reports itself dead.
+                let levels = "\(levelTrace(rms)) frames=\(frames)"
+                // A teardown is already in flight, or there is nothing to tear down.
+                // `endCapture` no-ops on both of those conditions, so escalating here would
+                // burn the rate limit and a damper credit on a call that does nothing —
+                // and the drain already running IS the recovery arriving.
+                guard isCapturing, drainTimer == nil else {
+                    trace("RECOGNIZER RECOVERY: persistent recognition failure reported "
+                        + "with no live capture to restart (capturing=\(isCapturing), "
+                        + "draining=\(drainTimer != nil)); ignored (\(levels))")
+                    return
+                }
+                // THE SAME DAMPER TIER 2 USES, deliberately, and it is not optional here.
+                // A system-wide daemon wedge produces this report every ~8 s for as long as
+                // it lasts; a time limit alone would turn each one into a full
+                // endCapture/beginCapture cycle forever — a permanent capture-restart loop,
+                // worse for the user than the silent death being removed. The damper's
+                // measured rule (see tier 2) is that a session which has never produced a
+                // partial gets at most ONE speculative restart. With `sessionSawPartial`
+                // cleared by `beginCapture` and `escalationsThisSession` surviving the
+                // self-heal, that resolves to: an unproductive wedge is restarted exactly
+                // once and then only reported; a session that demonstrably worked and then
+                // died earns one restart of its own, no oftener than the limit below.
+                //
+                // A suppressed report still feeds `suppressedBouncesSinceRestart`, which is
+                // the only way tier 3 can ever arm on a wedge that produces zero partials
+                // in every new session — the one shape of failure tiers 1 and 2 cannot fix
+                // by construction. Two consequences, stated because a non-watchdog path
+                // feeding a watchdog counter is exactly the kind of coupling this file
+                // documents rather than leaves to be discovered:
+                //   - it ARMS tier 3, it does not invoke it. Tier 3 still fires only from
+                //     the strike branch in `tickStatus`, behind the loud-tick gate and the
+                //     bounce backoff, and only with `daemonRestartEnabled` on.
+                //   - it also feeds `bounceBackoff` = min(ceiling, 6·2^min(count, 3)). At
+                //     the 8 s report cadence the count saturates in ~24 s, so the backoff
+                //     pins at its ceiling. That ceiling is now the toggle-independent 12 s
+                //     (see `backoffCeiling`), and it HAS to stay under the 20 s rotation
+                //     cadence: the window is measured from `lastRecognizerEventAt`, which
+                //     rotation re-stamps every 20 s, so any ceiling at or above that
+                //     describes a silence a rotating recogniser can never produce and gates
+                //     the ladder off entirely. Within 12 s the pin only makes the
+                //     anti-throttling backoff arrive sooner, which during a confirmed
+                //     persistent failure is the wanted direction.
+                guard sessionSawPartial || escalationsThisSession == 0 else {
+                    suppressedBouncesSinceRestart += 1
+                    trace("RECOGNIZER RECOVERY: persistent recognition failure, restart "
+                        + "suppressed by the escalation damper (no partials this session, "
+                        + "already restarted \(escalationsThisSession)x); "
+                        + "suppressedBounces=\(suppressedBouncesSinceRestart) (\(levels))")
+                    return
+                }
+                // Rate limit. `LiveRecognizer` re-reports on every retry cycle at a backoff
+                // capped at 8 s, so this window sits comfortably above that cadence: at
+                // most one restart per window however often the report arrives, and short
+                // enough that a genuinely recoverable wedge is retried promptly rather than
+                // waited out. Unthrottled TRACING of the suppression is intended — at an
+                // 8 s cadence it is a handful of lines a minute, not the 1 Hz flood the
+                // other rate-limited lines in this file exist to prevent, and the whole
+                // point of this change is that the next failure is diagnosable.
+                guard Date().timeIntervalSince(lastPersistentFailureRestartAt)
+                        > Self.persistentFailureRestartInterval else {
+                    trace("RECOGNIZER RECOVERY: persistent recognition failure, restart "
+                        + String(format: "rate-limited (%.0f s since the last one, limit "
+                                 + "%.0f s) ",
+                                 Date().timeIntervalSince(lastPersistentFailureRestartAt),
+                                 Self.persistentFailureRestartInterval)
+                        + "(\(levels))")
+                    return
+                }
+                lastPersistentFailureRestartAt = Date()
+                escalationsThisSession += 1
+                // Cleared exactly as tiers 2 and 3 clear it, and for their reason: the
+                // healed session is a fresh problem and should climb the ladder from a
+                // cheap bounce rather than resume mid-escalation against a request that no
+                // longer exists.
+                recognizerStalledTicks = 0
+                trace("RECOGNIZER RECOVERY: recogniser reports persistent failure and "
+                    + "cannot recover itself; restarting the whole capture (\(levels))")
+                // Mirrors the tier-2 call site exactly. `wantsDictation` is left true, so
+                // `syncDictation` at the end of `finishCapture` walks straight back into
+                // `beginCapture` and the user simply keeps talking. No HUD: unlike tier 3,
+                // which had just `kill -9`'d a system service, this heals in about a second
+                // and a red banner would read as "it broke" — the very thing the routine
+                // suppressions below exist to avoid.
+                endCapture(reason: "recogniser reported persistent recognition failure")
                 return
             }
-            let message = "On-device recogniser unavailable — \(reason)"
+            // Quick retries are routine plumbing, not user-facing failures -- flashing the
+            // HUD red for them reads as "it broke". Two former suppressions here are gone
+            // because nothing emits their strings any more: "promoting warm replacement"
+            // (the warm-overlap machinery was excised) and "rotating request" (the flush
+            // rotation is trace-only — the seam emits a final and a `.listening`, never an
+            // `.unavailable`). Do not re-add branches for strings nothing emits; grep
+            // LiveRecognizer for `emitState(.unavailable` before adding one.
+            if reason.contains("retry") {
+                return
+            }
+            // NAME THE ENGINE THAT ACTUALLY FAILED. This string was hardcoded to
+            // "On-device recogniser" when there was only one engine; with Gemini Live
+            // selected it is a lie of exactly the class `DictationEngineKind.recognizerNoun`
+            // exists to prevent (see its doc comment): it tells the user their voice is
+            // being handled on this Mac at the moment the engine streaming it to Google is
+            // the one reporting a failure. `recognizerNoun` resolves to the identical
+            // "On-device recogniser" for `.apple`, so the Apple path's message is unchanged.
+            let message = "\(activeEngineKind.recognizerNoun) unavailable — \(reason)"
             lastOutcome = message
             hud.set(.error(message))
             hud.show()
@@ -2437,22 +3917,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// and word merges are rewritten as context grows, so a non-prefix partial is the norm,
     /// not an edge case. The repair keeps the longest common prefix and hands exactly the
     /// stale tail to `TextInjector.replaceLastInserted(count:with:)`, which replaces the
-    /// exact range we own or does nothing and returns a reason. Only on a refusal does
-    /// injection stop for the utterance — and even then the FINAL (isFinal: true, which
-    /// bypasses the diverged guard) and the cloud pass each get one more reconciliation
-    /// attempt. We never blind-backspace, and we never pretend text was delivered.
+    /// exact range we own or does nothing and returns a reason. On a refusal injection no
+    /// longer stops: `reanchorAfterUnrepairedRevision` re-anchors the ledger and typing
+    /// carries on, leaving the unrepairable tail in the document.
+    ///
+    /// That last sentence used to read "and we never pretend text was delivered", with the
+    /// FINAL and the cloud pass named as the two reconciliation paths. Both claims are
+    /// superseded and the reason is worth keeping: under the old overlapped rotation
+    /// on-device th-TH delivered NO finals (`finals=0` across every capture of three
+    /// consecutive launches), so "stop and wait for the final" resolved to "stop".
+    ///
+    /// Flush-then-replay rotation has since restored one final per 20 s seam. That widens
+    /// what the reconciliation paths CAN do without changing what this path MUST do: a
+    /// refusal still has no reconciliation before the window it happens in ends, and a
+    /// capture shorter than one rotation still has none at all. We still never
+    /// blind-backspace; we now do knowingly tolerate a bounded, visible inaccuracy rather
+    /// than an unbounded silence. See `reanchorAfterUnrepairedRevision` for why the error
+    /// cannot compound — and for the one place where that bound is deliberately dropped,
+    /// on a seam final.
     private func deliver(_ text: String, isFinal: Bool = false) {
-        // Final-only mode: the focused app refused AX replacement earlier this session,
-        // so live partials would inevitably strand stale text. Type finals only.
-        if finalOnlyInjection && !isFinal { return }
+        // ── THE FINAL-ONLY MUTE USED TO BE HERE, AND IT STAYS REMOVED ──────────────────
+        // `if finalOnlyInjection && !isFinal { return }` was a reasonable trade when it was
+        // written — skip live partials in an app that cannot host revision, let each
+        // utterance FINAL land in one clean go. It rests entirely on finals existing, and
+        // when it was removed they did not: `finals=0` in all eight capture summaries
+        // across three consecutive launches, because the old overlapped rotation cancelled
+        // the outgoing request without `endAudio()`. So the guard did not degrade typing to
+        // whole sentences, it stopped typing outright, for the remainder of a capture, on
+        // ONE refusal — and the refusal that triggered it in trace 14:36 was "no focused
+        // element", 2 s into the session.
+        //
+        // Finals came back with flush-then-replay rotation — one per 20 s seam — so the
+        // guard would now type SOMETHING, and the sentence above is history rather than a
+        // current fact. It is still not coming back, for two reasons the change does not
+        // touch. What it would type is one 20 s blob per seam, arriving all at once instead
+        // of live text, which is not this product. And the failure is undiminished: a
+        // refusal early in a window still stops typing for the remainder of that window,
+        // and a capture that ends before its first seam still receives nothing at all.
+        //
+        // `finalOnlyInjection` survives with its meaning narrowed to the half that is still
+        // true and still valuable: this app has proven it will refuse in-place repair, so do
+        // not keep paying for the attempt (see `repairDivergence`, where it now short-
+        // circuits an AX round trip measured in Electron at up to ~900 ms). It suppresses
+        // nothing at all now — neither this guard nor any other. There is no suppression
+        // left on the partial path: `utteranceDiverged` below is inert (nothing sets it,
+        // see the note at the `.listening` clear) and the injection-blocked latch became a
+        // report rather than a gate. That is the point of the change set — a continuous
+        // speaker must never hit a state that stops typing until some later event, because
+        // on this build no such later event arrives.
         // The cloud already corrected this utterance; its text is authoritative. An
         // on-device FINAL arriving afterwards must not rewrite it back.
+        //
+        // ── EXCEPT FOR THE PART THE CLOUD NEVER HEARD ────────────────────────────────
+        // This branch used to return unconditionally, and under flush rotation that drops
+        // precisely the text the rotation exists to recover. `cloudOwnsUtterance` is set
+        // when a correction lands MID-window and is cleared only at `.listening` — which
+        // arrives AFTER the seam's flushed final. So a final carrying everything spoken
+        // between the cloud's audio chunk and the flush instant was being discarded in
+        // full, at every seam where a correction had landed.
+        //
+        // The exception is narrow by construction: a STRICT EXTENSION of the ledger. The
+        // final agrees with every character the ledger claims and then continues, and that
+        // continuation is audio beyond the WHOLE ledger. `cloudOwnsUtterance` is only set
+        // when the corrected span is a SUFFIX of the ledger, so the continuation lies
+        // beyond the corrected span too — content the cloud never saw and cannot own.
+        // Appending it rewrites nothing.
+        //
+        // IT IS CONTENT-CORRECT EVEN THOUGH THE LEDGER DOES NOT MATCH THE DOCUMENT HERE,
+        // and that is worth spelling out because the mismatch is deliberate:
+        // `applyCloudResult` never folds cloud text into `injectedForUtterance` (see the
+        // "NEVER assign cloud text into `injectedForUtterance`" note there), so after a
+        // correction the ledger holds the recogniser's wording while the document holds
+        // fal's. The skew is irrelevant to THIS write. The suffix is new speech, it goes
+        // at the caret, and the caret sits after whatever the document actually ends with
+        // — corrected or not. What must never happen is a final REPLACING the divergent
+        // part, and strict extension is exactly the condition under which no divergent
+        // part exists.
+        //
+        // Anything else — a final that revises text the cloud already rewrote — keeps
+        // today's drop. There is no honest way to reconcile the two wordings that does not
+        // delete applied cloud text on the strength of the worse transcription.
+        //
+        // NOTE THE FALL-THROUGH: this branch no longer always returns, which is unusual
+        // enough to say out loud. On the extension shape control continues into the
+        // ordinary append path below, deliberately: that path already owns the secure-input
+        // probe, the standing-selection rule, both ledgers, the counters and the
+        // retry-on-failure semantics, and a bespoke copy of it here would drift from it.
+        // `cloudOwnsUtterance` stays SET — the cloud still owns the earlier span, and
+        // `.listening` is still the only thing that clears it.
+        var appendedPastCloudOwnedText = false
         if isFinal && cloudOwnsUtterance {
-            trace("FINAL: skipped — cloud correction already owns this utterance")
-            return
+            let finalLcp = commonPrefixLength(injectedForUtterance, text)
+            guard !injectedForUtterance.isEmpty,
+                  finalLcp == injectedForUtterance.count,
+                  text.count > finalLcp else {
+                trace("FINAL: skipped — cloud correction already owns this utterance")
+                return
+            }
+            // The empty-ledger clause is not reachable today — `.listening` clears the
+            // ledger and this flag in the same block — and is written down anyway, because
+            // with an empty ledger the extension test is trivially true for ANY text. Drop
+            // it and this becomes "type the whole window again after the cloud's copy of
+            // it", the text-DUPLICATION failure the `.listening` reset is documented to
+            // guard against.
+            appendedPastCloudOwnedText = true
         }
         guard !utteranceDiverged || isFinal else { return }
-        guard injectionBlockedReason == nil else { return }
+        // ── THE LAST MUTE, REMOVED ────────────────────────────────────────────────────
+        // This used to be `guard injectionBlockedReason == nil || isFinal else { return }`,
+        // and it is the same shape as the two latches above it: block the rest of the
+        // utterance and rely on a FINAL to reconcile. When it was removed there were no
+        // finals at all (`finals=0`, see above), so the `|| isFinal` escape could never
+        // fire and the only exit was the `.listening` boundary. Flush rotation has since
+        // made that escape reachable — one per 20 s seam — and it changes nothing here,
+        // because the argument never rested on finals being absent: waiting for the seam
+        // still means dropping up to a full window of partials to pay for a failure that
+        // may have lasted a second. The reachable case is not exotic: `inject()` returns
+        // "Secure input is active" when the flag flips between the non-latching probe and
+        // the CGEvent post, which this file documents Cursor/Electron doing several times
+        // a day.
+        //
+        // Retrying instead is safe for a mechanical reason, not an optimistic one: a failed
+        // `inject()` returns BEFORE `injectedForUtterance = text` below, so the ledger still
+        // describes the document exactly. The next partial recomputes its LCP against the
+        // truth and simply tries again — the transient clears itself and typing resumes at
+        // the next partial rather than at the next rotation.
+        //
+        // `injectionBlockedReason` survives as the REPORT (menu text, the cloud-pass gate,
+        // `lastOutcome`), which is all it should ever have been.
         guard !text.isEmpty else { return }
         if text == injectedForUtterance {
             if isFinal && utteranceDiverged {
@@ -2541,21 +4133,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let suffix = String(text.dropFirst(lcp))
         guard !suffix.isEmpty else { return }
 
-        if let reason = injector.inject(suffix) {
+        // ── COLLAPSE A STANDING SELECTION, BUT ONLY MID-UTTERANCE ─────────────────────
+        // `kAXSelectedText` REPLACES a selection rather than inserting beside it, so an
+        // "append" made while a selection stands does not append — it DELETES. Whether
+        // that is wanted depends entirely on position within the utterance, which is why
+        // the flag is the caller's decision and not TextInjector's:
+        //
+        //   * FIRST injection of an utterance (`injectedForUtterance.isEmpty`) — replace-
+        //     selection is the FEATURE. Selecting a word and dictating over it is how a
+        //     user rewrites it, and this app must not take that away. Flag off, exactly as
+        //     the fresh-start site below has always had it.
+        //   * MID-utterance — the user has not reached for the mouse since we started
+        //     typing, so a selection standing here can only be OURS: TextInjector
+        //     deliberately leaves the stale tail SELECTED when it refuses a repair. The
+        //     sequence is not hypothetical. In Electron the refusal classifies transient,
+        //     `repairDivergence` defers it without re-anchoring, and this line then writes
+        //     over the standing selection — silently deleting the exact stale tail the
+        //     ledger still claims is in the document, which desynchronises every later
+        //     `replaceLastInserted` content check in the utterance. The deferral this
+        //     change set added makes that path MORE reachable, not less.
+        //
+        // The cost, stated honestly because this runs on every mid-utterance partial: two
+        // extra AX round trips (a focused-element copy plus one selection read), which
+        // TextInjector's own measurements put in the sub-millisecond band even in Electron.
+        // The 40 ms settle inside `collapseStandingSelectionToEnd` is paid only when a
+        // selection is ACTUALLY standing — once per refused repair, not once per partial.
+        if let reason = injector.inject(suffix,
+                                        collapseStandingSelection: !injectedForUtterance.isEmpty) {
             lifetime.injectFailures += 1; thisCapture.injectFailures += 1
-            // Latch — but only until the next `.listening` boundary clears it: a real
-            // inject failure (no AX trust, event post refused) is worth silencing the
-            // rest of THIS utterance for, and the next utterance re-probes.
+            // Recorded, not latched (see the note where the guard used to be). Every
+            // subsequent partial retries, so a persistently broken injector reaches this
+            // branch several times a second — hence the change test on the NOISY outputs:
+            // the trace line and the menu fire only when the REASON changes, which keeps a
+            // genuine new failure loud and a repeating one quiet, and makes a transient
+            // recognisable in the trace as a single line.
+            //
+            // THE HUD IS DELIBERATELY OUTSIDE THAT GATE, and the asymmetry is load-bearing.
+            // `handlePartial` calls `hud.set(.transcribing(raw))` immediately before every
+            // `deliver`, so the HUD is overwritten on each partial. Gating the error behind
+            // `isNewReason` therefore showed it once and let the very next partial replace
+            // it with scrolling transcript — the user would watch text stream past while
+            // NOTHING reached the document and no error was on screen. That is the same
+            // "looks like it is working while doing nothing" failure this change set exists
+            // to remove, relocated from the typing layer to the indicator layer. Re-setting
+            // it every failed partial is what keeps it on screen, and it is what shipped
+            // before this branch was rewritten.
+            let isNewReason = (injectionBlockedReason != reason)
             injectionBlockedReason = reason      // already names the pane to open
-            trace("INJECT FAILED: \(suffix.count) chars — \(reason)")
-            lastOutcome = "Injection failed"
             hud.set(.error(reason))
             hud.show()
-            refreshMenu()
+            if isNewReason {
+                trace("INJECT FAILED: \(suffix.count) chars — \(reason); retrying on the "
+                    + "next partial (the ledger is unchanged, so nothing is stranded)")
+                lastOutcome = "Injection failed"
+                refreshMenu()
+            }
             return
         }
 
         injectedForUtterance = text
+        if appendedPastCloudOwnedText {
+            // Traced only once the write has actually landed. A failed `inject()` returned
+            // above with its own INJECT FAILED line, and announcing an append that did not
+            // happen is the same class of lie as announcing a correction that did not.
+            trace("FINAL: appended \(suffix.count) chars past cloud-owned text")
+        }
+        // Characters landed, so whatever transient made a repair unapplicable is over;
+        // the next one starts its own deferral budget rather than inheriting a spent one.
+        transientRepairSkips = 0
         lifetime.injectedChars += suffix.count; thisCapture.injectedChars += suffix.count
         // Typed-span ledger: record exactly what landed in the document since the last
         // FINAL audio chunk was cut. `noteFinalChunk` snapshots and resets this at each
@@ -2567,6 +4212,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             utteranceDiverged = false
             lastOutcome = nil
         }
+        clearInjectionBlockAfterSuccessfulWrite()
+    }
+
+    /// Characters just landed in the document, so whatever made `inject()` fail earlier in
+    /// this utterance is demonstrably over -- keeping the latch set would leave the menu
+    /// saying "Injection blocked — <reason>" and would suppress `handleFinal`'s HUD
+    /// transcript until the next `.listening`, a mute indicator sitting over text the user
+    /// can watch arriving.
+    ///
+    /// This used to say "only a FINAL can reach a successful write while the latch is set",
+    /// because `deliver` had a guard that dropped every partial once it was set. That guard
+    /// is gone (see "THE LAST MUTE, REMOVED"), so PARTIALS are now the normal caller — and
+    /// that is exactly what makes this the reset for the change test in the failure branch:
+    /// a transient clears the latch as soon as one partial writes, so a later recurrence is
+    /// reported loudly instead of being swallowed as "same reason as before".
+    private func clearInjectionBlockAfterSuccessfulWrite() {
+        guard injectionBlockedReason != nil else { return }
+        injectionBlockedReason = nil
+        trace("injection-blocked latch cleared — a write landed after the failure "
+            + "(normally a partial; the failure was transient)")
     }
 
     /// Longest common prefix, counted in Characters — the same unit `injectedForUtterance`
@@ -2583,6 +4248,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ib = b.index(after: ib)
         }
         return n
+    }
+
+    /// Does a `replaceLastInserted` refusal describe a PERSISTENT property of the focused
+    /// app, or a momentary one? Only a persistent one may downgrade this capture to
+    /// `finalOnlyInjection`; see that declaration for the trace evidence that forced the
+    /// split. This is the ONLY classifier -- `repairDivergence` is its only caller -- so
+    /// the two lists cannot drift apart.
+    ///
+    /// Matched on stable substrings, the same discipline the recogniser's `unavailable`
+    /// reasons already use. Both anchors are byte-identical in `TextInjector`'s two
+    /// replace paths, and "clamped the selection" sits before the interpolated range
+    /// numbers in its message, so neither can be split by a value.
+    ///
+    ///   * "does not accept AX text replacement" -- the AX role/attribute set of the
+    ///     focused element. It cannot change while focus stays where it is.
+    ///   * "clamped the selection" -- the field rewrote the range we asked for. A field
+    ///     that does this does it every time.
+    ///
+    /// EVERYTHING ELSE IS TRANSIENT, INCLUDING REASONS THIS FUNCTION HAS NEVER SEEN --
+    /// a selection the user held for one frame, focus moving mid-partial, a secure-input
+    /// leak, a caret caught mid-cluster. The default is deliberately the permissive one:
+    /// an unrecognised refusal that was really structural costs some repair churn, while
+    /// an unrecognised refusal misfiled as structural silently mutes live typing for the
+    /// rest of the capture -- which is the bug this classifier exists to fix. A refusal
+    /// string added to `TextInjector` later therefore fails SAFE, and has to be listed
+    /// here explicitly before it can latch anything.
+    private func refusalIsStructural(_ reason: String) -> Bool {
+        let structuralMarkers = [
+            "does not accept AX text replacement",
+            "clamped the selection",
+        ]
+        return structuralMarkers.contains { reason.contains($0) }
     }
 
     /// A partial (or the final) revised, merged, or RETRACTED characters we already typed.
@@ -2605,38 +4302,298 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// repaired/refused deliberately: a single total cannot distinguish "the document was
     /// corrected" from "the app declined to touch the document", and those are the two
     /// outcomes a reader of the trace actually needs to tell apart.
+    /// A revision the focused app would not let us apply in place. Keep typing anyway.
+    ///
+    /// ── THIS DELIBERATELY MAKES `injectedForUtterance` INACCURATE, ONCE, BY A BOUNDED
+    ///    AMOUNT — AND THAT IS THE POINT ────────────────────────────────────────────────
+    /// `deliver`'s contract has always been "we never pretend text was delivered", and the
+    /// refusal path honoured it by suppressing partials until a FINAL or the cloud pass
+    /// reconciled the document. That contract is sound. Its recovery mechanism was gone
+    /// when this was written: on-device th-TH delivered no finals at all — `finals=0` in
+    /// all eight capture summaries across three consecutive launches — because utterance
+    /// boundaries came from request rotation and the old rotation cancelled the outgoing
+    /// request without `endAudio()`. "Suppress until a final" therefore evaluated to
+    /// "suppress until the user gives up".
+    ///
+    /// Flush-then-replay rotation has since restored one final per 20 s seam, and this
+    /// design does not go back. It never depended on finals being absent forever — only on
+    /// a refusal having no reconciliation WITHIN the window it happens in, which is still
+    /// true, and on a capture shorter than one rotation having none at all, which is
+    /// exactly the trace below: 11 s, no seam before the hotkey was released. What is
+    /// written here has to hold both when a final arrives every 20 s and when a whole
+    /// window produces none.
+    ///
+    /// Trace 14:36 is the whole argument. A refusal 2 s into an 11 s capture, no rotation
+    /// before the hotkey was released, `injectedChars=7`: the user spoke for nine more
+    /// seconds into a document that never moved. Clearing the latch at the `.listening`
+    /// boundary (which this change set also does) does not save that capture — it only
+    /// shortens the dead window to the 20 s rotation cadence in longer ones.
+    ///
+    /// So on a refusal we re-anchor the ledger to what the recogniser now says and carry
+    /// on. The document keeps the stale tail — typically the 3-7 characters the trace
+    /// shows — and everything spoken afterwards is typed instead of lost.
+    ///
+    /// WHY THE ERROR CANNOT COMPOUND, which is what makes this safe rather than merely
+    /// expedient. Say the document holds "ABC" and the recogniser revises to "ABD":
+    ///   * the repair is refused, so the document keeps "ABC" while the ledger becomes
+    ///     "ABD" — one wrong character;
+    ///   * the next partial "ABDE" is a clean prefix-extension of the ledger, so "E" is
+    ///     appended normally: document "ABCE", ledger "ABDE" — still one wrong character;
+    ///   * a later revision to "ABDF" computes `expected` as the ledger's tail "E", and
+    ///     "E" IS what sits in the document, so `replaceLastInserted` matches and SUCCEEDS.
+    /// Normal in-place repair resumes for everything typed after the anchor. Each refusal
+    /// strands its own stale tail and nothing more; the errors are local, visible, and the
+    /// HUD continues to show the correct transcript beside them.
+    ///
+    /// ── AND WHY THAT ARGUMENT ONLY BECAME TRUE WITH THE TWO LAYERS ABOVE ─────────────
+    /// "Each refusal strands its own stale tail and nothing more" was quietly incomplete
+    /// when it was written, because it says nothing about how BIG that tail is. At
+    /// `lcp == 0` — the shape a Thai pre-posed vowel (เ แ โ ใ ไ) produces legitimately at
+    /// index 0, and the shape behind the traced `kept 0 common chars … no focused element`
+    /// line — `staleCount` IS the entire utterance, up to twenty seconds of speech
+    /// stranded permanently to answer one momentary AX hiccup. Nothing here bounded that.
+    ///
+    /// Two layers now do, and this function is reached only once both have declined:
+    ///   * `repairDivergence` DEFERS a transient refusal (up to `maxTransientRepairSkips`
+    ///     in a row) without re-anchoring at all, so the momentary hiccup — which is what
+    ///     the trace evidence actually shows — never gets here;
+    ///   * `resolveUnrepairedRevision` diverts anything longer than
+    ///     `reanchorMaxStaleChars` to a fresh start instead of stranding it — ON A
+    ///     PARTIAL.
+    /// So every caller of this function on the PARTIAL path strands at most
+    /// `reanchorMaxStaleChars` clusters, which is what turns the compounding argument
+    /// above into a real bound rather than a hopeful one. Both of this function's call
+    /// sites go through `resolveUnrepairedRevision`; call it directly and the bound is
+    /// gone.
+    ///
+    /// ── ON A FINAL THE STRAND IS DELIBERATELY UNBOUNDED ──────────────────────────────
+    /// `resolveUnrepairedRevision` now sends every FINAL here regardless of `staleCount`,
+    /// so the cap above describes the partial path only. That is a knowing trade, argued
+    /// in full at that guard: under flush rotation a fresh start on a final retypes a whole
+    /// 20 s window, at every seam, in exactly the apps that refuse in-place repair.
+    ///
+    /// The compounding argument does not need the bound on this path, because compounding
+    /// needs a NEXT PARTIAL to compound into and a final does not have one: `.listening`
+    /// follows it and empties the ledger, so the re-anchored mark never gets diffed against
+    /// anything. The user keeps a stale tail in the document instead of a duplicated
+    /// window, and loses the gap text, which the trace says out loud.
+    ///
+    /// Note what is NOT touched: `injectedChars` and `typedSinceLastChunk` both describe
+    /// characters actually written to the document, and this path writes none. Inflating
+    /// them here would corrupt the cloud pass's span accounting, which is the one consumer
+    /// that still needs the ledger to mean "what is really in the document".
+    ///
+    /// `utteranceDiverged` is deliberately NOT set. It is the suppression this function
+    /// exists to replace; leaving it set would reinstate the mute one line after removing
+    /// it. Since these were its only writers, the flag is now inert everywhere — see the
+    /// note at the `.listening` clear. Do not "restore" it here on the assumption that
+    /// something else still depends on it.
+    /// The single door to "this revision will not be applied in place" — reached from the
+    /// structural fast-skip and from a real refusal alike, which is the point: an app that
+    /// refuses EVERY repair (Electron, via `finalOnlyInjection`) is precisely where the
+    /// unbounded strand recurs, so routing only the refusal branch through the cap would
+    /// leave the common case uncapped.
+    ///
+    /// Small stale tail — a revision, a merge, a tone mark — re-anchors exactly as before.
+    /// A tail past the cap is not a revision at all; it is the recogniser having replaced
+    /// the whole utterance, and stranding it would cost the user everything said so far.
+    /// So the app types the transcript again, in full, after a separator, and says so.
+    private func resolveUnrepairedRevision(to text: String,
+                                           lcp: Int,
+                                           staleCount: Int,
+                                           isFinal: Bool,
+                                           why: String) {
+        // ── A FINAL NEVER FRESH-STARTS, WHATEVER THE STALE COUNT ──────────────────────
+        // The fresh start below types the whole transcript again. On a PARTIAL that is the
+        // right trade: the utterance is still open, the alternative is stranding everything
+        // said so far, and the duplicate is paid once.
+        //
+        // On a FINAL it is the wrong trade, and flush rotation is what changed the
+        // arithmetic. There is now one final per 20 s seam, and in an app that has set
+        // `finalOnlyInjection` (Electron) every revision takes the structural fast-skip
+        // straight into this function with no transient budget in front of it, while
+        // `addsPunctuation` makes a deep-lcp revision on a final the ordinary case rather
+        // than the exotic one. Fresh-starting there retypes an ENTIRE 20 s window — and
+        // then does it again at the next seam, and the next.
+        //
+        // Weigh the two: a fresh start on a final buys at most the gap characters between
+        // the common prefix and the recogniser's text, and costs a duplicated window,
+        // repeatably. Re-anchoring loses those same gap characters and nothing else,
+        // because the final is immediately followed by `.listening`, which empties the
+        // ledger anyway — and it loses them in an app where in-place repair is already
+        // structurally impossible. Stale text beats duplication.
+        //
+        // The sacrifice is traced rather than swallowed, because the user is losing real
+        // words here and the trace is where that has to be visible.
+        if isFinal, staleCount > Self.reanchorMaxStaleChars {
+            trace("DIVERGENCE: seam final diverged too deeply (\(staleCount) stale); "
+                + "re-anchored without retyping — gap text not recovered in this app")
+        }
+        // `!isFinal` is part of the guard, not of the branch above, so that BOTH final
+        // shapes — deep and shallow — leave through the same re-anchor call. The fresh
+        // start below is therefore partial-only; its trace still carries the
+        // "(final reconciliation)" suffix, now unreachable, kept so the line stays correct
+        // if this rule is ever revisited.
+        guard staleCount > Self.reanchorMaxStaleChars, !isFinal else {
+            reanchorAfterUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
+                                            isFinal: isFinal, why: why)
+            return
+        }
+
+        // ── THE LEADING SPACE IS LOAD-BEARING, NOT COSMETIC ────────────────────────────
+        // The whole design rests on "the document tail equals the ledger", and a bare join
+        // can break that silently. Swift segments graphemes over the CONCATENATION: if the
+        // stale text ends in a base consonant and `text` opens with a combining mark — an
+        // everyday shape in Thai, and the reason this file counts in Characters everywhere
+        // — the two merge into ONE cluster in the document. The document would then hold
+        // one cluster fewer than the ledger's `text`, `injectedForUtterance.suffix(...)`
+        // would name the wrong span, and EVERY later `replaceLastInserted` content check
+        // in the utterance would refuse against text it should have matched. A space is a
+        // cluster nothing combines across, so the boundary is guaranteed by construction.
+        //
+        // It is deliberately NOT written into `injectedForUtterance`: the ledger means
+        // "what the recogniser said that is now in the document", `deliver` diffs the next
+        // partial against it, and a space the recogniser never uttered would put every
+        // subsequent common prefix off by one. `typedSinceLastChunk` is the opposite case
+        // and DOES get it — that ledger is a document-side span the cloud pass searches
+        // the document for, so it has to record what literally landed.
+        let separated = " " + text
+        if let reason = injector.inject(separated, collapseStandingSelection: true) {
+            // Record NOTHING. The ledger still describes the document, so the next partial
+            // recomputes honestly and retries — the same argument as a deferred repair.
+            trace("DIVERGENCE: fresh start not typed — \(staleCount) stale chars exceeded "
+                + "cap \(Self.reanchorMaxStaleChars) but the injection was refused "
+                + "(\(reason)); ledger unchanged, retrying on the next partial")
+            return
+        }
+
+        lifetime.freshStarts += 1; thisCapture.freshStarts += 1
+        injectedForUtterance = text
+        // Both counters describe characters that REALLY landed, separator included — the
+        // opposite of `reanchorAfterUnrepairedRevision`, which leaves them alone precisely
+        // because it writes nothing. This path writes.
+        lifetime.injectedChars += separated.count; thisCapture.injectedChars += separated.count
+        typedSinceLastChunk += separated
+        // A write landed, so the deferral budget starts over and the injection-blocked
+        // report must stop claiming the app cannot type.
+        transientRepairSkips = 0
+        lastTranscript = text
+        lastOutcome = "Typed the sentence again; \(staleCount) stale character(s) left before it"
+        clearInjectionBlockAfterSuccessfulWrite()
+        trace("DIVERGENCE: fresh start — \(staleCount) stale chars exceeded cap "
+            + "\(Self.reanchorMaxStaleChars); typed full transcript (\(text.count) chars) "
+            + "after a separator; the old text stays in the document"
+            + (isFinal ? " (final reconciliation)" : "") + " — \(why)")
+        refreshMenu()
+    }
+
+    private func reanchorAfterUnrepairedRevision(to text: String,
+                                                 lcp: Int,
+                                                 staleCount: Int,
+                                                 isFinal: Bool,
+                                                 why: String) {
+        lifetime.divergencesRefused += 1; thisCapture.divergencesRefused += 1
+        lastTranscript = text
+        lastOutcome = "Kept typing; \(staleCount) stale character(s) left in the text"
+        injectedForUtterance = text
+        trace("DIVERGENCE: re-anchored\(isFinal ? " (final reconciliation)" : "") — "
+            + "kept \(lcp) common chars, left \(staleCount) stale chars in the document, "
+            + "typing continues from the recogniser's text — \(why)")
+        refreshMenu()
+    }
+
     private func repairDivergence(to text: String, isFinal: Bool) {
         let lcp = commonPrefixLength(injectedForUtterance, text)
         let staleCount = injectedForUtterance.count - lcp
         let replacement = String(text.dropFirst(lcp))
 
         let expected = String(injectedForUtterance.suffix(staleCount))
+        // ── THIS APP HAS ALREADY PROVEN IT REFUSES IN-PLACE REPAIR ─────────────────────
+        // The only thing `finalOnlyInjection` still gates, and the only part of its old job
+        // that was ever load-bearing: skip an attempt whose outcome is known. The call
+        // below is not cheap — `replaceLastInserted` polls AX under a 0.9 s budget, and
+        // this file's own Electron measurement puts a refusal at ~1.1 s, twice per Thai
+        // utterance — so retrying it on every revision in an app that structurally cannot
+        // serve it burns roughly a second of the main actor to learn nothing.
+        //
+        // No HUD here on purpose: in such an app this is the expected steady state, not an
+        // incident, and an error banner on every revision would be noise that trains the
+        // user to ignore the one that matters.
+        //
+        // ── RE-ANCHOR, DO NOT SUPPRESS ────────────────────────────────────────────────
+        // `reanchorAfterUnrepairedRevision` is what keeps typing alive; see its definition
+        // below for why pretending is the lesser evil once finals stopped existing.
+        //
+        // ── AND IT GOES THROUGH THE SAME K-BOUND AS A REAL REFUSAL ────────────────────
+        // `resolveUnrepairedRevision`, not `reanchorAfterUnrepairedRevision` directly. In
+        // an app that has set this latch EVERY revision lands here, so this is exactly
+        // where an `lcp == 0` whole-utterance strand recurs; skipping the cap here would
+        // cap the rare path and leave the common one unbounded.
+        if finalOnlyInjection {
+            resolveUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
+                isFinal: isFinal,
+                why: "this app structurally refuses in-place repair (attempt skipped)")
+            return
+        }
         if let reason = injector.replaceLastInserted(count: staleCount, with: replacement,
                                                      expecting: expected) {
-            lifetime.divergencesRefused += 1; thisCapture.divergencesRefused += 1
-            utteranceDiverged = true
-            lastTranscript = text
-            lastOutcome = "Typed text is stale — in-place repair failed"
-            // This app cannot host live revision. Stop typing partials for the rest of
-            // the session; finals (which need no repair) still land in full.
-            if !finalOnlyInjection {
-                finalOnlyInjection = true
-                trace("FINAL-ONLY MODE: focused app refused in-place repair; typing utterance finals only for the rest of this session")
-            }
             trace("DIVERGENCE: repair FAILED\(isFinal ? " (final reconciliation)" : "") — "
                 + "kept \(lcp) common chars, could not replace \(staleCount) stale chars "
                 + "with \(replacement.count) chars — \(reason)")
-            let message = "The recogniser revised earlier words and MicTest could not rewrite "
-                + "the text it already typed (\(reason)), so it stopped typing rather than "
-                + "guess. Correct text: \(text)"
-            hud.set(.error(message))
-            hud.show()
-            refreshMenu()
+            // The structural latch now buys ONE thing only: never pay for this refusal
+            // again in an app that has proven it cannot serve the request. It no longer
+            // decides whether typing continues — `reanchorAfterUnrepairedRevision` does,
+            // identically for both classes.
+            if refusalIsStructural(reason), !finalOnlyInjection {
+                finalOnlyInjection = true
+                trace("IN-PLACE REPAIR DISABLED: focused app structurally refused it; "
+                    + "skipping the attempt for the rest of this capture — typing continues")
+            }
+
+            // ── DEFER A TRANSIENT BEFORE PAYING FOR IT ────────────────────────────────
+            // Re-anchoring is a PERMANENT answer: the stale tail stays in the user's
+            // document forever. The traced refusal that motivated all of this — "no
+            // focused element", at `lcp == 0`, `kept 0 common chars` — is the opposite of
+            // permanent; it is one AX round trip catching focus mid-move. Answering it
+            // by stranding an entire utterance is the wrong trade in both directions.
+            //
+            // So a transient refusal buys the document nothing and changes nothing: no
+            // write, no re-anchor, ledger untouched. That is safe for the mechanical
+            // reason `deliver` already relies on for a failed `inject()` — the refusal
+            // returned before anything was written, so `injectedForUtterance` still
+            // describes the document exactly and the next partial recomputes its common
+            // prefix against the truth. See `transientRepairSkips` for why it is bounded,
+            // and note there is deliberately no `isFinal` carve-out: on a final there is
+            // no "next partial", so the tail simply survives to the `.listening` reset,
+            // which is harmless while the ledger stays honest.
+            //
+            // REVISITED, as the parenthesis that stood here asked: flush rotation has
+            // restored real finals, one per 20 s seam. The decision is unchanged — the
+            // deferral keeps no `isFinal` carve-out. Deferring on a final writes nothing,
+            // re-anchors nothing and leaves the ledger describing the document exactly,
+            // which is the same "harmless" as before, except that the `.listening` reset
+            // now makes it harmless by construction rather than by argument. The decision
+            // that DID change sits one layer down, in `resolveUnrepairedRevision`: a final
+            // never fresh-starts, whatever the stale count.
+            if !refusalIsStructural(reason), transientRepairSkips < Self.maxTransientRepairSkips {
+                transientRepairSkips += 1
+                trace("DIVERGENCE: repair deferred (transient: \(reason)); ledger unchanged, "
+                    + "retrying on next partial "
+                    + "(skip \(transientRepairSkips)/\(Self.maxTransientRepairSkips))")
+                return
+            }
+
+            // Structural, or a "transient" that has now failed
+            // `maxTransientRepairSkips` times in a row and is therefore behaving
+            // structurally whatever the classifier calls it.
+            resolveUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
+                                      isFinal: isFinal, why: reason)
             return
         }
 
         lifetime.divergencesRepaired += 1; thisCapture.divergencesRepaired += 1
         injectedForUtterance = text
+        transientRepairSkips = 0
         lifetime.injectedChars += replacement.count; thisCapture.injectedChars += replacement.count
 
         // Keep the CHUNK ledger honest about the document, exactly as the cloud path does
@@ -2671,6 +4628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             utteranceDiverged = false
             lastOutcome = nil
         }
+        clearInjectionBlockAfterSuccessfulWrite()
         trace("DIVERGENCE: repaired in place\(isFinal ? " (final reconciliation)" : "") — "
             + "kept \(lcp) common chars, replaced \(staleCount) stale chars with "
             + "\(replacement.count) chars"
@@ -2685,7 +4643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// this is neither the main actor nor — emphatically — the realtime audio thread.
     /// `takeChunk()` is documented as "call from a background Task", and this is that Task.
     nonisolated private func chunkLoop(pipeline: AudioPipeline,
-                                       cloud: FalClient?,
+                                       cloud: GeminiClient?,
                                        generation: Int,
                                        flushRequest: FlushRequestBox) async {
         trace("LOOP[\(generation)]: chunk loop started (cloud client \(cloud == nil ? "absent" : "present"))")
@@ -2767,9 +4725,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// completion hop is necessarily a LATER MainActor job and always finds its task
     /// registered.
     nonisolated private func dispatchFinalChunk(_ chunk: AudioPipeline.Chunk,
-                                                cloud: FalClient?,
+                                                cloud: GeminiClient?,
                                                 generation: Int) async -> Bool {
         let wav = chunk.wav
+        // Extracted out here beside `wav`, for the same reason `wav` is: the MainActor
+        // closure below then captures two Sendable values instead of the chunk itself,
+        // which is the Sendable question this function already went out of its way to
+        // sidestep. This is the audio length the spend ledger counts.
+        let seconds = chunk.seconds
         return await MainActor.run { [weak self] () -> Bool in
             guard let self else { return false }
             // Gate (generation stale-guard included) — unchanged semantics, now simply
@@ -2787,22 +4750,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                      typedSpanSeq: typedSpanSeq,
                                      generation: generation, client: cloud)
             }
-            self.registerCloudTask(task, utteranceID: utteranceID, generation: generation)
+            self.registerCloudTask(task, utteranceID: utteranceID, generation: generation,
+                                   seconds: seconds)
             return true
         }
     }
 
-    /// Decide, on the main actor, whether this finalized utterance may reach fal.
+    /// Decide, on the main actor, whether this finalized utterance may reach the cloud.
     ///
     /// ── Why there is a gate at all ────────────────────────────────────────────────────
     /// Routing hallucinated text through the cloud pass *launders* it. A speech model fed
     /// silence or room tone does not return nothing — it invents fluent, plausible Thai. If
-    /// that chunk were forwarded to fal, fal would transcribe the same silence and return
-    /// something similar, the two would appear to agree, and the UI would then present
-    /// invented text as cloud-confirmed. The user's own ears would be the only thing left to
-    /// catch it. A confident wrong answer is strictly worse than no answer.
+    /// that chunk were forwarded, the cloud model would transcribe the same silence and
+    /// return something similar, the two would appear to agree, and the UI would then
+    /// present invented text as cloud-confirmed. The user's own ears would be the only thing
+    /// left to catch it. A confident wrong answer is strictly worse than no answer. (This
+    /// gate long predates Gemini and is provider-independent by design — it is a statement
+    /// about how speech models behave on silence, not about whose model it is.)
     ///
-    /// So an utterance only reaches fal when two independent witnesses agree there was
+    /// So an utterance only reaches the cloud when two independent witnesses agree there was
     /// speech:
     ///   1. AudioPipeline's own speech accounting. A chunk is only marked `isFinal` after at
     ///      least `minFinalSpeechSeconds` of above-threshold audio — the silence-ended branch
@@ -2871,7 +4837,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return FinalizedUtterance(id: id, runCloud: true, typedSpan: typedSpan, typedSpanSeq: utteranceSeq)
     }
 
-    private func registerCloudTask(_ task: Task<Void, Never>, utteranceID: Int, generation: Int) {
+    private func registerCloudTask(_ task: Task<Void, Never>, utteranceID: Int, generation: Int,
+                                   seconds: Double) {
         guard generation == captureGeneration, utteranceID == lastCloudUtteranceID else {
             task.cancel()
             trace("registerCloudTask: superseded before it started; cancelled")
@@ -2880,51 +4847,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cloudTask = task
         cloudTaskStartedAt = Date()   // drives the supersede rule in noteFinalChunk
         lifetime.cloudSent += 1; thisCapture.cloudSent += 1
+
+        // Seconds and requests are counted HERE: past the supersede guard above (which
+        // cancels before the request ever reaches the wire, so that path is honestly not a
+        // dispatch), and before any result can come back. See `cloudAudioSecondsSent` for
+        // why the completion side is the wrong place — the id-guards there discard
+        // superseded results the provider has already served and can already have billed.
+        //
+        // TOKENS ARE NOT COUNTED HERE, and cannot be: the billing unit only exists in a
+        // response. `applyCloudResult` adds them.
+        //
+        // Written through to UserDefaults on every dispatch rather than at terminate: this
+        // app is a menubar agent that gets force-quit, and a lifetime counter that only
+        // survives a graceful exit is not a lifetime counter.
+        cloudAudioSecondsSent += seconds
+        cloudRequestsSent += 1
+        UserDefaults.standard.set(cloudAudioSecondsSent, forKey: Self.cloudSecondsDefaultsKey)
+        UserDefaults.standard.set(cloudRequestsSent, forKey: Self.cloudRequestsDefaultsKey)
+        trace(String(format: "SPEND: +%.1f s audio → %.0f s / %d req lifetime",
+                     seconds, cloudAudioSecondsSent, cloudRequestsSent))
     }
 
     /// One cloud round trip for one finalized utterance.
     ///
-    /// `nonisolated` and only ever entered from `Task.detached` — a ~3 s HTTP request has no
-    /// business on the main actor, and `FalClient` is `Sendable` precisely so it can be used
-    /// this way. Every UI touch hops explicitly and the generation is checked on the far side
-    /// of that hop.
+    /// `nonisolated` and only ever entered from `Task.detached` — a multi-second HTTP request
+    /// has no business on the main actor, and `GeminiClient` is `Sendable` precisely so it
+    /// can be used this way. Every UI touch hops explicitly and the generation is checked on
+    /// the far side of that hop.
     ///
     /// A failure here is never allowed to disturb anything: the on-device text is already
     /// typed and stays exactly as it is.
     nonisolated private func cloudPass(wav: Data, utteranceID: Int, typedSpan: String,
                                        typedSpanSeq: UInt64,
-                                       generation: Int, client: FalClient) async {
-        trace("FAL[\(generation)]: sending utterance #\(utteranceID) — \(wav.count) wav bytes, "
+                                       generation: Int, client: GeminiClient) async {
+        trace("GEMINI[\(generation)]: sending utterance #\(utteranceID) — \(wav.count) wav bytes, "
             + "\(cloudKeyterms.count) keyterms")
         do {
             let result = try await client.transcribe(wav: wav, keyterms: cloudKeyterms)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            trace(String(format: "FAL[%d]: utterance #%d OK — %.0f ms, %d chars, langProb %.2f",
+            // `audioTokens`, not the old `langProb`: this is the EXACT unit Gemini bills,
+            // straight from the response, so the one number worth carrying per request is
+            // the one that costs money. A confidence figure was interesting; this is
+            // actionable, and it is the only place it can ever be observed.
+            trace(String(format: "GEMINI[%d]: utterance #%d OK — %.0f ms, %d chars, audioTokens=%d",
                          generation, utteranceID, result.elapsedMS, text.count,
-                         result.languageProbability))
+                         result.audioTokens))
             await MainActor.run { [weak self] in
                 self?.applyCloudResult(text: text, utteranceID: utteranceID,
                                        typedSpan: typedSpan,
                                        typedSpanSeq: typedSpanSeq,
-                                       elapsedMS: result.elapsedMS, generation: generation)
+                                       elapsedMS: result.elapsedMS,
+                                       audioTokens: result.audioTokens,
+                                       generation: generation)
             }
         } catch {
             let ns = error as NSError
             let wasCancelled = error is CancellationError
                 || (ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled)
-            let d = describeFalError(error)
-            trace("FAL[\(generation)]: utterance #\(utteranceID) FAILED "
+            let d = describeCloudError(error)
+            trace("GEMINI[\(generation)]: utterance #\(utteranceID) FAILED "
                 + "(cancelled=\(wasCancelled)) — \(d.summary)")
             await MainActor.run { [weak self] in
                 self?.applyCloudFailure(d.summary, utteranceID: utteranceID,
-                                        generation: generation, cancelled: wasCancelled)
+                                        generation: generation, cancelled: wasCancelled,
+                                        httpStatus: d.httpStatus)
             }
         }
     }
 
-    private func applyCloudResult(text: String, utteranceID: Int, typedSpan: String,
+    private func applyCloudResult(text rawText: String, utteranceID: Int, typedSpan: String,
                                   typedSpanSeq: UInt64,
-                                  elapsedMS: Double, generation: Int) {
+                                  elapsedMS: Double, audioTokens: Int, generation: Int) {
+        // ── Token ledger, ABOVE EVERY GUARD BELOW, deliberately ──────────────────────
+        // A response exists, therefore Google served it, therefore it was billed — and
+        // none of that is undone by this app deciding the text is stale. The stale-guards
+        // a few lines down discard superseded results, and counting after them would
+        // under-report exactly when usage is highest, which is the same mistake
+        // `cloudAudioSecondsSent` documents at length and avoids by counting at dispatch.
+        // Tokens cannot be counted at dispatch (the figure does not exist yet), so this is
+        // as early as the count can possibly happen. See `cloudAudioTokensSent`.
+        if audioTokens > 0 {
+            cloudAudioTokensSent += audioTokens
+            UserDefaults.standard.set(cloudAudioTokensSent, forKey: Self.cloudTokensDefaultsKey)
+            trace("SPEND: +\(audioTokens) audio tokens → \(cloudAudioTokensSent) lifetime")
+        }
+
         // Settle the one-in-flight gate ONLY when this hop belongs to the task that is
         // actually registered. A hung request superseded in `noteFinalChunk` was
         // cancelled and de-registered there, and by the time its late hop lands here a
@@ -2941,15 +4948,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 + "utterance \(utteranceID) vs \(lastCloudUtteranceID)); discarded")
             return
         }
+        // A request that came back at all proves the quota was not exhausted and the rate
+        // limit was not shut, so any 429 run ends here — "2 CONSECUTIVE 429s" has to mean
+        // consecutive, and a success sitting between two of them means they were not. Reset
+        // before the empty-result branch below, which is an HTTP success whatever it says
+        // about the audio. Cheap insurance against auto-disabling a working account.
+        consecutive429s = 0
+
         lastCloudLatencyMS = elapsedMS
-        guard !text.isEmpty else {
-            lifetime.cloudErrors += 1; thisCapture.cloudErrors += 1
-            lastOutcome = "Cloud pass returned nothing; on-device text kept"
-            trace("FAL: empty result; on-device text kept")
+        guard !rawText.isEmpty else {
+            // NOT an error, and deliberately not counted as one. `GeminiClient` documents
+            // an empty transcript as a legitimate "heard nothing" — Google returns it by
+            // design for a silent or near-silent chunk, with `finishReason: STOP` and a
+            // normal bill — so counting it here inflated `errors=` in the menu and the
+            // summary for every capture that happened to end on a quiet chunk, and made a
+            // healthy account look like it was failing. Counted separately instead, so the
+            // rate stays visible without being mistaken for breakage.
+            lifetime.cloudEmpty += 1; thisCapture.cloudEmpty += 1
+            lastOutcome = "Cloud pass heard nothing in that span; on-device text kept"
+            trace("GEMINI: empty result (silence — not counted as an error); "
+                + "on-device text kept")
             settleAfterCloud()
             return
         }
 
+        // ONE string from here down, which is why this is not done at the
+        // `replaceRecentText` call the way the newline work was first scoped. Normalising
+        // only the argument to the replace would put a string in the document that differs
+        // from the one recorded in `typedSinceLastChunk` below, shown in the HUD, and
+        // offered by "Copy cloud correction" — and the NEXT chunk's span search would then
+        // hunt the document for text that was never typed, which is the same permanent
+        // desync the normalisation exists to prevent. The cloud pass returns punctuated
+        // prose and is the realistic source of a line break here (this was true of fal and
+        // is no less true of Gemini); the on-device pass has never produced one. The
+        // parameter is `rawText` rather than a shadow because Swift forbids using a name
+        // earlier in a scope than the local declaration that shadows it, and the
+        // empty-result guard above must test what the cloud actually sent.
+        let text = normalizeForInjection(rawText, kind: "cloud")
         lastTranscript = text
 
         if text == injectedForUtterance {
@@ -2959,7 +4994,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lifetime.cloudApplied += 1; thisCapture.cloudApplied += 1
             unappliedCloudText = ""
             lastOutcome = String(format: "Cloud confirmed the typed text (%.0f ms)", elapsedMS)
-            trace(String(format: "FAL: result matches the typed text exactly (%d chars, %.0f ms)",
+            trace(String(format: "GEMINI: result matches the typed text exactly (%d chars, %.0f ms)",
                          text.count, elapsedMS))
             hud.set(.corrected(text))
             hud.show()
@@ -2993,7 +5028,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lifetime.secureInputRefusals += 1; thisCapture.secureInputRefusals += 1
             repairFailure = "secure input active; cloud text shown, not injected"
         } else if text.count * 2 < typedSpan.count || text.count > typedSpan.count * 3 {
-            // Size sanity: fal's text should be the same utterance, give or take
+            // Size sanity: the cloud text should be the same utterance, give or take
             // punctuation and corrections. A wildly different length means the span and
             // the audio chunk drifted apart (the ledger lags the audio cut) -- replacing
             // would swap in text belonging to a different stretch of speech.
@@ -3003,7 +5038,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lifetime.cloudApplied += 1; thisCapture.cloudApplied += 1
             unappliedCloudText = ""
             lastOutcome = String(format: "Cloud confirmed the typed text (%.0f ms)", elapsedMS)
-            trace(String(format: "FAL: result matches the typed span exactly (%d chars, %.0f ms)",
+            trace(String(format: "GEMINI: result matches the typed span exactly (%d chars, %.0f ms)",
                          text.count, elapsedMS))
             hud.set(.corrected(text))
             hud.show()
@@ -3018,13 +5053,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lifetime.cloudApplied += 1; thisCapture.cloudApplied += 1
             unappliedCloudText = ""
             lastOutcome = String(format: "Cloud auto-corrected the typed text (%.0f ms)", elapsedMS)
-            trace("FAL: auto-corrected span (\(typedSpan.count) -> \(text.count) chars)")
+            trace("GEMINI: auto-corrected span (\(typedSpan.count) -> \(text.count) chars)")
 
             // ── Bookkeeping: the recogniser-side mark is NOT touched here ───────────
             // `injectedForUtterance` is consumed by `deliver()` against RECOGNIZER text,
             // so the mark must stay in recognizer-text units at all times. The cloud text
-            // is a document-side rewrite in fal's own units: fal adds spaces and
-            // punctuation, so the strings differ. Folding it into the mark (as this block
+            // is a document-side rewrite in the cloud model's own units: it adds spaces
+            // and punctuation, so the strings differ. Folding it into the mark (as this block
             // once did) desynchronised a still-open utterance: later partials first
             // compared shorter than the inflated mark and were skipped (typing froze),
             // and once they outgrew it, `dropFirst(mark.count)` cut into genuinely new
@@ -3073,7 +5108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lifetime.cloudUnapplied += 1; thisCapture.cloudUnapplied += 1
         unappliedCloudText = text
         lastOutcome = "Cloud text ready but NOT typed — use “Copy cloud correction”"
-        trace(String(format: "FAL: result differs from the typed text "
+        trace(String(format: "GEMINI: result differs from the typed text "
                    + "(cloud %d chars vs typed %d chars, %.0f ms); NOT applied — ",
                      text.count, injectedForUtterance.count, elapsedMS)
             + (repairFailure ?? "unknown reason"))
@@ -3087,7 +5122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func applyCloudFailure(_ summary: String, utteranceID: Int,
-                                   generation: Int, cancelled: Bool) {
+                                   generation: Int, cancelled: Bool, httpStatus: Int?) {
         // Id-guarded for the same reason as applyCloudResult: a superseded request's
         // cancellation hop must not clear the NEW task registered after it.
         if utteranceID == lastCloudUtteranceID {
@@ -3099,6 +5134,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastOutcome = cancelled
             ? "Cloud pass cancelled; on-device text kept"
             : "Cloud pass failed — \(summary). On-device text kept."
+
+        // ── HTTP 429: quota or rate limit ────────────────────────────────────────────
+        // 429, NOT 402. fal signalled "out of credit" with a 402; Google never sends one,
+        // so the 402 branch this replaces would have been dead code wearing the costume of
+        // a safety net — the pass would have gone on uploading audio into a quota wall
+        // forever. See `max429sBeforeAutoDisable` for why two consecutive 429s is a weaker
+        // signal than two consecutive 402s were, and why the rule is kept at two anyway.
+        //
+        // Inside the `!cancelled` arm, both branches of it. A cancellation is not evidence
+        // about the quota either way, so it must neither increment NOR reset: if a
+        // supersede (which cancels — see `noteFinalChunk`) reset the run, two genuine 429s
+        // straddling one supersede would never trip the rule, and on a dead network that
+        // is the likeliest ordering there is.
+        if !cancelled {
+            if httpStatus == 429 {
+                consecutive429s += 1
+                if consecutive429s >= Self.max429sBeforeAutoDisable, cloudEnabled {
+                    // SESSION-ONLY: `cloudPassDefaultsKey` IS DELIBERATELY NOT WRITTEN.
+                    // That stored value records the user's opt-in, and hitting a quota is
+                    // not a change of mind. After the quota resets and a relaunch the pass
+                    // must come back exactly as they left it; writing `false` here would
+                    // revoke a preference on the app's own authority and leave no trace of
+                    // having done it. This matters MORE than it did under fal: a rate limit
+                    // clears by itself in a minute, so a persisted opt-out would outlive the
+                    // condition that caused it by an arbitrary margin.
+                    cloudEnabled = false
+                    cloudAutoDisabledReason = "hit Gemini quota"
+                    trace("CLOUD PASS AUTO-DISABLED: \(Self.max429sBeforeAutoDisable) consecutive "
+                        + "HTTP 429 (quota or rate limit); re-enable from the menubar — "
+                        + "check quota at \(googleQuotaURL)")
+                    // Overwrites the generic failure line set just above, on purpose: the
+                    // pass turning itself off is the more important half of this event.
+                    lastOutcome = "Cloud pass auto-disabled — hit Gemini quota"
+                    refreshMenu()
+                }
+            } else {
+                consecutive429s = 0
+            }
+        }
+
         settleAfterCloud()
     }
 
@@ -3115,6 +5190,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showIdleHUD()
         }
         refreshMenu()
+    }
+
+    // MARK: - Usage read-outs
+    //
+    // Two menu lines and nothing else. THERE IS NO NETWORK CALL IN THIS SECTION — under fal
+    // there was one (a billing probe, firewalled from dictation, with its own task and its
+    // own rate limits), and the rule it kept is now enforced by construction instead of by
+    // discipline: Google exposes no key-readable balance, so there is nothing to ask and no
+    // way for a billing endpoint to cost the user a character of typed text.
+
+    /// Titles for the two usage lines. Split out of `refreshMenu` because it is a formatting
+    /// job with its own rules, and inlining it would bury the dictation read-outs that matter
+    /// considerably more.
+    ///
+    /// Both lines are driven by `cloudAudioTokensSent`/`cloudRequestsSent` — the same
+    /// counters, never a second copy — so the clickable line and the read-out can never
+    /// disagree about the same launch.
+    private func refreshCreditItems() {
+        // Hidden until there IS usage, and hidden on the same variable it reports, or the
+        // line would render "Usage: 0 audio tokens this Mac" and read as a broken fetch.
+        creditItem.isHidden = cloudAudioTokensSent == 0
+        if cloudAudioTokensSent > 0 {
+            creditItem.isEnabled = true
+            creditItem.title = "Usage: \(Self.formattedCount(cloudAudioTokensSent)) audio tokens this Mac"
+            // The title says "this Mac" because that is all it can honestly claim; the
+            // tooltip says where the account-wide truth lives, which is also where the click
+            // goes.
+            creditItem.toolTip = "Counted locally by MicTest. Your account's real usage and "
+                + "quota live at \(googleQuotaURL) — click to open."
+        }
+
+        // Hidden until there is something to report; see `buildStatusItem`.
+        spendItem.isHidden = cloudRequestsSent == 0
+        if cloudRequestsSent > 0 {
+            spendItem.title = String(format: "Sent from this Mac: %d req, %.1f min, ",
+                                     cloudRequestsSent, cloudAudioSecondsSent / 60)
+                + "\(Self.formattedCount(cloudAudioTokensSent)) audio tokens"
+            // NO DOLLAR ESTIMATE LIVES HERE ANY MORE. The old title led with "~$0.42",
+            // derived from fal's $0.008/audio-minute plus a 30% keyterms premium. That price
+            // belonged to a vendor this app no longer calls, and the honest replacement for a
+            // wrong number is no number — not a guessed Gemini price dressed in the same
+            // tilde. The tokens beside it are the exact billing unit and are not an estimate
+            // at all; converting them to money is Google's job, on Google's current rates.
+            spendItem.toolTip = "Gemini bills by audio token; see Google AI Studio for "
+                + "current rates and your quota."
+        }
+    }
+
+    /// `48900` → `48,900`.
+    ///
+    /// Grouped, because a six-figure token count is unreadable otherwise, and this number is
+    /// meant to be compared by eye against the figure Google's own console shows. Deliberately
+    /// NOT the user's locale: under a Thai locale a localised formatter would render the
+    /// count in a shape that console never uses, which defeats the one job the line has.
+    /// A formatter per call rather than a shared static — this runs at menu-refresh rate, not
+    /// in a loop, and a mutable `NumberFormatter` stored on a type is a Swift 6 concurrency
+    /// problem bought for nothing.
+    private nonisolated static func formattedCount(_ value: Int) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.groupingSeparator = ","
+        f.usesGroupingSeparator = true
+        return f.string(from: NSNumber(value: value)) ?? String(value)
     }
 
     // MARK: - Menu actions
@@ -3134,6 +5273,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard cloudAvailable else { return }
         cloudEnabled.toggle()
         UserDefaults.standard.set(cloudEnabled, forKey: Self.cloudPassDefaultsKey)
+        // Every deliberate flip clears the auto-disable memory. On the way back ON that is
+        // load-bearing: without it, one stale 429 from before the quota reset plus one new
+        // failure would trip the rule again immediately and the pass would appear to
+        // refuse to stay on. On the way OFF it is simply true — the reason exists to
+        // explain an off state the user did not choose, and this one they did.
+        cloudAutoDisabledReason = nil
+        consecutive429s = 0
         trace("MENU: cloud accuracy pass -> \(cloudEnabled ? "on" : "off")")
         // The chunk loop is created (or skipped) once, at session start, from the state
         // read there. `isCapturing && chunkTask == nil` identifies exactly "this session
@@ -3141,6 +5287,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if cloudEnabled && isCapturing && chunkTask == nil {
             trace("MENU: cloud pass enabled mid-session — takes effect at the NEXT session "
                 + "(tap \(defaultHotkeyName) to stop, then again to start)")
+        }
+        refreshMenu()
+    }
+
+    /// Switch the dictation engine between Apple's on-device recogniser and Gemini Live.
+    ///
+    /// TAKES EFFECT AT THE NEXT CAPTURE, never mid-session, and that is the same rule
+    /// `toggleCloud` follows one screen up — but here it is a correctness requirement
+    /// rather than a convenience. `activeEngineKind` and the `activeEngine` reference it
+    /// resolves are captured once in `beginCapture` and are what `processTap` feeds on the
+    /// realtime audio thread; swapping the engine under a live session would hand a
+    /// half-streamed utterance to a different recogniser, with the consumer's typed-span
+    /// ledger still describing the first one's text. So the flip only ever moves
+    /// `selectedEngineKind`, and the running session keeps the engine it started with.
+    ///
+    /// Guarded on `geminiLiveAvailable` for the same reason `toggleCloud` guards on
+    /// `cloudAvailable`: with no `GOOGLE_API_KEY` on disk the Gemini engine cannot start,
+    /// and a toggle that silently selects a dead engine would present as "dictation just
+    /// stopped working". `refreshMenu` renders that unavailable state with the key name
+    /// and path, so the user is told what to create.
+    @objc private func toggleEngine() {
+        let next: DictationEngineKind = (selectedEngineKind == .apple) ? .geminiLive : .apple
+        // Only the way IN is gated. Falling back to Apple must always be possible — it is
+        // the on-device engine and the recovery path if the cloud one misbehaves.
+        if next == .geminiLive && !geminiLiveAvailable {
+            trace("MENU: dictation engine -> geminiLive REFUSED (no key / cloud unavailable)")
+            refreshMenu()
+            return
+        }
+        selectedEngineKind = next
+        UserDefaults.standard.set(next.rawValue, forKey: Self.engineDefaultsKey)
+        trace("MENU: dictation engine -> \(next.rawValue)")
+        if next == .geminiLive {
+            // Said once, plainly, at the moment of the choice. The menu title and tooltip
+            // carry it too, but this is the line that lands in the trace beside the audio
+            // that was actually streamed, which is what makes the record honest.
+            trace("PRIVACY: Gemini Live streams microphone audio to Google for as long as "
+                + "dictation runs; the Apple engine never sends audio off this Mac")
+        }
+        if isCapturing && next != activeEngineKind {
+            trace("MENU: engine switch takes effect at the NEXT session "
+                + "(tap \(defaultHotkeyName) to stop, then again to start) — this session "
+                + "continues on \(activeEngineKind.rawValue)")
         }
         refreshMenu()
     }
@@ -3192,6 +5381,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openMicrophoneSettings() { openPane(microphonePaneURL, name: "Microphone") }
     @objc private func openSpeechSettings() { openPane(speechPaneURL, name: "Speech Recognition") }
 
+    /// Google AI Studio's key page — where quota and usage actually live.
+    ///
+    /// AI Studio and not the Cloud console, because this is the "how much have I used"
+    /// button; the console is where a REJECTED KEY is fixed, and `describeCloudError`'s
+    /// 401/403 branch names that one instead. Two destinations, each reached from the state
+    /// it can resolve.
+    ///
+    /// Deliberately NOT routed through `openPane(_:name:)`, despite the identical shape:
+    /// that helper's failure path tells the user to go to "System Settings > Privacy &
+    /// Security > <name>", which is exactly the wrong advice for a web page and would send
+    /// someone hunting through a settings pane that has nothing to do with Gemini.
+    @objc private func openCloudQuota() {
+        guard let url = URL(string: googleQuotaURL) else {
+            trace("ERROR: could not build the Gemini quota URL from \(googleQuotaURL)")
+            return
+        }
+        let ok = NSWorkspace.shared.open(url)
+        trace("MENU: open Gemini quota — NSWorkspace.open -> \(ok)")
+        if !ok {
+            lastOutcome = "Could not open a browser — Gemini quota is at \(googleQuotaURL)"
+            refreshMenu()
+        }
+    }
+
     private func openPane(_ urlString: String, name: String) {
         guard let url = URL(string: urlString) else {
             trace("ERROR: could not build the \(name) settings URL from \(urlString)")
@@ -3227,17 +5440,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// cannot press a physical key, so the CGEventTap delivery path itself is NOT covered;
     /// only tap health is, via the trace and the menu.
     ///
-    /// `open` does not forward environment variables, so drive the inner Mach-O directly:
-    ///     MICTEST_AUTOSTART=1 ~/Desktop/MicTest.app/Contents/MacOS/MicTest
-    /// Bundle identity and signature still resolve (Bundle.main is the .app), so TCC is
-    /// unaffected.
+    /// LAUNCH IT WITH `open`, NEVER BY EXEC'ING THE INNER MACH-O. This paragraph used to say
+    /// the opposite — that `open` cannot forward environment variables, so one should run
+    /// `MICTEST_AUTOSTART=1 ~/Desktop/MicTest.app/Contents/MacOS/MicTest`, and that "bundle
+    /// identity and signature still resolve (Bundle.main is the .app), so TCC is unaffected."
+    /// Both halves were wrong, and the second one wrong in the expensive direction:
+    ///
+    ///     open -W -n -g --env MICTEST_AUTOSTART=1 --env MICTEST_AUTOSTART_HOLD=50 \
+    ///          -a ~/Desktop/MicTest.app
+    ///
+    ///   * `--env` forwards variables perfectly well; `-W` waits for exit, `-n` forces a new
+    ///     instance, `-g` keeps the launch from stealing focus.
+    ///   * Exec'ing the inner binary crashes 100% of the time, with SIGABRT, the instant
+    ///     `LiveRecognizer.requestAuthorization()` is reached: TCC namespace, "attempted to
+    ///     access privacy-sensitive data without a usage description ... must contain an
+    ///     NSSpeechRecognitionUsageDescription key". The key IS present and correct in the
+    ///     built Info.plist, and `Bundle.main` DOES resolve to the .app — the trace prints
+    ///     the right bundle id and path a line before it dies. TCC's usage-description
+    ///     lookup simply does not honour that when the executable is exec'd directly rather
+    ///     than launched as a bundle.
+    ///   * The reason this cost a whole test round rather than announcing itself: the
+    ///     process exits **0**, and the trace just stops after the last startup line. It
+    ///     reads exactly like a run that did nothing, not like a crash. The evidence is in
+    ///     ~/Library/Logs/DiagnosticReports/MicTest-*.ips, which is not where anyone looks
+    ///     when the exit status is success.
+    ///
+    /// `MICTEST_AUTOSTART_HOLD=<seconds>` lengthens the simulated hold. THIS IS NOT A
+    /// CONVENIENCE KNOB. The default hold is 8.5 s and the rotation cadence is 20 s, so the
+    /// default run tears the capture down before a single rotation happens — meaning the
+    /// flush-then-replay seam path (the fix for words being cut every 20 s, the whole point
+    /// of Phase 2) is exercised ZERO times by a default headless run, and its absence from
+    /// the trace looks identical to it being broken. Pass a hold of 45 s or more to cross
+    /// two seams; two, not one, because a single seam cannot show whether the replay window
+    /// is consumed correctly on the pass that follows it.
+    ///
+    /// Release is always hold-seconds after the press, and quit is 6 s after the release —
+    /// that tail is the cloud pass's window to settle, so the CLOUD SUMMARY has something
+    /// true to print rather than racing the reply. Derived, not independently configurable:
+    /// the two failure modes of a hand-tuned schedule are quitting before the release and
+    /// quitting before the cloud answers, and both print a clean-looking summary full of
+    /// zeroes.
     private func maybeArmAutostart() {
         guard ProcessInfo.processInfo.environment["MICTEST_AUTOSTART"] == "1" else { return }
-        trace("MICTEST_AUTOSTART=1 — simulated hold at t+1.5s, release at t+10s, quit at t+16s")
+        // Clamped, not trusted. A typo'd or non-numeric hold silently becoming 0 would end
+        // the capture in the same runloop turn it began and report `frames=0`, which reads
+        // as an audio-thread failure rather than as bad input. Floor of 1 s keeps a
+        // malformed value in "short run" territory; the 600 s ceiling exists because this
+        // harness quits the app on a timer and an unbounded value would hang a CI run.
+        let holdEnv = ProcessInfo.processInfo.environment["MICTEST_AUTOSTART_HOLD"]
+        // `.isFinite`, not just a nil check, and NOT `min(max(...))` alone. `TimeInterval`
+        // is `Double`, so `TimeInterval("nan")` parses successfully to NaN — and NaN passes
+        // straight through `min(max(x, 1.0), 600.0)` unchanged, because every comparison
+        // against NaN is false. The result was a NaN hold, NaN timer intervals for all three
+        // scheduled selectors, no "is not a number" warning (`TimeInterval("nan") == nil` is
+        // false) and no sub-20s warning either (`nan < 20.0` is false): a run that schedules
+        // nothing and says nothing, which is precisely the silent failure this clamp exists
+        // to prevent. `inf` was already handled correctly by the ceiling; `nan` was not.
+        let parsedHold = holdEnv.flatMap(TimeInterval.init).flatMap { $0.isFinite ? $0 : nil }
+        let hold = min(max(parsedHold ?? 8.5, 1.0), 600.0)
+        if let holdEnv, parsedHold == nil {
+            trace("MICTEST_AUTOSTART_HOLD=\(holdEnv) is not a usable number — using the 8.5s default")
+        }
+        let press: TimeInterval = 1.5
+        let release = press + hold
+        let quit = release + 6.0
+        trace(String(format: "MICTEST_AUTOSTART=1 — simulated hold at t+%.1fs, "
+                   + "release at t+%.1fs (hold %.1fs), quit at t+%.1fs", press, release, hold, quit))
+        if hold < 20.0 {
+            trace("AUTOSTART: hold \(String(format: "%.1f", hold))s < the 20s rotation cadence — "
+                + "this run will NOT reach a seam; rotation/replay lines are expected to be "
+                + "absent. Set MICTEST_AUTOSTART_HOLD=45 to exercise them.")
+        }
         let schedule: [(TimeInterval, Selector)] = [
-            (1.5, #selector(autostartBegin)),
-            (10.0, #selector(autostartEnd)),
-            (16.0, #selector(autostartQuit))
+            (press, #selector(autostartBegin)),
+            (release, #selector(autostartEnd)),
+            (quit, #selector(autostartQuit))
         ]
         for (delay, selector) in schedule {
             let t = Timer(timeInterval: delay, target: self, selector: selector,
@@ -3262,6 +5539,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         finishCapture(reason: "autostart run complete")
         let (_, frames) = levelBox.read()
         let cloudLatency = lastCloudLatencyMS.map { String(format: "%.0f ms", $0) } ?? "—"
+        // NO `balance=` FIELD ANY MORE: it reported a number fetched from fal's billing
+        // endpoint, and Google has no key-readable equivalent to fetch. `spentAudioTokens`
+        // takes its place and is a better field than the one it replaces — measured here
+        // from the responses themselves rather than reported by a vendor, and in the exact
+        // unit Gemini bills.
         // LIFETIME on purpose, both lines. This is the verdict for an entire headless run,
         // printed once at exit, and `sessions=` in the same line is what the totals are
         // counted against — per-capture numbers here would describe only the last capture,
@@ -3283,7 +5565,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "finalChunks=\(lifetime.finalChunks) sent=\(lifetime.cloudSent) "
             + "applied=\(lifetime.cloudApplied) unapplied=\(lifetime.cloudUnapplied) "
             + "errors=\(lifetime.cloudErrors) skipped=\(lifetime.cloudSkipped) "
-            + "lastCloudLatency=\(cloudLatency) setupError=\(falSetup.error ?? "(none)") "
+            + "lastCloudLatency=\(cloudLatency) setupError=\(cloudSetup.error ?? "(none)") "
+            + String(format: "spentSeconds=%.0f spentRequests=%d spentAudioTokens=%d ",
+                     cloudAudioSecondsSent, cloudRequestsSent, cloudAudioTokensSent)
             + "lastOutcome=\(lastOutcome ?? "(none)")")
         NSApp.terminate(nil)
     }
