@@ -192,6 +192,16 @@ final class DictationHUD {
 
     enum Mode: Sendable {
         case hidden
+        /// Not listening, but on screen. The panel stays visible and clickable — that is
+        /// the whole point of it, and `.hidden` would call `hide()`.
+        ///
+        /// This case exists because idle used to be rendered as `.transcribing`, chosen as
+        /// the least-wrong of six when there was no sixth. The cost was not cosmetic: the
+        /// HUD said the word "Transcribing" under an animated `waveform`, with the level
+        /// meter running, while the microphone was OFF. Every visual cue the panel has for
+        /// "I am working" was lit while it was doing nothing. `showsMeter(for:)` returns
+        /// false here, which is the half that actually stops the lie.
+        case idle(String)
         case listening              // mic live, waiting for speech
         case transcribing(String)   // live partial text
         case correcting(String)     // cloud pass running, showing current text
@@ -841,7 +851,9 @@ final class DictationHUD {
     private func showsMeter(for mode: Mode) -> Bool {
         switch mode {
         case .listening, .transcribing: return true
-        case .hidden, .correcting, .corrected, .error: return false
+        // `.idle` MUST stay on this side. The meter is the strongest "audio is being
+        // captured right now" signal on the panel, and idle is precisely when it is not.
+        case .hidden, .idle, .correcting, .corrected, .error: return false
         }
     }
 
@@ -860,6 +872,15 @@ final class DictationHUD {
         switch mode {
         case .hidden:
             return
+        case .idle(let text):
+            // Hollow `mic`, not `mic.fill`, and no colour: the filled red glyph is what
+            // `.listening` uses, and the two states must not look alike at a glance. This
+            // matches the menubar item, which already shows hollow `mic` when idle.
+            symbol = "mic"
+            tint = .secondaryLabelColor
+            status = "Idle"
+            body = text.isEmpty ? "Idle" : text
+            bodyIsPlaceholder = true
         case .listening:
             symbol = "mic.fill"
             tint = .systemRed

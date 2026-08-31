@@ -106,12 +106,34 @@ import AVFoundation
 /// Technical vocabulary, used for BOTH halves of the recognition stack:
 ///   * handed to `GeminiClient.transcribe(wav:keyterms:)` so the cloud pass biases towards
 ///     these spellings instead of transliterating them into Thai phonetics, and
-///   * handed to `LiveRecognizer.setContextualStrings` so the on-device pass biases the
-///     same way and the live text does not have to be undone by the cloud text.
+///   * handed to `LiveRecognizer.setContextualStrings`, where — MEASURED 2026-08-31 — it
+///     has NO EFFECT WHATSOEVER. See the warning below before spending time on it.
 ///
-/// THIS IS THE LIST TO EDIT — it is the single knob that decides whether "commit" comes
-/// back as `commit` or as `คอมมิต`. Keep entries short and keep them to words that are
-/// genuinely ambiguous in a Thai sentence.
+/// ⚠️ THIS LIST DOES NOTHING ON THE DEFAULT (APPLE / on-device th-TH) PATH.
+///
+/// This comment used to claim the list was "the single knob that decides whether `commit`
+/// comes back as `commit` or as `คอมมิต`". That is false, and it cost real debugging time.
+/// The terms ARE applied — `LiveRecognizer.swift:759` sets `request.contextualStrings` on
+/// every session and rotation — but the on-device th-TH model ignores them. Measured with
+/// bias on vs off, output byte-identical in every cell:
+///
+///     English voice (say -v Samantha), URL request:  commit→เข็ด   deploy→ซอย   debug→ที่บาร์
+///     English voice, BUFFER request (this app's exact five settings):  same, unchanged
+///     Thai voice, "ช่วย commit โค้ดนี้": ช่วยเครือมีโค้ดนี้ให้หน่อยครับ, unchanged
+///
+/// Eight of the twenty terms below were tested, across two voices and both request types.
+/// Nothing moved. Do not add terms here expecting the Apple path to honour them, and do
+/// not conclude from a fixed transcript that a term you added is working.
+///
+/// WHERE IT DOES STILL EARN ITS KEEP: `GeminiClient.transcribe(wav:keyterms:)` splices
+/// these into the prompt ("Use these exact spellings if you hear them: …"), and there they
+/// work — a cloud pass with this list returns `commit`, `deploy`, `production` correctly.
+/// That path is off by default and the user has declined to enable it (audio must not
+/// leave the machine), so in the shipped configuration this list is inert. It is kept
+/// because it is free, correct, and immediately live if the cloud pass is ever turned on.
+///
+/// Keep entries short and keep them to words that are genuinely ambiguous in a Thai
+/// sentence.
 ///
 /// The "short, ~100 entries" shape started as fal's hard API cap (50 characters per
 /// keyterm, 100 entries). That cap left with fal: `GeminiClient` carries these into a
@@ -2159,13 +2181,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// The compact idle form. `DictationHUD.Mode` has no `.idle` case and `.hidden` calls
-    /// `hide()`, so the least-wrong of the six is `.transcribing` with a body string we
-    /// control — the body carries the truth ("Idle — hold Right-Option to dictate") and the
-    /// panel stays on screen and clickable, which is what this requirement is about.
-    /// A genuine `.idle` case would need an edit to DictationHUD.swift, which is out of scope.
+    /// The compact idle form. Uses the real `.idle` case: the panel stays on screen and
+    /// clickable, shows a hollow grey `mic` with the word "Idle", and — the part that was
+    /// actually wrong before — runs NO level meter.
+    ///
+    /// This used to pass `.transcribing(idleBody())`, chosen as "the least-wrong of the
+    /// six" when `Mode` had no idle case. The body string told the truth while every other
+    /// cue contradicted it: the status word read "Transcribing", the icon was an accent-
+    /// coloured `waveform`, and `showsMeter(for:)` returns true for `.transcribing`, so a
+    /// live meter animated at 30 Hz over a microphone that was off. `DictationHUD.Mode`
+    /// now has `.idle`; see it for why the meter was the load-bearing half of the fix.
     private func showIdleHUD() {
-        hud.set(.transcribing(idleBody()))
+        hud.set(.idle(idleBody()))
         hud.show()
     }
 
@@ -3651,7 +3678,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         currentOnDeviceText = text
         if !text.isEmpty { lastTranscript = text }
         if !utteranceDiverged && injectionBlockedReason == nil {
-            hud.set(.transcribing(text.isEmpty ? hudIdleBody : text))
+            // An empty final means the utterance produced nothing, NOT that the session
+            // ended — the microphone is still live and the next utterance is already being
+            // listened for. This used to show `hudIdleBody` ("Idle — tap Right-Option to
+            // start dictating") under the status word "Transcribing", which is wrong twice
+            // over: it tells the user to start something already running, and it does so
+            // while claiming to transcribe. `.listening` is what this state actually is.
+            hud.set(text.isEmpty ? .listening : .transcribing(text))
         }
         // THIS IS THE LINE THE RETRACTION EVIDENCE CAME FROM — `FINAL: 6 chars, injected
         // 22 chars, diverged=false` was how 16 characters of retracted Thai left in the
