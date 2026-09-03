@@ -6,15 +6,21 @@
 //  ── WHY THIS EXISTS ──────────────────────────────────────────────────────────────────
 //
 //  Phase 2's whole purpose is that the session rotation at 20 s stops eating the words that
-//  straddle it. The number that measures it is the one `beginFlushRotation` prints:
+//  straddle it. The number that measures it is printed by `handle`, from the
+//  `result.isFinal` branch that receives the flushed final; `beginFlushRotation` only asks
+//  for the flush and latches the baseline the number is measured against:
 //
-//      rotation: flushed final after 34 ms, +N chars beyond last partial
+//      rotation: flushed final after 34 ms, ±N chars beyond partial at flush
 //
-//  `+N` is the text the seam used to lose. On 2026-08-30 that number was **0 at every seam
-//  ever observed** — not because the fix worked, but because every run happened in a silent
-//  room, so there was nothing at the seam to lose. `+0` there is equally consistent with
-//  "the gap is recovered" and "there was no gap". The mechanism was proven to RUN; it was
-//  never proven to FIX anything. See MicTest/TEST-2026-08-30.md, "Open / not verified" §1.
+//  `±N` is the text the seam used to lose, signed because a final can retract as well as
+//  extend. In the silent-room round of `TEST-2026-08-30.md` it read 0 at every seam
+//  observed — not because the fix worked, but because every run happened in a silent room,
+//  so there was nothing at the seam to lose. A no-change seam prints `0 chars`, which is
+//  equally consistent with "the gap is recovered" and "there was no gap". The mechanism was
+//  proven to RUN; it was never proven to FIX anything. See `TEST-2026-08-30.md`, "Open /
+//  not verified" §1. The synthetic runs this file exists to enable did later move it off
+//  zero — `TEST-2026-08-31-run6-trace.txt` reads +7, +2, −4 and +6 at its four
+//  seams — so that zero is scoped to the silent-room round, and must not be widened out.
 //
 //  Closing that needs continuous speech across a 20 s boundary. The obvious automation —
 //  `say -v Kanya` out of the speakers while the harness listens — was tried and does not
@@ -35,13 +41,13 @@
 //  Injection happens at `AppDelegate.processTap`, which is the single point every microphone
 //  buffer passes through. Everything downstream is therefore exercised by exactly the code
 //  that serves a real speaker: `LiveRecognizer.append` → `SFSpeechAudioBufferRecognitionRequest`,
-//  the `AudioReplayRing`, the rotation, the flush, the `+N` measurement, the injector.
+//  the `AudioReplayRing`, the rotation, the flush, the `±N` measurement, the injector.
 //
 //  NOT covered, and no run through this source may be described as if it were: the physical
 //  microphone, `AVAudioEngine`'s input node, the room, and — most importantly — whether
 //  Apple's recogniser treats a synthetic voice the way it treats a human one. Kanya is a
-//  text-to-speech voice. A `+N > 0` here proves the seam recovers audio that crosses it; it
-//  does not prove a sentence a person says survives. Read `SYNTH:` lines in the trace as
+//  text-to-speech voice. A `±N` above zero here proves the seam recovers audio that
+//  crosses it; it does not prove a sentence a person says survives. Read `SYNTH:` lines as
 //  "the harness fed this", never as "the user said this".
 //
 //  ── WHY THE MICROPHONE STAYS OPEN ────────────────────────────────────────────────────
@@ -246,8 +252,8 @@ final class SyntheticAudioSource: @unchecked Sendable {
     /// **Real-time pacing is the point, not a nicety.** The rotation this harness exists to
     /// test fires on a 20 s *wall-clock* cadence (`LiveRecognizer.sessionRotationSeconds`).
     /// A pacer that pushed the file through as fast as it could read it would cross the
-    /// boundary at an arbitrary and irreproducible point in the audio, and `+N` would measure
-    /// nothing but scheduling luck. Feeding audio-time at wall-time is what puts the seam
+    /// boundary at an arbitrary and irreproducible point in the audio, and `±N` would
+    /// measure nothing but scheduling luck. Feeding audio-time at wall-time puts the seam
     /// mid-utterance, which is where the bug lives.
     ///
     /// Deadlines are computed from a fixed origin rather than by adding a sleep each time, so

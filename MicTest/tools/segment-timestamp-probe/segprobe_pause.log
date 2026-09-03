@@ -1,0 +1,144 @@
+=== segprobe start 2026-08-31 07:05:16 +0000 ===
+bundleID: com.boombignose.segprobe
+auth before: authorized
+audio ready: thai 938 chunks / 20.0s, eng 900 chunks / 19.2s
+
+════════════════════════════════════════════════════════════════════
+CONDITION C10 — PAUSE: app-exact buffer, th-TH, on-device, PACED, speech then digital silence
+  request           : SFSpeechAudioBufferRecognitionRequest (paced real-time, 1024-frame chunks)
+  locale            : th-TH
+  requiresOnDevice  : true
+  shouldReportPartial: true
+  addsPunctuation   : true
+  taskHint          : dictation
+  contextualStrings : 20
+  audio             : 12s Thai speech + 10s DIGITAL SILENCE — 22.0s @48kHz mono f32
+────────────────────────────────────────────────────────────────────
+  recognizer: available=true supportsOnDevice=true
+  partial cb#1 segs=1 covered=0.000s wall=0.8s meta=false chars=3
+      segs: [0] t=0.000 d=0.000 "วันนี้"
+  partial cb#3 segs=3 covered=0.000s wall=2.0s meta=false chars=12
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"
+  partial cb#8 segs=5 covered=0.000s wall=3.2s meta=false chars=22
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#13 segs=9 covered=0.000s wall=4.7s meta=false chars=34
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#16 segs=12 covered=0.000s wall=5.9s meta=false chars=44
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#20 segs=16 covered=0.000s wall=7.3s meta=false chars=62
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#25 segs=19 covered=0.000s wall=8.5s meta=false chars=69
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#28 segs=20 covered=0.000s wall=9.7s meta=false chars=79
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#33 segs=23 covered=0.000s wall=10.9s meta=false chars=91
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#36 segs=26 covered=0.000s wall=12.1s meta=false chars=106
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#39 segs=24 covered=11.970s wall=14.3s meta=true chars=105
+      segs: [0] t=0.000 d=0.480 "วันนี้"  [1] t=0.480 d=0.570 "อากาศ"  [2] t=1.050 d=0.540 "ดีมาก"  [3] t=1.590 d=0.570 "ท้องฟ้า"  [4] t=2.250 d=0.480 "แจ่มใส"
+  FINAL   cb#40 segs=1 covered=0.000s wall=22.0s meta=false chars=0
+      segs: [0] t=0.000 d=0.000 ""
+  ── SUMMARY C10 ─────────────────────────────────────────────
+  callbacks: 40 total  (39 partial, 1 final)
+  PARTIALS: maxSegs=27  maxCovered=11.970s  callbacksWithNonZeroCovered=1
+  FINALS  : maxSegs=1  maxCovered=0.000s  callbacksWithNonZeroCovered=0
+  first partial segs: [0] t=0.000 d=0.000 "วันนี้"
+  first final   segs: [0] t=0.000 d=0.000 ""
+  text(0 chars): 
+
+════════════════════════════════════════════════════════════════════
+CONDITION C11 — PAUSE: app-exact buffer, th-TH, on-device, PACED, speech then LOW NOISE
+  request           : SFSpeechAudioBufferRecognitionRequest (paced real-time, 1024-frame chunks)
+  locale            : th-TH
+  requiresOnDevice  : true
+  shouldReportPartial: true
+  addsPunctuation   : true
+  taskHint          : dictation
+  contextualStrings : 20
+  audio             : 12s Thai speech + 10s low noise (-60 dBFS) — 22.0s @48kHz mono f32
+────────────────────────────────────────────────────────────────────
+  recognizer: available=true supportsOnDevice=true
+  partial cb#1 segs=1 covered=0.000s wall=0.8s meta=false chars=3
+      segs: [0] t=0.000 d=0.000 "วันนี้"
+  partial cb#3 segs=3 covered=0.000s wall=2.1s meta=false chars=12
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"
+  partial cb#8 segs=5 covered=0.000s wall=3.2s meta=false chars=22
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#13 segs=9 covered=0.000s wall=4.6s meta=false chars=34
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#16 segs=12 covered=0.000s wall=5.9s meta=false chars=44
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#20 segs=16 covered=0.000s wall=7.3s meta=false chars=62
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#25 segs=19 covered=0.000s wall=8.5s meta=false chars=69
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#28 segs=20 covered=0.000s wall=9.7s meta=false chars=79
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#33 segs=23 covered=0.000s wall=10.9s meta=false chars=91
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#36 segs=26 covered=0.000s wall=12.1s meta=false chars=106
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#39 segs=24 covered=11.970s wall=14.3s meta=true chars=105
+      segs: [0] t=0.000 d=0.510 "วันนี้"  [1] t=0.510 d=0.540 "อากาศ"  [2] t=1.050 d=0.510 "ดีมาก"  [3] t=1.560 d=0.600 "ท้องฟ้า"  [4] t=2.250 d=0.480 "แจ่มใส"
+  FINAL   cb#40 segs=1 covered=0.000s wall=22.0s meta=false chars=0
+      segs: [0] t=0.000 d=0.000 ""
+  ── SUMMARY C11 ─────────────────────────────────────────────
+  callbacks: 40 total  (39 partial, 1 final)
+  PARTIALS: maxSegs=27  maxCovered=11.970s  callbacksWithNonZeroCovered=1
+  FINALS  : maxSegs=1  maxCovered=0.000s  callbacksWithNonZeroCovered=0
+  first partial segs: [0] t=0.000 d=0.000 "วันนี้"
+  first final   segs: [0] t=0.000 d=0.000 ""
+  text(0 chars): 
+
+════════════════════════════════════════════════════════════════════
+CONDITION C12 — PAUSE: app-exact buffer, th-TH, on-device, PACED, speech/silence/speech
+  request           : SFSpeechAudioBufferRecognitionRequest (paced real-time, 1024-frame chunks)
+  locale            : th-TH
+  requiresOnDevice  : true
+  shouldReportPartial: true
+  addsPunctuation   : true
+  taskHint          : dictation
+  contextualStrings : 20
+  audio             : 8s speech + 6s silence + 8s speech — 22.0s @48kHz mono f32
+────────────────────────────────────────────────────────────────────
+  recognizer: available=true supportsOnDevice=true
+  partial cb#1 segs=1 covered=0.000s wall=0.8s meta=false chars=3
+      segs: [0] t=0.000 d=0.000 "วันนี้"
+  partial cb#3 segs=3 covered=0.000s wall=2.1s meta=false chars=12
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"
+  partial cb#8 segs=5 covered=0.000s wall=3.2s meta=false chars=22
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#13 segs=9 covered=0.000s wall=4.6s meta=false chars=34
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#16 segs=12 covered=0.000s wall=5.9s meta=false chars=44
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#20 segs=16 covered=0.000s wall=7.3s meta=false chars=62
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#25 segs=18 covered=0.000s wall=8.5s meta=false chars=69
+      segs: [0] t=0.000 d=0.000 "วันนี้"  [1] t=0.000 d=0.000 "อากาศ"  [2] t=0.000 d=0.000 "ดีมาก"  [3] t=0.000 d=0.000 "ท้องฟ้า"  [4] t=0.000 d=0.000 "แจ่มใส"
+  partial cb#26 segs=16 covered=8.010s wall=10.2s meta=true chars=69
+      segs: [0] t=0.000 d=0.510 "วันนี้"  [1] t=0.510 d=0.540 "อากาศ"  [2] t=1.050 d=0.510 "ดีมาก"  [3] t=1.560 d=0.600 "ท้องฟ้า"  [4] t=2.250 d=0.480 "แจ่มใส"
+  partial cb#27 segs=1 covered=0.000s wall=14.8s meta=false chars=1
+      segs: [0] t=0.000 d=0.000 "ค"
+  partial cb#31 segs=4 covered=0.000s wall=16.2s meta=false chars=14
+      segs: [0] t=0.000 d=0.000 "คัก"  [1] t=0.000 d=0.000 "บางคน"  [2] t=0.000 d=0.000 "วิ่ง"  [3] t=0.000 d=0.000 "บางคน"
+  partial cb#36 segs=7 covered=0.000s wall=17.6s meta=false chars=24
+      segs: [0] t=0.000 d=0.000 "คัก"  [1] t=0.000 d=0.000 "บางคน"  [2] t=0.000 d=0.000 "วิ่ง"  [3] t=0.000 d=0.000 "บางคน"  [4] t=0.000 d=0.000 "ขี่"
+  partial cb#41 segs=9 covered=0.000s wall=19.1s meta=false chars=36
+      segs: [0] t=0.000 d=0.000 "คัก"  [1] t=0.000 d=0.000 "บางคน"  [2] t=0.000 d=0.000 "วิ่ง"  [3] t=0.000 d=0.000 "บางคน"  [4] t=0.000 d=0.000 "ขี่"
+  partial cb#45 segs=12 covered=0.000s wall=20.3s meta=false chars=47
+      segs: [0] t=0.000 d=0.000 "คัก"  [1] t=0.000 d=0.000 "บางคน"  [2] t=0.000 d=0.000 "วิ่ง"  [3] t=0.000 d=0.000 "บางคน"  [4] t=0.000 d=0.000 "ขี่"
+  partial cb#49 segs=15 covered=0.000s wall=21.5s meta=false chars=64
+      segs: [0] t=0.000 d=0.000 "คัก"  [1] t=0.000 d=0.000 "บางคน"  [2] t=0.000 d=0.000 "วิ่ง"  [3] t=0.000 d=0.000 "บางคน"  [4] t=0.000 d=0.000 "ขี่"
+  FINAL   cb#52 segs=12 covered=22.140s wall=22.1s meta=true chars=68
+      segs: [0] t=13.980 d=0.240 "คัก"  [1] t=14.220 d=0.600 "บางคน"  [2] t=14.820 d=0.840 "วิ่งบางคน"  [3] t=15.660 d=0.210 "ขี่"  [4] t=15.870 d=0.990 "จักรยาน"
+  ── SUMMARY C12 ─────────────────────────────────────────────
+  callbacks: 52 total  (51 partial, 1 final)
+  PARTIALS: maxSegs=18  maxCovered=8.010s  callbacksWithNonZeroCovered=1
+  FINALS  : maxSegs=12  maxCovered=22.140s  callbacksWithNonZeroCovered=1
+  first partial segs: [0] t=0.000 d=0.000 "วันนี้"
+  first final   segs: [0] t=13.980 d=0.240 "คัก"  [1] t=14.220 d=0.600 "บางคน"  [2] t=14.820 d=0.840 "วิ่งบางคน"  [3] t=15.660 d=0.210 "ขี่"  [4] t=15.870 d=0.990 "จักรยาน"
+  text(68 chars): คักบางคนวิ่งบางคนขี่จักรยานและมีเด็กเล็กวิ่งเล่นอยู่ริมสนามหญ้าอย่างสนุกสนานหลังจากนั้นผม
+
+=== matrix complete ===

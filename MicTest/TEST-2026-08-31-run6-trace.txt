@@ -1,0 +1,180 @@
+13:57:10  === MicTest launched (background dictation) ===
+13:57:10  bundleIdentifier: com.boombignose.mictest
+13:57:10  bundlePath: /Users/boomvitt/Desktop/MicTest.app
+13:57:10  executablePath: /Users/boomvitt/Desktop/MicTest.app/Contents/MacOS/MicTest
+13:57:10  localWhisperFallbackEnabled=false (WhisperClient.swift is retained but never called; LiveRecognizer drives live text)
+13:57:10  hotkey: keyCode 61 (Right-Option is 61)
+13:57:10  gemini: configured (gemini-3.5-flash); cloud pass OFF by default (enable from the menubar)
+13:57:10  auto-correct from cloud: ON (default — user's choice, see autoCorrectEnabled)
+13:57:10  restart macOS speech service when wedged: ON (default) — watchdog tier 3 may pkill localspeechrecognition
+13:57:10  dictation engine: Apple (on-device) (default — nil means Apple, and audio never leaves this Mac)
+13:57:10  status item installed (variableLength). If it is hidden behind the notch, the floating HUD is the other way in — it never fully hides.
+13:57:10  system-state observers: willSleep + com.apple.screenIsLocked armed (microphone must not outlive the ability to stop it)
+13:57:10  initial authorizationStatus(.audio): authorized
+13:57:10  recognizer: engine=apple appleSupported=true geminiLiveSupported=true geminiLiveAvailable=true contextualStrings=20
+13:57:10  hotkey monitor started; isHealthy=true
+13:57:10  MICTEST_AUTOSTART=1 — simulated hold at t+1.5s, release at t+91.5s (hold 90.0s), quit at t+97.5s
+13:57:10  LiveRecognizer.requestAuthorization() -> true
+13:57:12  AUTOSTART: simulated hotkey press
+13:57:12  beginCapture: micStatus=authorized speechAuthorized=true axTrusted=true
+13:57:12  session: generation 1 installed as delivery owner (first start)
+13:57:12  SYNTH: feeding thai.aiff — 134.1 s, 6285 chunks of 1024 frames @ 48000 Hz
+13:57:12  LOOP[1]: chunk loop not started (cloud pass disabled)
+13:57:12  capture started OK — session 1, generation 1, 48000 Hz / 1 ch
+13:57:12  recogniser state: listening
+13:57:13  partial-lag: covered=0.0s wall=0.9s lag=0.9s segs=1
+13:57:13  replay: ring armed — 48000 Hz ×1, 12 s (2.2 MB)
+13:57:14  partial-lag: covered=0.0s wall=2.1s lag=2.1s segs=3
+13:57:15  partial-lag: covered=0.0s wall=3.3s lag=3.3s segs=5
+13:57:16  LEVEL: rms=0.16857 floor=0.21089 thr=0.63268 peak5s=0.47546 peakThr=1.68715 loudTicksSinceEvent=0 framesDelta=205824 sinceRealOutput=0 s
+13:57:17  partial-lag: covered=0.0s wall=4.7s lag=4.7s segs=9
+13:57:18  partial-lag: covered=0.0s wall=5.9s lag=5.9s segs=12
+13:57:19  partial-lag: covered=0.0s wall=7.4s lag=7.4s segs=16
+13:57:21  partial-lag: covered=0.0s wall=8.5s lag=8.5s segs=19
+13:57:21  DIVERGENCE: repair FAILED — kept 66 common chars, could not replace 3 stale chars with 0 chars — focused element does not accept AX text replacement
+13:57:21  IN-PLACE REPAIR DISABLED: focused app structurally refused it; skipping the attempt for the rest of this capture — typing continues
+13:57:21  DIVERGENCE: re-anchored — kept 66 common chars, left 3 stale chars in the document, typing continues from the recogniser's text — focused element does not accept AX text replacement
+13:57:21  LEVEL: rms=0.15618 floor=0.18319 thr=0.54958 peak5s=0.45015 peakThr=1.46555 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:57:22  partial-lag: covered=0.0s wall=9.8s lag=9.8s segs=20
+13:57:23  partial-lag: covered=0.0s wall=11.0s lag=11.0s segs=23
+13:57:24  partial-lag: covered=0.0s wall=12.2s lag=12.2s segs=26
+13:57:25  partial-lag: covered=0.0s wall=13.4s lag=13.4s segs=28
+13:57:26  DIVERGENCE: re-anchored — kept 115 common chars, left 7 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:26  LEVEL: rms=0.18447 floor=0.13855 thr=0.41564 peak5s=0.45467 peakThr=1.10838 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:57:27  partial-lag: covered=0.0s wall=15.0s lag=15.0s segs=32
+13:57:27  DIVERGENCE: fresh start — 13 stale chars exceeded cap 10; typed full transcript (129 chars) after a separator; the old text stays in the document — this app structurally refuses in-place repair (attempt skipped)
+13:57:28  partial-lag: covered=0.0s wall=16.2s lag=16.2s segs=34
+13:57:29  partial-lag: covered=0.0s wall=17.5s lag=17.5s segs=38
+13:57:31  partial-lag: covered=0.0s wall=18.7s lag=18.7s segs=41
+13:57:31  DIVERGENCE: re-anchored — kept 163 common chars, left 2 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:31  LEVEL: rms=0.24161 floor=0.12680 thr=0.38040 peak5s=0.43009 peakThr=1.01439 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:57:32  rotation: flushing owner 1 at 20 s (endAudio); partial at flush len 172
+13:57:32  partial-lag: covered=0.0s wall=20.1s lag=20.1s segs=41
+13:57:32  rotation: flushed final after 145 ms, +7 chars beyond partial at flush (final 179 vs partial at flush 172); partial then moved +4 after the flush, to 176
+13:57:32  replay: fed 0.1s (1 buffers) from sample 920576; residual 0 ms dropped
+13:57:32  session: generation 3 installed as delivery owner (restart)
+13:57:32  FINAL: 179 chars (raw 179), injected 179 chars, diverged=false
+13:57:32  utterance boundary: reset typed high-water mark (was 179 chars)
+13:57:32  recogniser state: listening
+13:57:33  partial-lag: covered=0.0s wall=0.9s lag=0.9s segs=1
+13:57:34  partial-lag: covered=0.0s wall=2.1s lag=2.1s segs=4
+13:57:35  partial-lag: covered=0.0s wall=3.3s lag=3.3s segs=6
+13:57:35  DIVERGENCE: re-anchored — kept 14 common chars, left 6 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:36  LEVEL: rms=0.17758 floor=0.11631 thr=0.34894 peak5s=0.46930 peakThr=0.93051 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:57:37  partial-lag: covered=0.0s wall=4.8s lag=4.8s segs=11
+13:57:38  partial-lag: covered=0.0s wall=6.0s lag=6.0s segs=15
+13:57:39  partial-lag: covered=0.0s wall=7.1s lag=7.1s segs=17
+13:57:39  DIVERGENCE: re-anchored — kept 48 common chars, left 9 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:40  partial-lag: covered=0.0s wall=8.3s lag=8.3s segs=21
+13:57:41  LEVEL: rms=0.19292 floor=0.11832 thr=0.35496 peak5s=0.45238 peakThr=0.94655 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:57:42  partial-lag: covered=0.0s wall=9.8s lag=9.8s segs=25
+13:57:43  partial-lag: covered=0.0s wall=11.2s lag=11.2s segs=27
+13:57:45  partial-lag: covered=0.0s wall=12.4s lag=12.4s segs=32
+13:57:46  partial-lag: covered=0.0s wall=14.1s lag=14.1s segs=36
+13:57:46  LEVEL: rms=0.00005 floor=0.09009 thr=0.27026 peak5s=0.44232 peakThr=0.72070 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:57:48  partial-lag: covered=0.0s wall=15.6s lag=15.6s segs=38
+13:57:48  DIVERGENCE: re-anchored — kept 136 common chars, left 8 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:49  partial-lag: covered=0.0s wall=17.0s lag=17.0s segs=43
+13:57:50  partial-lag: covered=0.0s wall=18.2s lag=18.2s segs=47
+13:57:51  LEVEL: rms=0.17049 floor=0.09293 thr=0.27878 peak5s=0.42392 peakThr=0.74340 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:57:51  partial-lag: covered=0.0s wall=19.2s lag=19.2s segs=50
+13:57:52  DIVERGENCE: re-anchored — kept 170 common chars, left 4 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:52  rotation: flushing owner 3 at 20 s (endAudio); partial at flush len 181
+13:57:52  rotation: flushed final after 139 ms, +2 chars beyond partial at flush (final 183 vs partial at flush 181); partial then moved +3 after the flush, to 184
+13:57:52  replay: fed 0.1s (1 buffers) from sample 1889280; residual 0 ms dropped
+13:57:52  session: generation 5 installed as delivery owner (restart)
+13:57:52  DIVERGENCE: seam final diverged too deeply (14 stale); re-anchored without retyping — gap text not recovered in this app
+13:57:52  DIVERGENCE: re-anchored (final reconciliation) — kept 170 common chars, left 14 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:52  FINAL: 183 chars (raw 183), injected 183 chars, diverged=false
+13:57:52  utterance boundary: reset typed high-water mark (was 183 chars)
+13:57:52  recogniser state: listening
+13:57:53  partial-lag: covered=0.0s wall=0.7s lag=0.7s segs=1
+13:57:54  partial-lag: covered=0.0s wall=1.9s lag=1.9s segs=4
+13:57:56  partial-lag: covered=0.0s wall=3.3s lag=3.3s segs=7
+13:57:56  LEVEL: rms=0.22306 floor=0.07701 thr=0.23102 peak5s=0.46025 peakThr=0.61606 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:57:56  DIVERGENCE: re-anchored — kept 32 common chars, left 3 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:57:57  partial-lag: covered=0.0s wall=4.5s lag=4.5s segs=14
+13:57:58  partial-lag: covered=0.0s wall=5.7s lag=5.7s segs=16
+13:57:59  partial-lag: covered=0.0s wall=6.9s lag=6.9s segs=19
+13:58:01  partial-lag: covered=0.0s wall=8.4s lag=8.4s segs=22
+13:58:01  LEVEL: rms=0.20698 floor=0.07914 thr=0.23743 peak5s=0.44355 peakThr=0.63315 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:58:02  partial-lag: covered=0.0s wall=9.6s lag=9.6s segs=24
+13:58:03  partial-lag: covered=0.0s wall=11.0s lag=11.0s segs=27
+13:58:05  partial-lag: covered=0.0s wall=12.2s lag=12.2s segs=30
+13:58:06  partial-lag: covered=0.0s wall=13.4s lag=13.4s segs=33
+13:58:06  LEVEL: rms=0.00004 floor=0.07267 thr=0.21801 peak5s=0.42597 peakThr=0.58135 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=1 s
+13:58:07  partial-lag: covered=0.0s wall=14.6s lag=14.6s segs=36
+13:58:08  DIVERGENCE: re-anchored — kept 132 common chars, left 2 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:08  DIVERGENCE: re-anchored — kept 138 common chars, left 2 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:08  partial-lag: covered=0.0s wall=15.8s lag=15.8s segs=38
+13:58:10  partial-lag: covered=0.0s wall=17.3s lag=17.3s segs=41
+13:58:11  partial-lag: covered=0.0s wall=18.7s lag=18.7s segs=44
+13:58:11  LEVEL: rms=0.14958 floor=0.07518 thr=0.22554 peak5s=0.41897 peakThr=0.60145 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:58:12  partial-lag: covered=0.0s wall=19.9s lag=19.9s segs=47
+13:58:12  rotation: flushing owner 5 at 20 s (endAudio); partial at flush len 189
+13:58:12  rotation: flushed final after 161 ms, -4 chars beyond partial at flush (final 185 vs partial at flush 189)
+13:58:12  replay: fed 0.2s (1 buffers) from sample 2855936; residual 0 ms dropped
+13:58:12  session: generation 7 installed as delivery owner (restart)
+13:58:12  DIVERGENCE: seam final diverged too deeply (179 stale); re-anchored without retyping — gap text not recovered in this app
+13:58:12  DIVERGENCE: re-anchored (final reconciliation) — kept 10 common chars, left 179 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:12  FINAL: 185 chars (raw 185), injected 185 chars, diverged=false
+13:58:12  utterance boundary: reset typed high-water mark (was 185 chars)
+13:58:12  recogniser state: listening
+13:58:13  partial-lag: covered=0.0s wall=0.4s lag=0.4s segs=1
+13:58:14  partial-lag: covered=0.0s wall=1.6s lag=1.6s segs=2
+13:58:14  DIVERGENCE: re-anchored — kept 9 common chars, left 1 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:15  partial-lag: covered=0.0s wall=2.8s lag=2.8s segs=5
+13:58:16  LEVEL: rms=0.00441 floor=0.06276 thr=0.18828 peak5s=0.43807 peakThr=0.50209 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:58:16  partial-lag: covered=0.0s wall=4.0s lag=4.0s segs=7
+13:58:18  partial-lag: covered=0.0s wall=5.2s lag=5.2s segs=9
+13:58:19  partial-lag: covered=0.0s wall=6.4s lag=6.4s segs=13
+13:58:20  partial-lag: covered=0.0s wall=7.6s lag=7.6s segs=15
+13:58:20  DIVERGENCE: re-anchored — kept 59 common chars, left 2 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:21  DIVERGENCE: re-anchored — kept 71 common chars, left 5 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:21  LEVEL: rms=0.14642 floor=0.06451 thr=0.19353 peak5s=0.45224 peakThr=0.51609 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:58:22  partial-lag: covered=0.0s wall=9.1s lag=9.1s segs=19
+13:58:23  partial-lag: covered=0.0s wall=10.3s lag=10.3s segs=21
+13:58:24  partial-lag: covered=0.0s wall=11.5s lag=11.5s segs=25
+13:58:24  DIVERGENCE: re-anchored — kept 94 common chars, left 5 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:24  DIVERGENCE: re-anchored — kept 94 common chars, left 8 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:25  partial-lag: covered=0.0s wall=12.7s lag=12.7s segs=28
+13:58:25  DIVERGENCE: re-anchored — kept 105 common chars, left 4 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:26  LEVEL: rms=0.11422 floor=0.06646 thr=0.19939 peak5s=0.46645 peakThr=0.53172 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=1 s
+13:58:27  partial-lag: covered=0.0s wall=14.6s lag=14.6s segs=30
+13:58:27  DIVERGENCE: fresh start — 12 stale chars exceeded cap 10; typed full transcript (120 chars) after a separator; the old text stays in the document — this app structurally refuses in-place repair (attempt skipped)
+13:58:29  partial-lag: covered=0.0s wall=16.0s lag=16.0s segs=35
+13:58:30  partial-lag: covered=0.0s wall=17.5s lag=17.5s segs=37
+13:58:30  DIVERGENCE: re-anchored — kept 131 common chars, left 7 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:30  DIVERGENCE: fresh start — 11 stale chars exceeded cap 10; typed full transcript (144 chars) after a separator; the old text stays in the document — this app structurally refuses in-place repair (attempt skipped)
+13:58:31  partial-lag: covered=0.0s wall=18.7s lag=18.7s segs=40
+13:58:31  LEVEL: rms=0.17777 floor=0.06329 thr=0.18986 peak5s=0.44663 peakThr=0.50628 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:58:32  partial-lag: covered=0.0s wall=19.9s lag=19.9s segs=43
+13:58:32  rotation: flushing owner 7 at 20 s (endAudio); partial at flush len 170
+13:58:33  rotation: flushed final after 140 ms, +6 chars beyond partial at flush (final 176 vs partial at flush 170); partial then moved +2 after the flush, to 172
+13:58:33  replay: fed 0.1s (1 buffers) from sample 3824640; residual 0 ms dropped
+13:58:33  session: generation 9 installed as delivery owner (restart)
+13:58:33  DIVERGENCE: seam final diverged too deeply (58 stale); re-anchored without retyping — gap text not recovered in this app
+13:58:33  DIVERGENCE: re-anchored (final reconciliation) — kept 114 common chars, left 58 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:33  FINAL: 176 chars (raw 176), injected 176 chars, diverged=false
+13:58:33  utterance boundary: reset typed high-water mark (was 176 chars)
+13:58:33  recogniser state: listening
+13:58:33  partial-lag: covered=0.0s wall=0.7s lag=0.7s segs=1
+13:58:35  partial-lag: covered=0.0s wall=2.1s lag=2.1s segs=5
+13:58:36  partial-lag: covered=0.0s wall=3.6s lag=3.6s segs=8
+13:58:36  LEVEL: rms=0.00004 floor=0.05258 thr=0.15774 peak5s=0.43269 peakThr=0.42064 loudTicksSinceEvent=1 framesDelta=239616 sinceRealOutput=0 s
+13:58:37  DIVERGENCE: re-anchored — kept 35 common chars, left 1 stale chars in the document, typing continues from the recogniser's text — this app structurally refuses in-place repair (attempt skipped)
+13:58:37  partial-lag: covered=0.0s wall=4.8s lag=4.8s segs=11
+13:58:39  partial-lag: covered=0.0s wall=6.0s lag=6.0s segs=15
+13:58:40  partial-lag: covered=0.0s wall=7.2s lag=7.2s segs=19
+13:58:41  partial-lag: covered=0.0s wall=8.4s lag=8.4s segs=22
+13:58:41  LEVEL: rms=0.14276 floor=0.05530 thr=0.16590 peak5s=0.42968 peakThr=0.44239 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:58:42  AUTOSTART: simulated hotkey release
+13:58:42  endCapture(hotkey released): recogniser stopped; draining audio for 0.9 s
+13:58:42  FINAL: 82 chars (raw 82), injected 82 chars, diverged=false
+13:58:42  recogniser state: idle
+13:58:43  SYNTH: stopped — fed 4251 buffers, 90.7 s of audio
+13:58:43  capture stopped (release drain complete); engine=apple frames=4353024 rms=0.13270 floor=0.05577 thr=0.16731 partials=263 coalesced=27 finals=5 injectedChars=1179 divergencesRepaired=0 divergencesRefused=21 freshStarts=3 injectFailures=0 secureInputRefusals=0 finalChunks=0 cloudSent=0 cloudApplied=0 cloudUnapplied=0 cloudErrors=0 cloudEmpty=0 cloudSkipped=0  [lifetime: sessions=1 partials=263 coalesced=27 finals=5 injectedChars=1179 divergencesRepaired=0 divergencesRefused=21 freshStarts=3 injectFailures=0 secureInputRefusals=0 finalChunks=0 cloudSent=0 cloudApplied=0 cloudUnapplied=0 cloudErrors=0 cloudEmpty=0 cloudSkipped=0]
+13:58:43  recogniser state: idle
+13:58:48  AUTOSTART SUMMARY: sessions=1 frames=4353024 micStatus=authorized speechAuthorized=true recognizerSupported=true axTrusted=true tapHealthy=true partials=263 finals=5 injectedChars=1179 injectFailures=0 divergencesRepaired=0 divergencesRefused=21 secureInputRefusals=0
+13:58:48  AUTOSTART CLOUD SUMMARY: available=true enabled=false finalChunks=0 sent=0 applied=0 unapplied=0 errors=0 skipped=0 lastCloudLatency=— setupError=(none) spentSeconds=0 spentRequests=0 spentAudioTokens=0 lastOutcome=Kept typing; 1 stale character(s) left in the text
+13:58:48  === MicTest terminating ===

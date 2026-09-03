@@ -1,0 +1,178 @@
+13:44:24  === MicTest launched (background dictation) ===
+13:44:24  bundleIdentifier: com.boombignose.mictest
+13:44:24  bundlePath: /Users/boomvitt/Desktop/MicTest.app
+13:44:24  executablePath: /Users/boomvitt/Desktop/MicTest.app/Contents/MacOS/MicTest
+13:44:24  localWhisperFallbackEnabled=false (WhisperClient.swift is retained but never called; LiveRecognizer drives live text)
+13:44:24  hotkey: keyCode 61 (Right-Option is 61)
+13:44:24  gemini: configured (gemini-3.5-flash); cloud pass OFF by default (enable from the menubar)
+13:44:24  auto-correct from cloud: ON (default — user's choice, see autoCorrectEnabled)
+13:44:24  restart macOS speech service when wedged: ON (default) — watchdog tier 3 may pkill localspeechrecognition
+13:44:24  dictation engine: Apple (on-device) (default — nil means Apple, and audio never leaves this Mac)
+13:44:24  status item installed (variableLength). If it is hidden behind the notch, the floating HUD is the other way in — it never fully hides.
+13:44:24  system-state observers: willSleep + com.apple.screenIsLocked armed (microphone must not outlive the ability to stop it)
+13:44:24  initial authorizationStatus(.audio): authorized
+13:44:24  recognizer: engine=apple appleSupported=true geminiLiveSupported=true geminiLiveAvailable=true contextualStrings=20
+13:44:24  hotkey monitor started; isHealthy=true
+13:44:24  MICTEST_AUTOSTART=1 — simulated hold at t+1.5s, release at t+91.5s (hold 90.0s), quit at t+97.5s
+13:44:24  LiveRecognizer.requestAuthorization() -> true
+13:44:25  AUTOSTART: simulated hotkey press
+13:44:25  beginCapture: micStatus=authorized speechAuthorized=true axTrusted=true
+13:44:25  session: generation 1 installed as delivery owner (first start)
+13:44:25  SYNTH: feeding thai.aiff — 134.1 s, 6285 chunks of 1024 frames @ 48000 Hz
+13:44:25  LOOP[1]: chunk loop not started (cloud pass disabled)
+13:44:25  capture started OK — session 1, generation 1, 48000 Hz / 1 ch
+13:44:25  recogniser state: listening
+13:44:26  partial-lag: covered=0.0s wall=0.9s lag=0.9s segs=1
+13:44:26  replay: ring armed — 48000 Hz ×1, 12 s (2.2 MB)
+13:44:27  partial-lag: covered=0.0s wall=2.1s lag=2.1s segs=3
+13:44:29  partial-lag: covered=0.0s wall=3.3s lag=3.3s segs=5
+13:44:30  LEVEL: rms=0.17780 floor=0.21547 thr=0.64642 peak5s=0.47546 peakThr=1.72378 loudTicksSinceEvent=0 framesDelta=206848 sinceRealOutput=0 s
+13:44:30  partial-lag: covered=0.0s wall=4.7s lag=4.7s segs=9
+13:44:31  partial-lag: covered=0.0s wall=5.9s lag=5.9s segs=12
+13:44:33  partial-lag: covered=0.0s wall=7.4s lag=7.4s segs=16
+13:44:34  partial-lag: covered=0.0s wall=8.6s lag=8.6s segs=19
+13:44:34  DIVERGENCE: repaired in place — kept 66 common chars, replaced 3 stale chars with 0 chars (RETRACTION: pure delete)
+13:44:35  LEVEL: rms=0.15618 floor=0.18529 thr=0.55587 peak5s=0.45015 peakThr=1.48231 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:44:35  partial-lag: covered=0.0s wall=9.8s lag=9.8s segs=20
+13:44:36  partial-lag: covered=0.0s wall=11.0s lag=11.0s segs=23
+13:44:38  partial-lag: covered=0.0s wall=12.2s lag=12.2s segs=26
+13:44:38  DIVERGENCE: repaired in place — kept 106 common chars, replaced 1 stale chars with 2 chars
+13:44:39  partial-lag: covered=0.0s wall=13.3s lag=13.3s segs=28
+13:44:40  DIVERGENCE: repaired in place — kept 115 common chars, replaced 7 stale chars with 7 chars
+13:44:40  LEVEL: rms=0.18726 floor=0.15554 thr=0.46662 peak5s=0.45467 peakThr=1.24433 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:44:40  partial-lag: covered=0.0s wall=15.0s lag=15.0s segs=32
+13:44:40  DIVERGENCE: repaired in place — kept 115 common chars, replaced 7 stale chars with 14 chars
+13:44:42  partial-lag: covered=0.0s wall=16.2s lag=16.2s segs=34
+13:44:43  partial-lag: covered=0.0s wall=17.4s lag=17.4s segs=38
+13:44:44  DIVERGENCE: repaired in place — kept 155 common chars, replaced 3 stale chars with 4 chars
+13:44:44  partial-lag: covered=0.0s wall=18.6s lag=18.6s segs=41
+13:44:44  DIVERGENCE: repaired in place — kept 163 common chars, replaced 2 stale chars with 3 chars
+13:44:45  LEVEL: rms=0.19239 floor=0.14218 thr=0.42655 peak5s=0.43009 peakThr=1.13747 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:44:45  partial-lag: covered=0.0s wall=20.1s lag=20.1s segs=41
+13:44:45  rotation: flushing owner 1 at 20 s (endAudio); partial at flush len 174
+13:44:46  rotation: flushed final after 127 ms, +5 chars beyond partial at flush (final 179 vs partial at flush 174); partial then moved +5 after the flush, to 179
+13:44:46  replay: fed 0.1s (1 buffers) from sample 922624; residual 0 ms dropped
+13:44:46  session: generation 3 installed as delivery owner (restart)
+13:44:46  FINAL: 179 chars (raw 179), injected 179 chars, diverged=false
+13:44:46  utterance boundary: reset typed high-water mark (was 179 chars)
+13:44:46  recogniser state: listening
+13:44:47  partial-lag: covered=0.0s wall=1.0s lag=1.0s segs=1
+13:44:48  partial-lag: covered=0.0s wall=2.4s lag=2.4s segs=4
+13:44:49  DIVERGENCE: repaired in place — kept 14 common chars, replaced 5 stale chars with 6 chars
+13:44:49  partial-lag: covered=0.0s wall=3.8s lag=3.8s segs=8
+13:44:50  LEVEL: rms=0.17758 floor=0.11945 thr=0.35836 peak5s=0.46930 peakThr=0.95563 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:44:51  partial-lag: covered=0.0s wall=5.1s lag=5.1s segs=12
+13:44:51  DIVERGENCE: repaired in place — kept 36 common chars, replaced 2 stale chars with 2 chars
+13:44:52  partial-lag: covered=0.0s wall=6.2s lag=6.2s segs=16
+13:44:53  partial-lag: covered=0.0s wall=7.4s lag=7.4s segs=18
+13:44:55  partial-lag: covered=0.0s wall=9.1s lag=9.1s segs=22
+13:44:55  LEVEL: rms=0.20292 floor=0.12108 thr=0.36324 peak5s=0.45238 peakThr=0.96864 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:44:56  partial-lag: covered=0.0s wall=10.8s lag=10.8s segs=26
+13:44:58  partial-lag: covered=0.0s wall=12.0s lag=12.0s segs=30
+13:44:59  partial-lag: covered=0.0s wall=13.4s lag=13.4s segs=34
+13:45:00  LEVEL: rms=0.00005 floor=0.09208 thr=0.27624 peak5s=0.44232 peakThr=0.73664 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:45:00  partial-lag: covered=0.0s wall=14.9s lag=14.9s segs=37
+13:45:02  partial-lag: covered=0.0s wall=16.1s lag=16.1s segs=39
+13:45:03  partial-lag: covered=0.0s wall=17.3s lag=17.3s segs=42
+13:45:04  partial-lag: covered=0.0s wall=18.5s lag=18.5s segs=46
+13:45:05  LEVEL: rms=0.17049 floor=0.09488 thr=0.28465 peak5s=0.42392 peakThr=0.75905 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:45:05  partial-lag: covered=0.0s wall=19.6s lag=19.6s segs=50
+13:45:05  DIVERGENCE: repaired in place — kept 171 common chars, replaced 7 stale chars with 8 chars
+13:45:06  rotation: flushing owner 3 at 20 s (endAudio); partial at flush len 179
+13:45:06  DIVERGENCE: repaired in place — kept 170 common chars, replaced 9 stale chars with 13 chars
+13:45:06  rotation: flushed final after 118 ms, +0 chars beyond partial at flush (final 173 vs partial at flush 179); partial then moved +4 after the flush, to 183
+13:45:06  replay: fed 0.1s (1 buffers) from sample 1893376; residual 0 ms dropped
+13:45:06  session: generation 5 installed as delivery owner (restart)
+13:45:06  DIVERGENCE: repaired in place (final reconciliation) — kept 90 common chars, replaced 93 stale chars with 83 chars
+13:45:06  FINAL: 173 chars (raw 173), injected 173 chars, diverged=false
+13:45:06  utterance boundary: reset typed high-water mark (was 173 chars)
+13:45:06  recogniser state: listening
+13:45:06  partial-lag: covered=0.0s wall=0.7s lag=0.7s segs=1
+13:45:08  partial-lag: covered=0.0s wall=1.7s lag=1.7s segs=3
+13:45:09  partial-lag: covered=0.0s wall=3.2s lag=3.2s segs=6
+13:45:10  LEVEL: rms=0.18568 floor=0.08596 thr=0.25787 peak5s=0.46025 peakThr=0.68764 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:45:10  partial-lag: covered=0.0s wall=4.3s lag=4.3s segs=12
+13:45:11  partial-lag: covered=0.0s wall=5.5s lag=5.5s segs=14
+13:45:13  partial-lag: covered=0.0s wall=7.0s lag=7.0s segs=17
+13:45:14  partial-lag: covered=0.0s wall=8.2s lag=8.2s segs=20
+13:45:15  LEVEL: rms=0.15038 floor=0.08681 thr=0.26043 peak5s=0.44355 peakThr=0.69448 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:45:15  partial-lag: covered=0.0s wall=9.6s lag=9.6s segs=22
+13:45:16  DIVERGENCE: repaired in place — kept 73 common chars, replaced 6 stale chars with 6 chars
+13:45:17  partial-lag: covered=0.0s wall=10.8s lag=10.8s segs=26
+13:45:18  partial-lag: covered=0.0s wall=12.0s lag=12.0s segs=29
+13:45:19  partial-lag: covered=0.0s wall=13.5s lag=13.5s segs=32
+13:45:20  LEVEL: rms=0.00004 floor=0.07965 thr=0.23895 peak5s=0.42597 peakThr=0.63721 loudTicksSinceEvent=0 framesDelta=238592 sinceRealOutput=0 s
+13:45:20  partial-lag: covered=0.0s wall=14.7s lag=14.7s segs=35
+13:45:22  partial-lag: covered=0.0s wall=15.9s lag=15.9s segs=37
+13:45:23  partial-lag: covered=0.0s wall=17.1s lag=17.1s segs=40
+13:45:24  partial-lag: covered=0.0s wall=18.5s lag=18.5s segs=43
+13:45:25  LEVEL: rms=0.04827 floor=0.07831 thr=0.23494 peak5s=0.41897 peakThr=0.62650 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:45:26  partial-lag: covered=0.0s wall=19.9s lag=19.9s segs=46
+13:45:26  rotation: flushing owner 5 at 20 s (endAudio); partial at flush len 185
+13:45:26  rotation: flushed final after 121 ms, +3 chars beyond partial at flush (final 188 vs partial at flush 185)
+13:45:26  replay: fed 0.1s (1 buffers) from sample 2861056; residual 0 ms dropped
+13:45:26  session: generation 7 installed as delivery owner (restart)
+13:45:26  DIVERGENCE: repaired in place (final reconciliation) — kept 10 common chars, replaced 175 stale chars with 178 chars
+13:45:26  FINAL: 188 chars (raw 188), injected 188 chars, diverged=false
+13:45:26  utterance boundary: reset typed high-water mark (was 188 chars)
+13:45:26  recogniser state: listening
+13:45:27  partial-lag: covered=0.0s wall=0.7s lag=0.7s segs=1
+13:45:27  DIVERGENCE: repaired in place — kept 1 common chars, replaced 2 stale chars with 5 chars
+13:45:28  partial-lag: covered=0.0s wall=2.2s lag=2.2s segs=5
+13:45:28  DIVERGENCE: repaired in place — kept 6 common chars, replaced 8 stale chars with 13 chars
+13:45:29  DIVERGENCE: repaired in place — kept 19 common chars, replaced 3 stale chars with 0 chars (RETRACTION: pure delete)
+13:45:29  DIVERGENCE: repaired in place — kept 1 common chars, replaced 18 stale chars with 22 chars
+13:45:29  partial-lag: covered=0.0s wall=3.3s lag=3.3s segs=6
+13:45:30  LEVEL: rms=0.00441 floor=0.05993 thr=0.17980 peak5s=0.43807 peakThr=0.47946 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:45:30  partial-lag: covered=0.0s wall=4.5s lag=4.5s segs=8
+13:45:32  partial-lag: covered=0.0s wall=5.8s lag=5.8s segs=11
+13:45:33  partial-lag: covered=0.0s wall=7.0s lag=7.0s segs=15
+13:45:34  partial-lag: covered=0.0s wall=8.2s lag=8.2s segs=18
+13:45:35  LEVEL: rms=0.15098 floor=0.05637 thr=0.16910 peak5s=0.45224 peakThr=0.45093 loudTicksSinceEvent=0 framesDelta=240640 sinceRealOutput=0 s
+13:45:35  partial-lag: covered=0.0s wall=9.4s lag=9.4s segs=21
+13:45:37  partial-lag: covered=0.0s wall=10.8s lag=10.8s segs=24
+13:45:38  partial-lag: covered=0.0s wall=12.2s lag=12.2s segs=28
+13:45:38  DIVERGENCE: repaired in place — kept 101 common chars, replaced 5 stale chars with 4 chars
+13:45:40  partial-lag: covered=0.0s wall=13.7s lag=13.7s segs=31
+13:45:40  LEVEL: rms=0.06194 floor=0.05648 thr=0.16944 peak5s=0.46645 peakThr=0.45183 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:45:40  DIVERGENCE: repaired in place — kept 101 common chars, replaced 12 stale chars with 13 chars
+13:45:41  DIVERGENCE: repaired in place — kept 101 common chars, replaced 16 stale chars with 17 chars
+13:45:41  partial-lag: covered=0.0s wall=14.9s lag=14.9s segs=33
+13:45:42  DIVERGENCE: repaired in place — kept 118 common chars, replaced 8 stale chars with 8 chars
+13:45:42  partial-lag: covered=0.0s wall=16.1s lag=16.1s segs=36
+13:45:43  partial-lag: covered=0.0s wall=17.3s lag=17.3s segs=39
+13:45:44  DIVERGENCE: repaired in place — kept 141 common chars, replaced 3 stale chars with 12 chars
+13:45:44  partial-lag: covered=0.0s wall=18.5s lag=18.5s segs=42
+13:45:45  LEVEL: rms=0.17777 floor=0.05957 thr=0.17871 peak5s=0.44663 peakThr=0.47655 loudTicksSinceEvent=0 framesDelta=239616 sinceRealOutput=0 s
+13:45:46  partial-lag: covered=0.0s wall=19.9s lag=19.9s segs=45
+13:45:46  rotation: flushing owner 7 at 20 s (endAudio); partial at flush len 173
+13:45:46  rotation: flushed final after 148 ms, +3 chars beyond partial at flush (final 176 vs partial at flush 173); partial then moved +4 after the flush, to 177
+13:45:46  replay: fed 0.1s (1 buffers) from sample 3828736; residual 0 ms dropped
+13:45:46  session: generation 9 installed as delivery owner (restart)
+13:45:46  DIVERGENCE: repaired in place (final reconciliation) — kept 110 common chars, replaced 67 stale chars with 66 chars
+13:45:46  FINAL: 176 chars (raw 176), injected 176 chars, diverged=false
+13:45:46  utterance boundary: reset typed high-water mark (was 176 chars)
+13:45:46  recogniser state: listening
+13:45:47  partial-lag: covered=0.0s wall=0.7s lag=0.7s segs=1
+13:45:48  partial-lag: covered=0.0s wall=1.9s lag=1.9s segs=5
+13:45:50  LEVEL: rms=0.00004 floor=0.04949 thr=0.14846 peak5s=0.43269 peakThr=0.39590 loudTicksSinceEvent=1 framesDelta=240640 sinceRealOutput=1 s
+13:45:50  partial-lag: covered=0.0s wall=3.6s lag=3.6s segs=8
+13:45:50  DIVERGENCE: repaired in place — kept 35 common chars, replaced 1 stale chars with 2 chars
+13:45:51  partial-lag: covered=0.0s wall=4.8s lag=4.8s segs=12
+13:45:52  partial-lag: covered=0.0s wall=5.9s lag=5.9s segs=15
+13:45:52  DIVERGENCE: repaired in place — kept 51 common chars, replaced 6 stale chars with 8 chars
+13:45:52  DIVERGENCE: repaired in place — kept 55 common chars, replaced 4 stale chars with 0 chars (RETRACTION: pure delete)
+13:45:53  partial-lag: covered=0.0s wall=7.1s lag=7.1s segs=19
+13:45:55  partial-lag: covered=0.0s wall=8.4s lag=8.4s segs=23
+13:45:55  LEVEL: rms=0.14276 floor=0.05228 thr=0.15685 peak5s=0.42968 peakThr=0.41826 loudTicksSinceEvent=1 framesDelta=239616 sinceRealOutput=0 s
+13:45:55  AUTOSTART: simulated hotkey release
+13:45:55  endCapture(hotkey released): recogniser stopped; draining audio for 0.9 s
+13:45:55  DIVERGENCE: repaired in place (final reconciliation) — kept 35 common chars, replaced 44 stale chars with 49 chars
+13:45:55  FINAL: 84 chars (raw 84), injected 84 chars, diverged=false
+13:45:55  recogniser state: idle
+13:45:56  capture stopped (release drain complete); engine=apple frames=4354048 rms=0.19950 floor=0.05281 thr=0.15843 partials=258 coalesced=24 finals=5 injectedChars=1317 divergencesRepaired=27 divergencesRefused=0 freshStarts=0 injectFailures=0 secureInputRefusals=0 finalChunks=0 cloudSent=0 cloudApplied=0 cloudUnapplied=0 cloudErrors=0 cloudEmpty=0 cloudSkipped=0  [lifetime: sessions=1 partials=258 coalesced=24 finals=5 injectedChars=1317 divergencesRepaired=27 divergencesRefused=0 freshStarts=0 injectFailures=0 secureInputRefusals=0 finalChunks=0 cloudSent=0 cloudApplied=0 cloudUnapplied=0 cloudErrors=0 cloudEmpty=0 cloudSkipped=0]
+13:45:56  SYNTH: stopped — fed 4252 buffers, 90.7 s of audio
+13:45:56  recogniser state: idle
+13:46:01  AUTOSTART SUMMARY: sessions=1 frames=4354048 micStatus=authorized speechAuthorized=true recognizerSupported=true axTrusted=true tapHealthy=true partials=258 finals=5 injectedChars=1317 injectFailures=0 divergencesRepaired=27 divergencesRefused=0 secureInputRefusals=0
+13:46:01  AUTOSTART CLOUD SUMMARY: available=true enabled=false finalChunks=0 sent=0 applied=0 unapplied=0 errors=0 skipped=0 lastCloudLatency=— setupError=(none) spentSeconds=0 spentRequests=0 spentAudioTokens=0 lastOutcome=(none)
+13:46:01  === MicTest terminating ===

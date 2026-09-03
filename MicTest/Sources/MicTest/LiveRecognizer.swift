@@ -189,11 +189,11 @@ final class LiveRecognizer: @unchecked Sendable {
     /// ── THE SEAM PROBE GRADUATED INTO THE MECHANISM ──────────────────────────────────
     /// A one-shot, env-gated probe (`MICTEST_FLUSH_SEAM=1`) used to convert the first
     /// rotation of a run into an `endAudio()` flush purely to measure two numbers: how many
-    /// characters the flushed final adds beyond the last partial (what the seam was losing)
-    /// and how long the flush takes (what fixing it would cost in latency). Both numbers
-    /// are now taken at EVERY seam, because every rotation is a flush — the probe's
+    /// characters the flushed final moves beyond the partial at flush (what the seam was
+    /// losing) and how long the flush takes (what fixing it would cost in latency). Both
+    /// numbers are now taken at EVERY seam, because every rotation is a flush — the probe's
     /// measurement is the mechanism's routine trace line (`rotation: flushed final …
-    /// +N chars beyond last partial`). The env gate, the per-run arming flag and the
+    /// ±N chars beyond partial at flush`). The env gate, the per-run arming flag and the
     /// parallel probe rotation are gone with it; nothing about the measurement is.
     ///
     /// Minimum spacing between `partial-lag:` lines. Partials arrive many times per second
@@ -251,12 +251,15 @@ final class LiveRecognizer: @unchecked Sendable {
         /// already holds: partials keep arriving between the flush and the final, and each
         /// one walks `lastPartialLength` up toward the final's length. Measuring the seam
         /// against the live field therefore subtracts the post-flush refinement from the
-        /// very quantity the seam line exists to report, making every `+N` a LOWER BOUND —
-        /// and it let the flush line and the final line print different numbers under the
-        /// same name `last partial`. (`TEST-2026-08-30-seam.md` caught the extreme case in
-        /// its own table: a "last partial" of 184 against a final of 183, which is only
-        /// possible when the baseline moved after the flush.) This field is the one both
-        /// lines now quote, so they agree by construction.
+        /// very quantity the seam line exists to report, making every such `±N` a LOWER
+        /// BOUND — and it let the flush line and the final line print different numbers
+        /// under the same name `last partial`. (`TEST-2026-08-30-seam.md` caught the extreme
+        /// case in its own table: a "last partial" of 184 against a final of 183. That report
+        /// read it as proof the baseline had moved, and for those runs it was — but it is
+        /// NOT the only cause, and saying so was wrong. `TEST-2026-08-31-seam-rerun.md`
+        /// measured a final SHORTER than a LATCHED baseline, 173 against 179: Speech retracts
+        /// as well as extends, and a shrinking final is a real outcome on its own.) This
+        /// field is the one both lines now quote, so they agree by construction.
         var flushBaseline = 0
         /// Whether this flush's single outcome line has been claimed. A flush has three
         /// racing reporters — the flushed final in `handle`, the error path when the flush
@@ -358,10 +361,14 @@ final class LiveRecognizer: @unchecked Sendable {
     /// ── PER SESSION, NOT PER RUN: THE FIRST LINE IS THE PAYLOAD ─────────────────────
     /// Reset in `beginSession`'s install critical section, as well as in `start()`, so the
     /// first admitted partial of every session always traces. That is load-bearing, not
-    /// politeness about sampler fairness: a successor's FIRST line is the only place the
-    /// replay verdict appears. It is where a `covered` that already spans the replayed
-    /// window is read against a `wall` of nearly zero, which is what answers whether the
-    /// pre-task appends were retained at all (the assumption named in `beginSession`).
+    /// politeness about sampler fairness: a successor's FIRST line is the only place a
+    /// replay verdict could ever appear — a `covered` already spanning the replayed window,
+    /// read against a `wall` of nearly zero. That reading is INERT in the steady state:
+    /// `covered` is pinned at 0 while speech is continuous, so it answers nothing about
+    /// whether the pre-task appends were retained (see the rule at the `partial-lag` line
+    /// in `handle`, and the standing assumption in `beginSession`). The line is still reset
+    /// per session so that the one untested case which could produce a verdict — a replay
+    /// window whose audio ends in silence — would not be sampled away if it ever fires.
     /// As a purely global 1 Hz sampler that exact line was the one most likely to be
     /// suppressed: at 2-4 partials/s the predecessor has almost always printed within the
     /// previous second, and a seam is precisely when partials are flowing. Nothing else is
@@ -709,13 +716,43 @@ final class LiveRecognizer: @unchecked Sendable {
         // false the replay is a silent no-op that still traces `replay: fed 1.8s` — the
         // worst kind of failure, which is why it is written down here rather than assumed.
         //
-        // The discriminator is already in the trace: at the first seam, compare the
-        // `replay: fed Xs` line with the successor's first `partial-lag:` line. If the
-        // pre-task audio is retained, `covered=` starts high — roughly the window — because
-        // the request really did hear it. If `covered=` starts near zero, it did not, and
-        // the fix is to move `recognitionTask` above the replay and accept that partials
-        // arriving before the install are dropped by the alive check (cheap: partials are
-        // cumulative, so the first one after the install still carries the window's text).
+        // ── THE `covered=` TEST THIS BLOCK USED TO NAME IS INERT — DO NOT USE IT ──────
+        // It used to read: at the first seam compare the `replay: fed Xs` line with the
+        // successor's first `partial-lag:` line; a `covered=` starting high — roughly the
+        // window — means the pre-task audio was retained, near zero means it was not.
+        // That test cannot fire in the steady state this app is actually observed in.
+        // Segment timestamps are non-zero only on a result carrying
+        // `speechRecognitionMetadata`, and continuous speech never produces one — the rule
+        // and its evidence are at the `partial-lag` line in `handle` — so `covered` is
+        // pinned at 0, `lag = wall - 0 = wall` is always positive, and the NEGATIVE reading
+        // the old instruction waited for can never appear. Positive at every seam of the
+        // latest run. Do NOT read a positive first `lag` as the replay being broken: it
+        // says nothing either way.
+        //
+        // Inert is not structurally dead, and the difference is not decoration. One case
+        // is untested rather than ruled out: a replay window whose audio ENDS IN SILENCE
+        // could make the successor's first partial an endpointed, metadata-bearing one,
+        // which would carry real timestamps and could then read negative. Nothing has
+        // exercised that, so it is neither the verdict nor excluded.
+        //
+        // What IS evidence today is the FEED side: `replay: fed Xs` with a non-zero
+        // duration, i.e. real audio found in the ring and handed to `request.append`. Its
+        // two halves carry DIFFERENT counts and must not be quoted as one. `fed Xs` is on
+        // record for all 18 seams of the six runs — 10 across runs 1-4, tabulated in
+        // `TEST-2026-08-30-seam.md`, plus 4 each in the run 5 and run 6 traces. The
+        // `residual 0 ms dropped` half is on record for only 10 of those: the 2 of
+        // `TEST-2026-08-30-run4-trace.txt` and the 4 each of
+        // `TEST-2026-08-31-run5-trace.txt` and `TEST-2026-08-31-run6-trace.txt`. Runs 1-3
+        // are absent from that half because their raw traces were truncated, NOT because a
+        // non-zero residual was seen. That is the feed observed, NOT the retention.
+        // Whether Speech held it until its task began draining is still inferred, which is
+        // why the assumption above stays named rather than closed.
+        //
+        // If it ever is falsified, the fix is unchanged: move `recognitionTask` above the
+        // replay and accept that partials arriving before the install are dropped by the
+        // alive check (cheap: partials are cumulative, so the first one after the install
+        // still carries the window's text). That needs evidence the retention actually
+        // failed, and no such evidence exists.
         //
         // Do NOT "pre-emptively" reorder without that evidence. Creating the task first
         // opens a real hazard in exchange for an imagined one: a window that ends in silence
@@ -955,7 +992,7 @@ final class LiveRecognizer: @unchecked Sendable {
                 if flushStartedAt != nil { session.flushOutcomeReported = true }
                 // ── MEASURED FROM THE FLUSH, NOT FROM NOW ────────────────────────────
                 // Two figures, because the GAP between them is what used to corrupt this
-                // metric: `flushBaseline` is frozen at the flush and is what `+N` is
+                // metric: `flushBaseline` is frozen at the flush and is what `±N` is
                 // computed from; `lastPartialLength` is wherever the partial stream has
                 // since walked. This line used to read only the live field, which
                 // silently subtracted the post-flush refinement from the recovery it was
@@ -974,10 +1011,22 @@ final class LiveRecognizer: @unchecked Sendable {
                 if let flushStartedAt {
                     let ms = Double(DispatchTime.now().uptimeNanoseconds
                         &- flushStartedAt.uptimeNanoseconds) / 1_000_000
-                    let gained = max(0, text.count - flushBaseline)
+                    // Signed, and deliberately NOT floored at zero. A final SHORTER than the
+                    // partial latched at the flush is a real outcome, not an error: Speech
+                    // retracts as well as extends, and the seam then cost text rather than
+                    // recovering it. The old `max(0, …)` printed such a contraction as `+0`,
+                    // byte-identical to a seam that changed nothing, so the two outcomes
+                    // were indistinguishable in the column a reader scans — the run
+                    // preserved in TEST-2026-08-31-run5-trace.txt hid a −6 that way. The
+                    // sign is therefore carried into the line, exactly as `drift` below
+                    // carries its own.
+                    let gained = text.count - flushBaseline
                     // A baseline of 0 means the flushed session delivered no partial at all
                     // (silence, or a wedge) — then `gained` is the whole final, which is NOT
                     // seam recovery and must never be averaged in with the real numbers.
+                    // It is also the one case a signed `gained` cannot reach: with nothing
+                    // latched there is nothing to shrink away from, so this note never has
+                    // to explain a negative.
                     let baselineNote = flushBaseline == 0 ? " [no partial yet — not seam loss]" : ""
                     // Reported ONLY when it is non-zero, so an ordinary seam keeps the short
                     // line. This is exactly the quantity the old final-time baseline used to
@@ -995,7 +1044,7 @@ final class LiveRecognizer: @unchecked Sendable {
                     // and TEST-2026-08-30-seam.md were updated to match.
                     Self.trace("rotation: flushed final after "
                         + "\(String(format: "%.0f", ms)) ms, "
-                        + "+\(gained) chars beyond partial at flush "
+                        + "\(gained > 0 ? "+" : "")\(gained) chars beyond partial at flush "
                         + "(final \(text.count) vs partial at flush \(flushBaseline))"
                         + driftNote
                         + baselineNote)
@@ -1159,28 +1208,94 @@ final class LiveRecognizer: @unchecked Sendable {
                 // recognizer's own lag: audio it has swallowed but not yet spoken for.
                 //
                 // It sized the replay ring, and it still earns its place after the ring
-                // exists, for two reasons. It is the only view of a request going QUIET
-                // while audio keeps flowing — a growing `lag` with no partials is the
-                // signature of the ~35 s wedge the rotation cadence exists to dodge — and it
-                // is the number that says how much the flush at each seam still has to
-                // finalise, which is what the seam's `+N chars` figure then confirms.
+                // exists, for ONE reason. It is the only view of a request going QUIET while
+                // audio keeps flowing — the signature of the ~35 s wedge the rotation
+                // cadence exists to dodge. Read it as the LAST line before a gap rather
+                // than as a rising `lag`: the line is emitted from the partial path, so a
+                // wedged request stops producing lines instead of producing growing ones,
+                // and `lag = wall` dates how long it had been alive when it went quiet.
+                //
+                // A second reason stood here and is RETRACTED: that `lag` says how much the
+                // flush at each seam still has to finalise. It cannot, while `covered` is
+                // pinned to 0 — `lag` is then session age, so it reads ~20 s at every 20 s
+                // rotation whatever the seam does. MEASURED as the LAST `partial-lag` before
+                // each flushed final (not the last before the flush CALL: at run 6's first
+                // seam the 20.1 s line lands after `endAudio()`, in the append-after-endAudio
+                // window documented above, and the last line before the call reads 18.7 s).
+                // `TEST-2026-08-31-run6-trace.txt`: 20.1 / 19.2 / 19.9 /
+                // 19.9 s against seam recoveries of +7 / +2 / −4 / +6 chars.
+                // `TEST-2026-08-31-run5-trace.txt` agrees — 20.1 / 19.6 / 19.9 / 19.9 s
+                // against +5 / −6 / +3 / +3, that −6 being the one the old clamp
+                // printed as `+0`. A near-constant cannot be the varying quantity, and
+                // the seam's `±N chars` figure does not confirm it. Do not reinstate it.
                 //
                 // The line is written even when `segments` is empty or every timestamp is
-                // zero, which on-device th-TH may well do. That is not a failed measurement,
-                // it is the measurement: `covered=0.0s` with a growing `wall` says "this
-                // locale reports no timing", which is precisely why the replay window is
-                // counted in SAMPLES by `AudioReplayRing` and not in segment timestamps.
+                // zero, which on CONTINUOUS speech is the norm and not a fault: no
+                // `partial-lag` line in any PRESERVED trace reads a non-zero `covered` —
+                // 179 of them across the three surviving traces, and more in runs whose
+                // traces were truncated away — against exactly one non-zero ever reported.
+                // That is not a failed measurement, it is the measurement.
+                //
+                // ── WHY `covered` READS 0.0s, AND WHY THAT IS NOT A LOCALE DEFECT ─────
+                // One rule, stated as a ONE-WAY implication because that is all that was
+                // proven: non-zero segment timestamps appear only on a result carrying
+                // `result.speechRecognitionMetadata`. That direction has no counterexample in
+                // 882 callbacks across 17 conditions. The CONVERSE was checkable over 107 of
+                // those 882 — `meta` is not itself a logging trigger and the probe kept no
+                // counter for it — so a metadata-bearing result with a zero `covered` was
+                // never seen and never ruled out. An earlier draft wrote this as `⟺`; the
+                // direction relied on below is the proven one.
+                // While speech is CONTINUOUS no result carries metadata, so every segment
+                // reports `timestamp=0, duration=0` and `covered` is 0.0s. A PAUSE is what
+                // breaks that: the endpoint produces exactly ONE metadata-bearing non-final
+                // result ~1.8-2.5 s after speech stops, and THAT one carries real timestamps
+                // (4 s of speech → covered 4.050s, 17 s → 17.010s; the lag is an endpoint
+                // timeout, not a function of utterance length). Partials then RESET to zero.
+                // Nor is it "partials zero, finals real" — a final that carries no metadata
+                // reads `covered=0.000` as well.
+                //
+                // So 0.0s here is EXPECTED, and it is not a th-TH defect: the same probe
+                // reproduced it on en-US and with a URL request, with and without
+                // punctuation, `taskHint` and `contextualStrings`. Changing locale will not
+                // "fix" it. Neither will clearing `requiresOnDeviceRecognition`, but for a
+                // narrower reason than was once claimed here: setting it false changed
+                // nothing observable — the final came back in `wall=0.3s` with
+                // byte-identical text and identical `covered` — which reads as macOS 26.5.1
+                // having served it ON-DEVICE anyway. So the flag is not a lever on this OS
+                // version, and the SERVER path is UNTESTED rather than passed: no result
+                // among the 882 is known to have come from a server. Those 882 callbacks
+                // are admissible here only because the probe drove this recognizer's exact
+                // configuration and returned a segment-count sequence IDENTICAL to the
+                // app's own in `TEST-2026-08-30-run4-trace.txt`.
+                //
+                // The one non-zero ever reported — a single line at `covered=12.0s` — is
+                // what the rule predicts of an endpointed result, and the endpoint path
+                // reproduces its three numbers: 11.970 / 14.3 / 2.33 against 12.0 / 14.4 /
+                // 2.4. That is not proof it took that path. Its raw trace never survived —
+                // the line is hand-copied — and its `segs=8` does NOT match the probe's 24
+                // segments over the same 12 s. The likeliest account is a slower human
+                // speaker with fewer words, which is unverified and which nobody is
+                // working on. Counts and sweep: `TEST-2026-08-31-seam-rerun.md`.
+                //
+                // That finding makes the replay window's design MORE clearly right, not
+                // less: the window is counted in SAMPLES by `AudioReplayRing` and never in
+                // segment timestamps. Timestamps are unavailable exactly while audio is
+                // flowing continuously, which is exactly when a seam is cut — a sample count
+                // is the only measure of the window that exists at the instant it opens.
                 //
                 // `wall` is SESSION age, not capture age — it restarts at every rotation and
                 // at every backoff restart, so `lag` is a within-session figure and is not
                 // comparable across a seam. At a seam the two clocks deliberately disagree:
                 // `covered` counts from the head of this REQUEST's audio, which is the
                 // replayed window, while `wall` counts from `Session.createdAt`, set after
-                // the replay. So a successor born from a replay reads its first `lag` as
-                // NEGATIVE by roughly the window — that is the replay working, and it is the
-                // verdict on the pre-task-append assumption named in `beginSession`. A first
-                // `lag` near zero at a seam is the failing case: the request kept nothing it
-                // was fed before its task existed.
+                // the replay. That disagreement was once offered as the verdict on the
+                // pre-task-append assumption named in `beginSession`: a successor born from
+                // a replay should read its first `lag` NEGATIVE by roughly the window. It
+                // cannot be read that way while `covered` is pinned to 0 — `lag = wall - 0`
+                // is then always positive, measured at `+1.0 s` and `+0.7 s` at run 5's
+                // seams (run 6's read 0.9 / 0.7 / 0.4 / 0.7 — same verdict, different run;
+                // a reader grepping run 6 for `1.0` will not find it). See `beginSession`
+                // for what that leaves as evidence.
                 //
                 // Costs one sampled write per second and formats nothing when suppressed.
                 if admitLagTrace {

@@ -1,0 +1,3 @@
+[submodule "thaiasr"]
+	path = thaiasr
+	url = https://github.com/Boom-Vitt/thaiasr.git
