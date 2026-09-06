@@ -1558,8 +1558,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private struct FinalCapture {
         let target: TextInjector.BufferedTargetToken
         let keyterms: [String]
-        var transcript = ""
+        var output = PendingTranscript()
         var failure: String?
+        var transcriptionFailure: String?
     }
     private var finalCaptures: [FinalQueue.CaptureID: FinalCapture] = [:]
     private var localCaptureID: FinalQueue.CaptureID?
@@ -1568,6 +1569,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var localTranscriptionSuspended = false
     private var localTerminationRequested = false
     private var activeLocalDictation = false
+    // Retain after stop for the last correction reply. A new recording replaces
+    // this token and increments captureGeneration, rejecting older replies.
+    private var captureTarget: TextInjector.BufferedTargetToken?
     private var localDictationEnabled: Bool {
         selectedEngineKind == .apple && WhisperServerManager.shared.localFinalConfigured
             && (UserDefaults.standard.object(forKey: "localBilingualDictation") as? Bool ?? true)
@@ -2991,8 +2995,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///      that switched itself off without saying why is its own bug.
     private func stopBecauseOffSwitchIsUnreachable(why: String, message: String) {
         localTranscriptionSuspended = true
+        captureTarget = nil
         for id in finalCaptures.keys {
-            finalCaptures[id]?.failure = "Dictation stopped — \(why). Use Copy last transcript for completed text."
+            let reason = "Dictation stopped — \(why). Use Copy last transcript for completed text."
+            finalCaptures[id]?.failure = reason
+            finalCaptures[id]?.output.cancelDelivery(reason: reason)
         }
         let wasLive = isCapturing || drainTimer != nil
         let actingNow = wasLive || wantsDictation
@@ -3037,6 +3044,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if activeLocalDictation && drainTimer != nil {
             finishCapture(reason: "new capture during local finalization")
         }
+        if drainTimer != nil, capturedTargetRefusal() != nil {
+            finishCapture(reason: "new recording in a different text target")
+        }
         // A press that arrives during the drain window cancels the teardown: the user has
         // pressed again, and this is one continuous session as far as the engine is concerned.
         if drainTimer != nil {
@@ -3046,7 +3056,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if isCapturing {
                 tickUI()
                 insertStableTranscript()
-                injector.captureBufferedTarget()
                 // The engine is still live but the recogniser was stopped on release; restart
                 // it so the new utterance gets its own session rather than silently producing
                 // no partials at all.
@@ -3102,6 +3111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         guard !isCapturing, !localTerminationRequested else { return }
         localTranscriptionSuspended = false
+        // Invalidate old correction replies before any fallible startup step:
+        // even a failed new recording must never redirect an old reply.
+        captureGeneration &+= 1
+        captureTarget = injector.captureBufferedTarget()
 
         micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         trace("beginCapture: micStatus=\(statusName(micStatus)) "
@@ -3312,7 +3325,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             AppDelegate.processTap(buffer, into: box, pipeline: pipe, engine: rec)
         }
 
-        captureGeneration &+= 1
         let gen = captureGeneration
         chunkTask?.cancel()
         chunkTask = nil
@@ -3347,7 +3359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             localCaptureID = id
             let loadedTerms = UserKeyterms.load()
             let terms = UserKeyterms.merge(user: loadedTerms.terms, builtin: cloudKeyterms)
-            finalCaptures[id] = FinalCapture(target: injector.captureBufferedTarget(), keyterms: terms)
+            guard let captureTarget else { return }
+            finalCaptures[id] = FinalCapture(target: captureTarget, keyterms: terms)
             activeCorrectionKind = .off
             startLocalServer(reason: "bilingual capture")
             chunkTask = Task.detached { [weak self] in
@@ -3382,7 +3395,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // New pipeline, new generation: a span typed for a previous session's audio must
         // never be offered to this session's cloud pass.
         typedSinceLastChunk = ""
-        injector.captureBufferedTarget()
         startUtterance()
         lastOutcome = nil
         trace(String(format: "capture started OK — session %d, generation %d, %.0f Hz / %u ch",
@@ -3424,7 +3436,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pumpLocalTranscription()
         } catch {
             let recovery = preserveLocalAudio(wav, capture: capture)
-            finalCaptures[capture]?.failure = "Transcription queue is full. \(recovery)"
+            let reason = "Transcription queue is full. \(recovery)"
+            finalCaptures[capture]?.failure = reason
+            finalCaptures[capture]?.transcriptionFailure = reason
             injectionBlockedReason = finalCaptures[capture]?.failure
             if localCaptureID == capture {
                 wantsDictation = false
@@ -3507,21 +3521,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .success(let raw):
                     let text = normalizeForInjection(raw, kind: "local final")
                     guard !text.isEmpty else { return }
-                    let addition = (capture.transcript.isEmpty ? "" : " ") + text
-                    capture.transcript += addition
-                    lastTranscript = capture.transcript
-                    if capture.failure == nil {
-                        if let reason = injector.injectBuffered(addition, target: capture.target) {
-                            capture.failure = reason
-                            lifetime.injectFailures += 1
-                        } else {
-                            clearInjectionBlockAfterSuccessfulWrite()
-                            lifetime.injectedChars += addition.count
-                            if localCaptureID == id.capture { thisCapture.injectedChars += addition.count }
-                            trace("LOCAL FINAL: inserted capture \(id.capture.sequence), chunk \(id.sequence), \(addition.count) chars once")
-                        }
-                    }
+                    capture.output.append(text)
+                    lastTranscript = capture.output.transcript
+                    deliverPendingLocalText(&capture, id: id.capture)
                 case .failure(let reason):
+                    capture.transcriptionFailure = reason
                     capture.failure = reason
                     trace("LOCAL FINAL: capture \(id.capture.sequence), chunk \(id.sequence) failed; recovery available")
                 }
@@ -3533,14 +3537,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     hud.show()
                 }
             case .captureDrained(let id):
-                let capture = finalCaptures.removeValue(forKey: id)
-                if let capture, !capture.transcript.isEmpty { lastTranscript = capture.transcript }
+                var capture = finalCaptures.removeValue(forKey: id)
+                if var pending = capture {
+                    deliverPendingLocalText(&pending, id: id)
+                    capture = pending
+                    if !pending.output.transcript.isEmpty { lastTranscript = pending.output.transcript }
+                }
                 trace("LOCAL FINAL: capture \(id.sequence) fully drained")
+                if let reason = capture?.failure {
+                    injectionBlockedReason = reason
+                    lastOutcome = "Transcript kept for Copy last transcript — \(reason)"
+                    hud.set(.error(reason))
+                    hud.show()
+                }
                 if !isCapturing && finalQueue.pendingCaptureCount == 0 && capture?.failure == nil {
                     hud.set(.idle(idleBody()))
                 }
             }
         refreshMenu()
+    }
+
+    /// Retry the undelivered suffix, in order, against its original target.
+    /// A temporary Accessibility failure no longer mutes the rest of a recording.
+    private func deliverPendingLocalText(_ capture: inout FinalCapture, id: FinalQueue.CaptureID) {
+        let count = capture.output.pendingText.count
+        guard count > 0 else { return }
+        let target = capture.target
+        if let reason = capture.output.deliver(using: { injector.injectBuffered($0, target: target) }) {
+            capture.failure = reason
+            lifetime.injectFailures += 1
+        } else {
+            capture.failure = capture.transcriptionFailure
+            clearInjectionBlockAfterSuccessfulWrite()
+            lifetime.injectedChars += count
+            if localCaptureID == id { thisCapture.injectedChars += count }
+            trace("LOCAL FINAL: inserted capture \(id.sequence), \(count) pending chars once")
+        }
+    }
+
+    private func capturedTargetRefusal() -> String? {
+        guard let captureTarget else { return "No dictation target was captured. Start dictation in a text field." }
+        return injector.bufferedTargetRefusal(captureTarget)
     }
 
     /// Failed audio stays on this Mac with user-only permissions for recovery.
@@ -4509,9 +4546,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// only the part we have not injected yet.
     private func insertStableTranscript(final: String? = nil) {
         guard !activeLocalDictation, !autoCorrectEnabled, isCapturing,
+              let target = captureTarget,
               let text = stableTranscript.finish(final: final) else { return }
         lastTranscript = text
-        if let reason = injector.injectBuffered(text) {
+        if let reason = injector.injectBuffered(text, target: target) {
             lifetime.injectFailures += 1; thisCapture.injectFailures += 1
             injectionBlockedReason = reason
             lastOutcome = "Transcript kept in preview — \(reason)"
@@ -4868,6 +4906,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The menu must disable every automatic document rewrite, including the
         // Apple partial-repair path, even when no second provider is installed.
         guard autoCorrectEnabled && !activeLocalDictation else { return }
+        if let reason = capturedTargetRefusal() {
+            if !text.isEmpty { lastTranscript = text }
+            let changed = injectionBlockedReason != reason
+            injectionBlockedReason = reason
+            lastOutcome = "Transcript kept for Copy last transcript — \(reason)"
+            hud.set(.error(reason))
+            hud.show()
+            if changed {
+                trace("LIVE TARGET: delivery paused; \(text.count) chars available to copy — \(reason)")
+                refreshMenu()
+            }
+            return
+        }
+        guard let target = captureTarget else { return }
         // ── THE FINAL-ONLY MUTE USED TO BE HERE, AND IT STAYS REMOVED ──────────────────
         // `if finalOnlyInjection && !isFinal { return }` was a reasonable trade when it was
         // written — skip live partials in an app that cannot host revision, let each
@@ -5065,33 +5117,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let suffix = String(text.dropFirst(lcp))
         guard !suffix.isEmpty else { return }
 
-        // ── COLLAPSE A STANDING SELECTION, BUT ONLY MID-UTTERANCE ─────────────────────
-        // `kAXSelectedText` REPLACES a selection rather than inserting beside it, so an
-        // "append" made while a selection stands does not append — it DELETES. Whether
-        // that is wanted depends entirely on position within the utterance, which is why
-        // the flag is the caller's decision and not TextInjector's:
-        //
-        //   * FIRST injection of an utterance (`injectedForUtterance.isEmpty`) — replace-
-        //     selection is the FEATURE. Selecting a word and dictating over it is how a
-        //     user rewrites it, and this app must not take that away. Flag off, exactly as
-        //     the fresh-start site below has always had it.
-        //   * MID-utterance — the user has not reached for the mouse since we started
-        //     typing, so a selection standing here can only be OURS: TextInjector
-        //     deliberately leaves the stale tail SELECTED when it refuses a repair. The
-        //     sequence is not hypothetical. In Electron the refusal classifies transient,
-        //     `repairDivergence` defers it without re-anchoring, and this line then writes
-        //     over the standing selection — silently deleting the exact stale tail the
-        //     ledger still claims is in the document, which desynchronises every later
-        //     `replaceLastInserted` content check in the utterance. The deferral this
-        //     change set added makes that path MORE reachable, not less.
-        //
-        // The cost, stated honestly because this runs on every mid-utterance partial: two
-        // extra AX round trips (a focused-element copy plus one selection read), which
-        // TextInjector's own measurements put in the sub-millisecond band even in Electron.
-        // The 40 ms settle inside `collapseStandingSelectionToEnd` is paid only when a
-        // selection is ACTUALLY standing — once per refused repair, not once per partial.
+        // Collapse a known standing selection before every guarded append. This
+        // preserves selected user text and any stale tail left by a refused repair.
+        // A window without selection evidence uses the token's untouched-window
+        // fallback, which cannot perform in-place correction.
         if let reason = injector.inject(suffix,
-                                        collapseStandingSelection: !injectedForUtterance.isEmpty) {
+                                        collapseStandingSelection: true,
+                                        target: target) {
             lifetime.injectFailures += 1; thisCapture.injectFailures += 1
             // Recorded, not latched (see the note where the guard used to be). Every
             // subsequent partial retries, so a persistently broken injector reaches this
@@ -5469,7 +5501,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and DOES get it — that ledger is a document-side span the cloud pass searches
         // the document for, so it has to record what literally landed.
         let separated = " " + text
-        if let reason = injector.inject(separated, collapseStandingSelection: true) {
+        guard let target = captureTarget else { return }
+        if let reason = injector.inject(separated, collapseStandingSelection: true, target: target) {
             // Record NOTHING. The ledger still describes the document, so the next partial
             // recomputes honestly and retries — the same argument as a deferred repair.
             trace("DIVERGENCE: fresh start not typed — \(staleCount) stale chars exceeded "
@@ -5634,8 +5667,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             trace("DIVERGENCE: invalid repair span; nothing replaced")
             return
         }
+        guard capturedTargetRefusal() == nil else { return }
         if let reason = injector.replaceLastInserted(count: repair.count, with: repair.replacement,
-                                                     expecting: repair.expected) {
+                                                     expecting: repair.expected, target: captureTarget) {
             trace("DIVERGENCE: repair FAILED\(isFinal ? " (final reconciliation)" : "") — "
                 + "kept \(lcp) common chars, could not replace \(staleCount) stale chars "
                 + "with \(replacement.count) chars — \(reason)")
@@ -6141,6 +6175,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var repairFailure: String?
         if !autoCorrectEnabled {
             repairFailure = "auto-correct is off; cloud text shown, not injected"
+        } else if let reason = capturedTargetRefusal() {
+            repairFailure = reason
         } else if typedSpan.count < 10 {
             // Too short to match safely (replaceRecentText refuses < 3 graphemes anyway;
             // refusing here keeps the reason honest in the trace).
@@ -6186,7 +6222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshMenu()
             return
         } else {
-            repairFailure = injector.replaceRecentText(find: typedSpan, with: text)
+            repairFailure = injector.replaceRecentText(find: typedSpan, with: text, target: captureTarget)
         }
 
         if repairFailure == nil {

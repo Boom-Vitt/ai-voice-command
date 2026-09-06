@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Typecheck the app and run deterministic component tests on Apple silicon macOS.
+# Compile the app and run deterministic component tests on Apple silicon macOS.
 # Uses no microphone, Accessibility automation, model runtime or network requests.
 set -euo pipefail
 
@@ -18,9 +18,9 @@ TASK_SOURCE="MicTest/Sources/MicTest"
 TASK_TOOLS="MicTest/tools"
 TASK_SWIFT_FLAGS=(-swift-version 6 -sdk "$TASK_SDK" -target arm64-apple-macos26.0)
 
-echo "Typechecking MicTest..."
-xcrun swiftc "${TASK_SWIFT_FLAGS[@]}" -typecheck -module-name MicTest \
-  "$TASK_SOURCE"/*.swift
+echo "Compiling MicTest (Swift 6, optimized)..."
+xcrun swiftc "${TASK_SWIFT_FLAGS[@]}" -O -wmo -module-name MicTest \
+  "$TASK_SOURCE"/*.swift -o "$TASK_TEST_DIR/MicTest"
 
 run_suite() {
   local suite_name="$1"
@@ -43,6 +43,14 @@ run_suite stable-transcript \
   "$TASK_SOURCE/StableTranscriptBuffer.swift" \
   "$TASK_TOOLS/stable-transcript-test/main.swift"
 
+run_suite pending-transcript \
+  "$TASK_SOURCE/PendingTranscript.swift" \
+  "$TASK_TOOLS/pending-transcript-test/main.swift"
+
+run_suite text-target \
+  "$TASK_SOURCE/TextTargetPolicy.swift" \
+  "$TASK_TOOLS/text-target-test/main.swift"
+
 run_suite tail-repair \
   "$TASK_SOURCE/TailRepair.swift" \
   "$TASK_TOOLS/tail-repair-test/main.swift"
@@ -57,4 +65,4 @@ run_suite segment-joining \
   "$TASK_SOURCE/RefuseRedirects.swift" \
   "$TASK_TOOLS/local-transcription-integration-test/ClientTextTest.swift"
 
-echo "All checks passed: app typecheck and six component suites."
+echo "All checks passed: optimized app compilation and component suites."

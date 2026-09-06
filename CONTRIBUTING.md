@@ -16,7 +16,7 @@
 ./MicTest/build-dev.sh "$HOME/Applications/MicTest Dev.app"
 ```
 
-รัน Swift 6 typecheck และ component tests หกชุดจาก source จริง โดยไม่เปิดไมโครโฟน, UI, local server หรือ inference:
+รัน Swift 6 typecheck และ component tests จาก source จริง โดยไม่เปิดไมโครโฟน, UI, local server หรือ inference:
 
 ```bash
 bash MicTest/tools/check.sh

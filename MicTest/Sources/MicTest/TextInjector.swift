@@ -104,6 +104,11 @@ final class TextInjector: TextInjecting {
     /// whichever field a subsequent recording captured.
     struct BufferedTargetToken {
         fileprivate let element: AXUIElement?
+        fileprivate let window: AXUIElement?
+        fileprivate let processID: pid_t?
+        fileprivate let editable: Bool
+        fileprivate let inputGeneration: UInt64
+        fileprivate let monitored: Bool
     }
 
     // Compatibility slot for callers that deliver only the current recording.
@@ -112,10 +117,16 @@ final class TextInjector: TextInjecting {
 
     @discardableResult
     func captureBufferedTarget() -> BufferedTargetToken {
+        startInputMonitoringIfNeeded()
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
+        let focused = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute)
+        let processID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if let focused { AXUIElementSetMessagingTimeout(focused, Self.axMessagingTimeout) }
         let token = BufferedTargetToken(
-            element: copyElement(systemWide, attribute: kAXFocusedUIElementAttribute))
+            element: focused, window: focusedWindow(element: focused, processID: processID),
+            processID: processID, editable: focused.map(isEditableTextElement) ?? false,
+            inputGeneration: inputActivity.generation, monitored: inputMonitoringReady)
         bufferedTarget = token
         return token
     }
@@ -123,24 +134,131 @@ final class TextInjector: TextInjecting {
     func clearBufferedTarget() { bufferedTarget = nil }
 
     func injectBuffered(_ text: String) -> String? {
-        injectBuffered(text, target: bufferedTarget ?? BufferedTargetToken(element: nil))
+        guard let bufferedTarget else {
+            return "No dictation target was captured. Use Copy last transcript."
+        }
+        return injectBuffered(text, target: bufferedTarget)
     }
 
     func injectBuffered(_ text: String, target token: BufferedTargetToken) -> String? {
-        guard let target = token.element, focusIsStill(target) else {
-            return "The text field changed. Transcript kept in the preview; "
-                + "use Copy last transcript or start dictation in the intended field."
-        }
-        guard let range = selectedTextRange(of: target), range.location >= 0, range.length >= 0 else {
-            return "The text selection cannot be verified. Transcript kept in the preview; use Copy last transcript."
-        }
-        // No selected text is replaced when automatic corrections are off.
-        return inject(text, collapseStandingSelection: true, expectedTarget: target)
+        // Known selections collapse before insertion. An untouched window
+        // fallback retains ordinary explicit-dictation paste semantics.
+        return inject(text, collapseStandingSelection: true, target: token)
     }
 
-    private func bufferedTargetIsReady(_ target: AXUIElement) -> Bool {
-        guard focusIsStill(target), let range = selectedTextRange(of: target) else { return false }
-        return range.location >= 0 && range.length == 0
+    /// Check identity and authorization only. Repair callers validate their own
+    /// content and selection after this check; insertion validates selection too.
+    func bufferedTargetRefusal(_ token: BufferedTargetToken) -> String? {
+        guard AXIsProcessTrusted() else {
+            return "MicTest needs Accessibility permission. Grant it in System Settings > Privacy & Security > Accessibility."
+        }
+        guard !secureInputActive() else {
+            return "Secure input is active. Click into a normal text field and start dictation again."
+        }
+        let processID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
+        let current = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute)
+        if let current { AXUIElementSetMessagingTimeout(current, Self.axMessagingTimeout) }
+        let sameElement: Bool?
+        if let expected = token.element {
+            sameElement = current.map { CFEqual($0, expected) } ?? false
+        } else {
+            // Do not let a newly identifiable field inherit a window-only token.
+            sameElement = current == nil ? nil : false
+        }
+        let sameWindow: Bool? = token.window.map { expected in
+            focusedWindow(element: current, processID: processID).map { CFEqual($0, expected) } ?? false
+        }
+        let refusal = TextTargetPolicy.identityRefusal(
+            sameApplication: token.processID != nil && token.processID == processID,
+            sameElement: sameElement, sameWindow: sameWindow,
+            editable: token.editable && (current.map(isEditableTextElement) ?? false),
+            unchangedInput: token.inputGeneration == inputActivity.generation,
+            allowsWindowFallback: permitsWindowFallback(token))
+        return refusal.map(targetRefusalMessage)
+    }
+
+    func inject(_ text: String, collapseStandingSelection: Bool,
+                target token: BufferedTargetToken) -> String? {
+        if let reason = bufferedTargetRefusal(token) { return reason }
+        return inject(text, collapseStandingSelection: collapseStandingSelection, expectedTarget: token)
+    }
+
+    private func permitsWindowFallback(_ token: BufferedTargetToken) -> Bool {
+        !token.editable && token.window != nil && token.monitored && inputMonitoringReady
+    }
+
+    private func bufferedInsertionDecision(_ token: BufferedTargetToken) -> TextTargetPolicy.Insertion {
+        let evidence: TextTargetPolicy.Selection
+        if let element = token.element, let range = selectedTextRange(of: element) {
+            evidence = .range(location: range.location, length: range.length)
+        } else if let element = token.element, let selected = stringAttribute(element, kAXSelectedTextAttribute) {
+            evidence = .selectedText(isEmpty: selected.isEmpty)
+        } else {
+            evidence = .unavailable
+        }
+        return TextTargetPolicy.insertionDecision(evidence, allowsWindowFallback: permitsWindowFallback(token))
+    }
+
+    private func bufferedTargetIsReady(_ target: BufferedTargetToken) -> Bool {
+        bufferedTargetRefusal(target) == nil && bufferedInsertionDecision(target) == .ready
+    }
+
+    private func repairTargetRefusal(_ token: BufferedTargetToken?, focused: AXUIElement) -> String? {
+        guard let token else { return nil }
+        if let reason = bufferedTargetRefusal(token) { return reason }
+        guard token.editable, let expected = token.element, CFEqual(expected, focused) else {
+            return "This app does not expose the original editable field for safe correction. Transcript kept for Copy last transcript."
+        }
+        return nil
+    }
+
+    private func pasteTargetIsReady(_ token: BufferedTargetToken, selection: CFRange?) -> Bool {
+        guard let selection else { return bufferedTargetIsReady(token) }
+        guard let element = token.element, repairTargetRefusal(token, focused: element) == nil,
+              let actual = selectedTextRange(of: element) else { return false }
+        return actual.location == selection.location && actual.length == selection.length
+    }
+
+    private func targetRefusalMessage(_ reason: TextTargetPolicy.Refusal) -> String {
+        let explanation: String
+        switch reason {
+        case .applicationChanged: explanation = "The active app changed."
+        case .fieldChanged: explanation = "The text field changed."
+        case .fieldUnavailable: explanation = "This app does not expose a verifiable text field or window."
+        case .windowChanged: explanation = "The active window changed."
+        case .notEditable: explanation = "The focused control is not an editable text field."
+        case .selectionUnavailable: explanation = "This app cannot verify the text selection."
+        case .invalidSelection: explanation = "The app reported an invalid text selection."
+        case .userInteracted: explanation = "Keyboard, mouse or app focus changed after dictation started."
+        }
+        return explanation + " Transcript kept for Copy last transcript; start dictation in the intended field to continue."
+    }
+
+    private func focusedWindow(element: AXUIElement?, processID: pid_t?) -> AXUIElement? {
+        if let element, let window = copyElement(element, attribute: kAXWindowAttribute) { return window }
+        guard let processID else { return nil }
+        let app = AXUIElementCreateApplication(processID)
+        AXUIElementSetMessagingTimeout(app, Self.axMessagingTimeout)
+        return copyElement(app, attribute: kAXFocusedWindowAttribute)
+    }
+
+    private func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == CFStringGetTypeID() else { return nil }
+        return value as? String
+    }
+
+    private func isEditableTextElement(_ element: AXUIElement) -> Bool {
+        guard let role = stringAttribute(element, kAXRoleAttribute),
+              [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role) else { return false }
+        var enabled: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabled) == .success,
+           let enabled, CFGetTypeID(enabled) == CFBooleanGetTypeID(),
+           !CFBooleanGetValue((enabled as! CFBoolean)) { return false }
+        return true
     }
 
     // MARK: - Timing constants
@@ -418,7 +536,57 @@ final class TextInjector: TextInjecting {
     /// Anything else means somebody else has since taken ownership.
     private var ourChangeCount: Int = 0
 
+    private let inputActivity = TextInputActivity()
+    private var globalInputMonitor: Any?
+    private var localInputMonitor: Any?
+    private var activationObserver: (any NSObjectProtocol)?
+    private static let syntheticEventMarker: Int64 = 0x4D494354455854
+    private var inputMonitoringReady: Bool {
+        globalInputMonitor != nil && localInputMonitor != nil && activationObserver != nil
+    }
+
     init() {}
+
+    isolated deinit {
+        if let globalInputMonitor { NSEvent.removeMonitor(globalInputMonitor) }
+        if let localInputMonitor { NSEvent.removeMonitor(localInputMonitor) }
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+    }
+
+    private func startInputMonitoringIfNeeded() {
+        let activity = inputActivity
+        let marker = Self.syntheticEventMarker
+        let record: @Sendable (NSEvent) -> Void = { event in
+            let ours = event.cgEvent?.getIntegerValueField(.eventSourceUserData) == marker
+            activity.record(ours ? .synthetic : .input)
+        }
+        // Modifier changes include the Right Option hotkey and do not change
+        // a caret. Never collect key contents or pointer coordinates.
+        let mask: NSEvent.EventTypeMask = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if globalInputMonitor == nil {
+            globalInputMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: record)
+        }
+        if localInputMonitor == nil {
+            localInputMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { event in
+                // Stop on the floating HUD cannot change the external caret.
+                // Invalidating here would discard the very final text Stop drains.
+                if let window = event.window, window.styleMask.contains(.nonactivatingPanel),
+                   !window.canBecomeKey, !window.canBecomeMain {
+                    activity.record(.nonactivatingControl)
+                } else {
+                    record(event)
+                }
+                return event
+            }
+        }
+        if activationObserver == nil {
+            activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
+            ) { _ in activity.record(.activation) }
+        }
+    }
 
     // MARK: - TextInjecting
 
@@ -471,7 +639,7 @@ final class TextInjector: TextInjecting {
     ///   one that knows whether a standing selection is the user's or a mess
     ///   left by a refused repair.
     func inject(_ text: String, collapseStandingSelection: Bool,
-                expectedTarget: AXUIElement? = nil) -> String? {
+                expectedTarget: BufferedTargetToken? = nil) -> String? {
         guard !text.isEmpty else {
             // Nothing to deliver is not a failure — an empty transcript just
             // means the user held the hotkey and said nothing.
@@ -494,6 +662,13 @@ final class TextInjector: TextInjecting {
             Self.log.notice("Refusing injection: Accessibility permission not granted.")
             return "MicTest needs Accessibility permission. Grant it in System Settings > "
                 + "Privacy & Security > Accessibility, then try again."
+        }
+
+        if let expectedTarget {
+            if let reason = bufferedTargetRefusal(expectedTarget) { return reason }
+            if case .refused(let reason) = bufferedInsertionDecision(expectedTarget) {
+                return targetRefusalMessage(reason)
+            }
         }
 
         // A standing selection is a hazard BOTH paths below would silently
@@ -530,11 +705,11 @@ final class TextInjector: TextInjecting {
             let systemWide = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
             if let focused = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute) {
-                if let expectedTarget, !CFEqual(focused, expectedTarget) {
-                    return Self.focusMovedRefusal
+                if let expectedTarget, let reason = bufferedTargetRefusal(expectedTarget) {
+                    return reason
                 }
                 AXUIElementSetMessagingTimeout(focused, Self.axMessagingTimeout)
-                if let reason = collapseStandingSelectionToEnd(focused) {
+                if let reason = collapseStandingSelectionToEnd(focused, target: expectedTarget) {
                     // Return HERE. Falling through would reach the clipboard
                     // path, which pastes over exactly the selection we just
                     // failed to clear — the outcome this guard exists for.
@@ -613,7 +788,8 @@ final class TextInjector: TextInjecting {
     ///
     /// It also cannot help a field whose selection we cannot read; see the
     /// first guard for why proceeding is the right answer there.
-    private func collapseStandingSelectionToEnd(_ focused: AXUIElement) -> String? {
+    private func collapseStandingSelectionToEnd(_ focused: AXUIElement,
+                                                target token: BufferedTargetToken? = nil) -> String? {
         guard let standing = selectedTextRange(of: focused) else {
             // Cannot guard what cannot be read. This is today's behaviour for
             // every field whose range read fails — `inject` has never asked —
@@ -641,6 +817,10 @@ final class TextInjector: TextInjecting {
         var collapsed = CFRange(location: standing.location + standing.length, length: 0)
         guard let rangeValue = AXValueCreate(.cfRange, &collapsed) else {
             return Self.standingSelectionRefusal
+        }
+        if let token {
+            if let reason = bufferedTargetRefusal(token) { return reason }
+            guard focusIsStill(focused) else { return Self.focusMovedRefusal }
         }
         guard AXUIElementSetAttributeValue(
             focused, kAXSelectedTextRangeAttribute as CFString, rangeValue
@@ -701,7 +881,10 @@ final class TextInjector: TextInjecting {
     /// - Returns: `true` only when we have positive evidence the text landed.
     ///   Anything ambiguous returns `false` so the caller falls back to the
     ///   clipboard path.
-    private func insertViaAccessibility(_ text: String, expectedTarget: AXUIElement? = nil) -> Bool {
+    private func insertViaAccessibility(_ text: String, expectedTarget: BufferedTargetToken? = nil) -> Bool {
+        // A window-only token authorizes an ordinary paste, never an AX write
+        // into a root/group that happens to advertise a text attribute.
+        if let expectedTarget, !expectedTarget.editable { return false }
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
 
@@ -723,9 +906,9 @@ final class TextInjector: TextInjecting {
         // Snapshot the insertion point so we can tell a real insertion from a
         // polite lie (see the verification note below).
         let rangeBefore = selectedTextRange(of: focused)
-        if let expectedTarget,
-           (!CFEqual(focused, expectedTarget) || !bufferedTargetIsReady(expectedTarget)) {
-            return false
+        if let expectedTarget {
+            guard let expectedElement = expectedTarget.element, CFEqual(focused, expectedElement),
+                  bufferedTargetIsReady(expectedTarget) else { return false }
         }
 
         guard AXUIElementSetAttributeValue(
@@ -887,7 +1070,7 @@ final class TextInjector: TextInjecting {
     /// justify posting a destructive keystroke, so a nil `expecting` refuses
     /// there even though path A would have proceeded.
     func replaceLastInserted(count: Int, with text: String,
-                             expecting: String? = nil) -> String? {
+                             expecting: String? = nil, target token: BufferedTargetToken? = nil) -> String? {
         guard count >= 0 else { return "internal error: negative count" }
         if count == 0 && text.isEmpty { return nil }
         guard AXIsProcessTrusted() else { return "Accessibility permission not granted" }
@@ -899,6 +1082,7 @@ final class TextInjector: TextInjecting {
             return "no focused element"
         }
         AXUIElementSetMessagingTimeout(focused, Self.axMessagingTimeout)
+        if let reason = repairTargetRefusal(token, focused: focused) { return reason }
 
         var settable: DarwinBoolean = false
         guard AXUIElementIsAttributeSettable(
@@ -1047,6 +1231,7 @@ final class TextInjector: TextInjecting {
         guard let rangeValue = AXValueCreate(.cfRange, &target) else {
             return "internal error: could not build the AX range"
         }
+        if let reason = repairTargetRefusal(token, focused: focused) { return reason }
         guard AXUIElementSetAttributeValue(
             focused, kAXSelectedTextRangeAttribute as CFString, rangeValue
         ) == .success else {
@@ -1093,7 +1278,9 @@ final class TextInjector: TextInjecting {
               applied.location == target.location, applied.length == target.length else {
             // Nothing has been posted yet, so collapsing the caret back is safe
             // and leaves no surprise selection behind.
-            collapseSelection(of: focused, to: caret.location)
+            if repairTargetRefusal(token, focused: focused) == nil {
+                collapseSelection(of: focused, to: caret.location)
+            }
             let got = applied.map { "(\($0.location),\($0.length))" } ?? "unreadable"
             return "the field clamped the selection (wanted (\(target.location),\(target.length)), got \(got)); not replacing"
         }
@@ -1108,6 +1295,7 @@ final class TextInjector: TextInjecting {
         let collapsed = CFRange(location: target.location + text.utf16.count, length: 0)
 
         // ── Path A: the AX attribute write. Preferred, and unchanged. ────────
+        if let reason = repairTargetRefusal(token, focused: focused) { return reason }
         if AXUIElementSetAttributeValue(
             focused, kAXSelectedTextAttribute as CFString, text as CFString
         ) == .success {
@@ -1167,7 +1355,9 @@ final class TextInjector: TextInjecting {
         // destructive keystroke on. `repairDivergence` always supplies this;
         // the parameter is optional only for path A's benefit.
         guard let expecting else {
-            collapseSelection(of: focused, to: caret.location)
+            if repairTargetRefusal(token, focused: focused) == nil {
+                collapseSelection(of: focused, to: caret.location)
+            }
             return "the field ignored the AX replacement and no content check was supplied; not repairing"
         }
 
@@ -1195,7 +1385,9 @@ final class TextInjector: TextInjecting {
         // the user can recover from the HUD; the cost of not doing it is text
         // they wrote themselves.
         guard expecting.count >= 3 else {
-            collapseSelection(of: focused, to: caret.location)
+            if repairTargetRefusal(token, focused: focused) == nil {
+                collapseSelection(of: focused, to: caret.location)
+            }
             return "the stale text is too short to identify safely (under 3 characters) "
                 + "for a keystroke repair; not repairing"
         }
@@ -1207,7 +1399,9 @@ final class TextInjector: TextInjecting {
         // of function entry. Nothing has been posted yet, so we can back out
         // cleanly.
         if secureInputActive() {
-            collapseSelection(of: focused, to: caret.location)
+            if repairTargetRefusal(token, focused: focused) == nil {
+                collapseSelection(of: focused, to: caret.location)
+            }
             return "secure input became active mid-repair; nothing was written to the clipboard"
         }
 
@@ -1228,18 +1422,24 @@ final class TextInjector: TextInjecting {
             // thing this file could do, so it is checked explicitly here rather
             // than inferred from `count > 0` several screens above.
             guard target.length > 0 else {
-                collapseSelection(of: focused, to: caret.location)
+                if repairTargetRefusal(token, focused: focused) == nil {
+                    collapseSelection(of: focused, to: caret.location)
+                }
                 return "internal error: refusing to post Delete with an empty selection"
             }
-            guard focusIsStill(focused) else {
-                collapseSelection(of: focused, to: caret.location)
+            guard focusIsStill(focused), repairTargetRefusal(token, focused: focused) == nil else {
+                if repairTargetRefusal(token, focused: focused) == nil {
+                    collapseSelection(of: focused, to: caret.location)
+                }
                 Self.log.notice(
                     "Repair refused: FOCUS MOVED between the verified selection and the repair keystroke (delete branch); nothing was posted."
                 )
                 return Self.focusMovedRefusal
             }
             guard postDeleteKey() else {
-                collapseSelection(of: focused, to: caret.location)
+                if repairTargetRefusal(token, focused: focused) == nil {
+                    collapseSelection(of: focused, to: caret.location)
+                }
                 return "could not post the delete keystroke. Check Accessibility permission in System Settings."
             }
             postedAt = Date()
@@ -1247,17 +1447,21 @@ final class TextInjector: TextInjecting {
                 "Repair fallback: deleted a \(target.length, privacy: .public)-unit selection with one Delete (no clipboard borrow)."
             )
         } else {
-            guard focusIsStill(focused) else {
-                collapseSelection(of: focused, to: caret.location)
+            guard focusIsStill(focused), repairTargetRefusal(token, focused: focused) == nil else {
+                if repairTargetRefusal(token, focused: focused) == nil {
+                    collapseSelection(of: focused, to: caret.location)
+                }
                 Self.log.notice(
                     "Repair refused: FOCUS MOVED between the verified selection and the repair keystroke (paste branch); the transcript never reached the clipboard."
                 )
                 return Self.focusMovedRefusal
             }
-            switch borrowPasteboardAndPasteV(text) {
+            switch borrowPasteboardAndPasteV(text, expectedTarget: token, expectedSelection: target) {
             case .failed(let reason):
                 // The borrow released itself and nothing was posted.
-                collapseSelection(of: focused, to: caret.location)
+                if repairTargetRefusal(token, focused: focused) == nil {
+                    collapseSelection(of: focused, to: caret.location)
+                }
                 return reason
             case .posted(let generation, let at, _):
                 borrowedGeneration = generation
@@ -1344,7 +1548,8 @@ final class TextInjector: TextInjecting {
     ///
     /// - Returns: `nil` on success, or a human-readable reason and the
     ///   document untouched.
-    @MainActor func replaceRecentText(find: String, with replacement: String) -> String? {
+    @MainActor func replaceRecentText(find: String, with replacement: String,
+                                      target token: BufferedTargetToken? = nil) -> String? {
         guard !find.isEmpty else { return "internal error: empty search text" }
         // Identical text is a no-op success: the document already reads the
         // way the caller wants it to.
@@ -1364,6 +1569,7 @@ final class TextInjector: TextInjecting {
             return "no focused element"
         }
         AXUIElementSetMessagingTimeout(focused, Self.axMessagingTimeout)
+        if let reason = repairTargetRefusal(token, focused: focused) { return reason }
 
         var settable: DarwinBoolean = false
         guard AXUIElementIsAttributeSettable(
@@ -1471,6 +1677,7 @@ final class TextInjector: TextInjecting {
         guard let rangeValue = AXValueCreate(.cfRange, &target) else {
             return "internal error: could not build the AX range"
         }
+        if let reason = repairTargetRefusal(token, focused: focused) { return reason }
         guard AXUIElementSetAttributeValue(
             focused, kAXSelectedTextRangeAttribute as CFString, rangeValue
         ) == .success else {
@@ -1495,7 +1702,8 @@ final class TextInjector: TextInjecting {
               applied.location == target.location, applied.length == target.length else {
             // Restore the caret so we do not leave a surprise selection behind.
             var restore = CFRange(location: caret.location, length: 0)
-            if let restoreValue = AXValueCreate(.cfRange, &restore) {
+            if repairTargetRefusal(token, focused: focused) == nil,
+               let restoreValue = AXValueCreate(.cfRange, &restore) {
                 AXUIElementSetAttributeValue(
                     focused, kAXSelectedTextRangeAttribute as CFString, restoreValue)
             }
@@ -1503,11 +1711,13 @@ final class TextInjector: TextInjecting {
             return "the field clamped the selection (wanted (\(target.location),\(target.length)), got \(got)); not replacing"
         }
 
+        if let reason = repairTargetRefusal(token, focused: focused) { return reason }
         guard AXUIElementSetAttributeValue(
             focused, kAXSelectedTextAttribute as CFString, replacement as CFString
         ) == .success else {
             var restore = CFRange(location: caret.location, length: 0)
-            if let restoreValue = AXValueCreate(.cfRange, &restore) {
+            if repairTargetRefusal(token, focused: focused) == nil,
+               let restoreValue = AXValueCreate(.cfRange, &restore) {
                 AXUIElementSetAttributeValue(
                     focused, kAXSelectedTextRangeAttribute as CFString, restoreValue)
             }
@@ -1524,7 +1734,8 @@ final class TextInjector: TextInjecting {
             location: min(max(0, caret.location + delta), max(0, newLength)),
             length: 0
         )
-        if let restoredValue = AXValueCreate(.cfRange, &restored) {
+        if repairTargetRefusal(token, focused: focused) == nil,
+           let restoredValue = AXValueCreate(.cfRange, &restored) {
             AXUIElementSetAttributeValue(
                 focused, kAXSelectedTextRangeAttribute as CFString, restoredValue)
         }
@@ -1729,7 +1940,8 @@ final class TextInjector: TextInjecting {
     /// growing a second, parallel one. There is exactly one borrow mechanism in
     /// this file and this is it.
     private func borrowPasteboardAndPasteV(_ text: String,
-                                          expectedTarget: AXUIElement? = nil) -> PasteHandoff {
+                                          expectedTarget: BufferedTargetToken? = nil,
+                                          expectedSelection: CFRange? = nil) -> PasteHandoff {
         let pasteboard = NSPasteboard.general
 
         // Resolve the keycode BEFORE touching the pasteboard, so a resolution
@@ -1751,12 +1963,19 @@ final class TextInjector: TextInjecting {
         }
 
         // Only snapshot when we are not already holding one. See `restorePending`.
-        if let expectedTarget, !bufferedTargetIsReady(expectedTarget) {
+        if let expectedTarget, !pasteTargetIsReady(expectedTarget, selection: expectedSelection) {
             return .failed("The text field or selection changed. Transcript kept in the preview.")
         }
-        if !restorePending {
-            savedClipboard = snapshotPasteboard(pasteboard)
+        let freshSnapshot = restorePending ? nil : snapshotPasteboard(pasteboard)
+        // Snapshotting can synchronously ask another app for promised data.
+        // Check again after that IPC, immediately before touching the clipboard.
+        guard !secureInputActive() else {
+            return .failed("Secure input became active. Nothing was put on the clipboard.")
         }
+        if let expectedTarget, !pasteTargetIsReady(expectedTarget, selection: expectedSelection) {
+            return .failed("The text field or selection changed. Nothing was put on the clipboard.")
+        }
+        if !restorePending { savedClipboard = freshSnapshot }
         restorePending = true
         restoreGeneration &+= 1
         let generation = restoreGeneration
@@ -1769,7 +1988,7 @@ final class TextInjector: TextInjecting {
         }
         ourChangeCount = pasteboard.changeCount
 
-        if let expectedTarget, !bufferedTargetIsReady(expectedTarget) {
+        if let expectedTarget, !pasteTargetIsReady(expectedTarget, selection: expectedSelection) {
             completeRestore(generation: generation, restoring: true)
             return .failed("The text field or selection changed. Nothing was pasted.")
         }
@@ -1782,7 +2001,7 @@ final class TextInjector: TextInjecting {
     }
 
     private func injectViaClipboard(_ text: String, targetID: String,
-                                    expectedTarget: AXUIElement? = nil) -> String? {
+                                    expectedTarget: BufferedTargetToken? = nil) -> String? {
         switch borrowPasteboardAndPasteV(text, expectedTarget: expectedTarget) {
         case .failed(let reason):
             return reason
@@ -2056,6 +2275,8 @@ final class TextInjector: TextInjecting {
         // `.cghidEventTap` injects at the lowest point in the event stream, so
         // the event passes through the same path as real hardware input and is
         // seen by every tap and by the target app's normal key handling.
+        keyDown.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
+        keyUp.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
         return true
@@ -2098,6 +2319,8 @@ final class TextInjector: TextInjecting {
         keyDown.flags = []
         keyUp.flags = []
 
+        keyDown.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
+        keyUp.setIntegerValueField(.eventSourceUserData, value: Self.syntheticEventMarker)
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
         return true

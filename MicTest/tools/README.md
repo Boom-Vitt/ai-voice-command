@@ -19,6 +19,8 @@ bash MicTest/tools/check.sh
 | Audio pipeline | การแบ่งช่วงเสียง การ flush และการรักษา PCM |
 | Transcription queue | ลำดับงาน ขอบเขตรอบบันทึก และการยกเลิก |
 | Stable transcript | การส่งข้อความสมบูรณ์ครั้งเดียวและ final/stop fallback |
+| Pending transcript | เก็บส่วนที่ส่งไม่สำเร็จ ลองใหม่ตามลำดับ และไม่ส่งส่วนที่สำเร็จแล้วซ้ำ |
+| Text target | app/window/field identity, selection ที่อ่านไม่ครบ และการยกเลิก fallback เมื่อมีกิจกรรมผู้ใช้ |
 | Tail repair | แผนแก้ท้ายข้อความโดยรักษา grapheme clusters ภาษาไทย |
 | Audio gain | การปรับเสียงเบาภายในขอบเขต และการคงเสียงปกติ/silence |
 | Segment joining | การรวมข้อความจาก local Whisper โดยไม่เพิ่มช่องว่างกลางคำไทย |
@@ -35,6 +37,7 @@ Workflow **Checks** บน GitHub Actions ใช้ runner เดียวกั
 | `local-transcription-queue-test/` | ตรวจคิว local transcription |
 | `local-transcription-integration-test/` | ตรวจการเชื่อม pipeline/transcriber; บางโหมดต้องมี runtime |
 | `stable-transcript-test/`, `tail-repair-test/` | ตรวจ buffer และการวางแผนแก้ข้อความโดยไม่พิมพ์ลงแอป |
+| `pending-transcript-test/`, `text-target-test/` | ตรวจการกู้คืนข้อความและเงื่อนไขปลายทางแบบ pure tests |
 | `cap-test/` | ตรวจสูตรจำกัดช่วงแก้ข้อความ |
 | `prompt-test/` | ตรวจ glossary และ multipart request |
 | `whisper-server-lifecycle/` | ตรวจ server ownership และ lifecycle; แยก fake-server tests จาก real-server tests |
