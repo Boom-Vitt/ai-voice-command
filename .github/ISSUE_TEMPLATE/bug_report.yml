@@ -1,0 +1,54 @@
+name: แจ้งบั๊ก / Bug report
+description: รายงานปัญหาพร้อมขั้นตอนที่ทำซ้ำได้
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        โปรดใช้ประโยคทดสอบที่ไม่มีข้อมูลส่วนตัว ไม่แนบ API key, เสียงจริงส่วนตัว, transcript ส่วนตัว หรือ log ที่ยังไม่ได้ตรวจ
+  - type: input
+    id: environment
+    attributes:
+      label: เครื่องและเวอร์ชัน
+      description: รุ่นชิป, macOS, commit หรือวิธี build ของ MicTest
+      placeholder: Apple Silicon, macOS 26.x, commit ... / build-dev.sh
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: โหมดที่ใช้
+      options:
+        - Apple Speech
+        - Thai + English local large-v3
+        - Gemini Live
+        - ไม่แน่ใจ / Not sure
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Correction และแอปปลายทาง
+      description: Automatic corrections เปิดหรือปิด, Correction provider และแอปที่ต้องการพิมพ์ลงไป
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: ขั้นตอนที่ทำให้เกิดปัญหา
+      placeholder: |
+        1. เปิดเอกสารทดลองใน ...
+        2. แตะ Right Option ...
+        3. HUD แสดง ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: คาดหวังอะไร และเกิดอะไรขึ้นจริง
+      description: หากเป็นความผิดพลาดการถอดเสียง ใช้ตัวอย่างที่สร้างใหม่และไม่เป็นข้อมูลส่วนตัว
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: หลักฐานเพิ่มเติมที่ลบข้อมูลส่วนตัวแล้ว
+      description: แนบเฉพาะสถานะหรือข้อความผิดพลาดที่จำเป็น พร้อมบอกว่าทดสอบซ้ำได้กี่ครั้ง

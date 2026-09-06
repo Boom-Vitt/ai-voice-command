@@ -30,13 +30,17 @@
 //      because nothing else was fast enough when this was written: Gemini's earlier
 //      streaming model was measured needing 25 s before its first output, against
 //      on-device word-by-word. See the engine selector below for what changed.
-//    * Gemini 3.5 Flash (`GeminiClient`) runs an accuracy pass on each finalized
-//      ~10 s chunk — OPT-IN, default OFF, because it sends audio off the machine.
-//      It REPLACED fal Scribe v2 at the user's instruction, and the fal client and its
-//      billing probe have since been deleted outright; see the cloud section.
-//      Whether its result is APPLIED to the typed text is a second toggle, and that
-//      one now defaults ON — also the user's choice, recorded at `autoCorrectEnabled`.
-//      See `noteFinalChunk` for the gate that stops it laundering hallucinations.
+//    * A CORRECTION PASS re-transcribes each finalized utterance (a chunk of at most
+//      10 s, cut 0.6 s after silence) and repairs the typed span. Which engine runs it
+//      is the `CorrectionProviderKind` setting: `local` — a whisper.cpp server this app
+//      owns on loopback, audio never leaves the Mac, the default when a model exists —
+//      or `gemini` (`GeminiClient`, audio to Google, never a default), or `off`. Gemini
+//      REPLACED fal Scribe v2 at the user's instruction and the fal client is gone; the
+//      local provider was added 2026-09-03 because Apple's th-TH model cannot
+//      code-switch (PLAN-2026-09-03-local-correction.md). Whether a result is APPLIED
+//      to the typed text is a second toggle, default ON (the user's choice, recorded
+//      at `autoCorrectEnabled`). See `noteFinalChunk` for the gate that stops it
+//      laundering hallucinations.
 //
 //  ── TWO live engines, and Apple is the default ─────────────────────────────────
 //
@@ -100,12 +104,14 @@
 
 import AppKit
 import AVFoundation
+import Synchronization
 
 // MARK: - Constants
 
 /// Technical vocabulary, used for BOTH halves of the recognition stack:
-///   * handed to `GeminiClient.transcribe(wav:keyterms:)` so the cloud pass biases towards
-///     these spellings instead of transliterating them into Thai phonetics, and
+///   * handed to whichever `CorrectionProvider` runs the correction pass (merged behind
+///     the user's own file, see below) so it biases towards these spellings instead of
+///     transliterating them into Thai phonetics, and
 ///   * handed to `LiveRecognizer.setContextualStrings`, where — MEASURED 2026-08-31 — it
 ///     has NO EFFECT WHATSOEVER. See the warning below before spending time on it.
 ///
@@ -125,15 +131,25 @@ import AVFoundation
 /// Nothing moved. Do not add terms here expecting the Apple path to honour them, and do
 /// not conclude from a fixed transcript that a term you added is working.
 ///
-/// WHERE IT DOES STILL EARN ITS KEEP: `GeminiClient.transcribe(wav:keyterms:)` splices
-/// these into the prompt ("Use these exact spellings if you hear them: …"), and there they
-/// work — a cloud pass with this list returns `commit`, `deploy`, `production` correctly.
-/// That path is off by default and the user has declined to enable it (audio must not
-/// leave the machine), so in the shipped configuration this list is inert. It is kept
-/// because it is free, correct, and immediately live if the cloud pass is ever turned on.
+/// WHERE IT DOES EARN ITS KEEP: the correction pass. `GeminiClient.transcribe(wav:
+/// keyterms:)` splices these into its prompt ("Use these exact spellings if you hear
+/// them: …") and there they work — `commit`, `deploy`, `production` come back correct.
+/// Since 2026-09-03 the same list is LIVE ON THE LOCAL PROVIDER too:
+/// `WhisperClient.promptString(from:)` renders it as one natural Thai sentence (a comma
+/// list rescued the English and wrecked the Thai around it — measured, see that
+/// function), capped at `WhisperClient.maxPromptBytes` (800; these 20 terms render to
+/// 452 of them). The default provider is local whisper whenever a model and the binary
+/// exist, so in the shipped configuration this list is no longer inert.
 ///
-/// Keep entries short and keep them to words that are genuinely ambiguous in a Thai
-/// sentence.
+/// THE USER'S OWN TERMS DO NOT GO HERE. `UserKeyterms` reads
+/// `~/.config/thaidictate/keyterms.txt` and merges it AHEAD of this list, so a word the
+/// user needs (`time`, reported missing — TEST-2026-09-03-oog-english.txt: never
+/// appeared until it was in the prompt, exact once it was) survives the byte cap before
+/// any of these do. Keep this list to words that are genuinely ambiguous in a Thai
+/// sentence, and short: whether 800 bytes of Thai-heavy prompt fits whisper's 224-token
+/// window has not been counted (WhisperClient.swift, `maxPromptBytes`), so "how many
+/// terms fit" is not a number this comment can promise — the `keyterms:` trace line at
+/// every capture start says how many were kept and dropped.
 ///
 /// The "short, ~100 entries" shape started as fal's hard API cap (50 characters per
 /// keyterm, 100 entries). That cap left with fal: `GeminiClient` carries these into a
@@ -156,16 +172,230 @@ let defaultHotkeyName = "Right-Option"
 /// (see the header comment), so it needs an idle body.
 let hudIdleBody = "Idle — tap \(defaultHotkeyName) to start dictating, tap again to stop."
 
-/// Local whisper.cpp (`WhisperClient.swift`) is superseded by `LiveRecognizer` for live
-/// text: on-device speech recognition is word-by-word and near-zero latency, whereas the
-/// whisper round trip is chunked and hundreds of milliseconds behind.
+/// Which engine the correction pass sends a finished utterance's WAV to.
 ///
-/// DECISION: the file is retained but is NOT called from anywhere. There is no fallback
-/// path and no toggle — a dormant second transcriber that can silently take over is how
-/// you get two different answers for the same audio and no way to tell which one you are
-/// reading. This flag exists only so the choice is stated in the trace rather than
-/// implied by an absence.
-let localWhisperFallbackEnabled = false
+/// `LiveRecognizer` (Apple, on-device) drives the LIVE text in every case: it types word
+/// by word and its pure Thai is right. This setting names the SECOND engine, the one
+/// that re-transcribes each finished utterance so `applyCloudResult` can repair the
+/// typed span — the pass that exists because Apple's th-TH model cannot code-switch
+/// (0/20 English terms usable, `contextualStrings` inert: TEST-2026-08-31-mixed-
+/// language.md; that verdict is scoped to Apple by PLAN-2026-09-03-local-correction.md).
+///
+///   * `off`    — no second engine; nothing but Apple ever hears the microphone.
+///   * `local`  — `LocalWhisperProvider`: a `whisper-server` this app spawns on
+///                127.0.0.1 (`WhisperServerManager`). Audio stays on this Mac. Measured
+///                2026-09-03 on ggml-large-v3-turbo with the sentence prompt: 4/5 clips
+///                exact, English kept 7/8, Thai intact, ~650 ms warm for 5.7 s of audio
+///                (TEST-2026-09-03-turbo-server-5clip.txt; synthetic voice).
+///   * `gemini` — `GeminiClient`: the WAV is sent to Google. Never a default.
+///
+/// The default with nothing stored is `local` when both the pinned binary and a model
+/// file exist, else `off` — the privacy-preserving reading survives every failure. There
+/// is NO fallback between providers at runtime: a dormant second transcriber that can
+/// silently take over is how you get two different answers for the same audio and no
+/// way to tell which one you are reading. A provider's failure is traced as a failure.
+/// Whisper never drives the live text — the round trip is chunked and hundreds of
+/// milliseconds behind Apple's word-by-word partials, and whisper.cpp has no partials.
+enum CorrectionProviderKind: String, CaseIterable, Sendable {
+    case off, local, gemini
+}
+
+/// `CorrectionProvider` over the `whisper-server` that `WhisperServerManager` owns.
+///
+/// Why this is not simply a `WhisperClient`: the client is built with a port, and the
+/// port is not known until the manager has started or adopted a server — `ensureReady`
+/// scans 8177…8180 and launches on the first free one. So each request first asks the
+/// manager (one loopback `/health` probe when the server is already up: the fast path
+/// at the top of `ensureReady`), then takes the client for the port it returns. A
+/// server that is not up yet is started here, on the request path, deliberately: the
+/// first correction after a cold start waits for the model load (~2 s measured) rather
+/// than being refused — a refused chunk's typed span is permanently uncorrectable (its
+/// ledger snapshot is consumed in `noteFinalChunk`), a late one is merely late. The app
+/// preloads the server at launch and at every capture start so that wait is normally
+/// paid before the first utterance, not on it.
+///
+/// One client PER PORT, kept for the life of the process — not one per request.
+/// `WhisperClient.init` builds a `URLSession` with a `RefuseRedirects` delegate, and a
+/// session built with a delegate is retained by Foundation until it is invalidated,
+/// which nothing does: measured 2026-09-03 with a 20-line `swiftc -O` program, 50
+/// delegate sessions built and dropped left 50 delegates alive; the same 50 with
+/// `finishTasksAndInvalidate()` left 0. Per request that was one session, delegate
+/// and queue leaked per finalized utterance. The cache is bounded by the manager's
+/// port scan (`portScanCount` candidates above `defaultPort`), and a class because a
+/// struct cannot hold the `Mutex`.
+final class LocalWhisperProvider: CorrectionProvider {
+    let manager: WhisperServerManager
+    private let clients = Mutex<[Int: WhisperClient]>([:])
+
+    init(manager: WhisperServerManager) {
+        self.manager = manager
+    }
+
+    /// `modelName` is the file the manager launches with, not something the server
+    /// reports (WhisperClient.swift header); for an ADOPTED server it is unverified, and
+    /// the ready trace says `ownership=adopted` for exactly that reason.
+    var displayName: String { "local whisper (\(manager.modelName))" }
+    var sendsAudioOffDevice: Bool { false }
+
+    /// Live readiness. Async, so nothing on the main actor gates on it — see
+    /// `AppDelegate.localCorrectionConfigured` for the synchronous question.
+    func isAvailable() async -> Bool { await manager.isHealthy() }
+
+    func transcribe(wav: Data, keyterms: [String]) async throws -> CorrectionResult {
+        let url = try await manager.ensureReady()
+        let port = url.port ?? WhisperServerManager.defaultPort
+        let modelName = manager.modelName
+        let client = clients.withLock { cache in
+            if let existing = cache[port] { return existing }
+            let fresh = WhisperClient(port: port, modelName: modelName)
+            cache[port] = fresh
+            return fresh
+        }
+        return try await client.transcribe(wav: wav, keyterms: keyterms)
+    }
+}
+
+/// The user's own glossary: `~/.config/thaidictate/keyterms.txt`, one term per line.
+///
+/// This file is where a word like `time` goes. `cloudKeyterms` is the app's built-in
+/// list and not the user's to edit; measured 2026-09-03
+/// (TEST-2026-09-03-oog-english.txt, synthetic voice), `time` and `test` went from
+/// never appearing to exact once they were in the prompt, so an editable list is the fix
+/// for "I say time and it does not appear" — necessary, not sufficient: `commit`,
+/// `check`, `Python` resisted even when added.
+///
+/// Read off the hotkey path (a detached task at launch and at every capture start —
+/// `beginCapture` is the synchronous hotkey handler and a file read does not belong on
+/// it), merged USER TERMS FIRST ahead of the built-ins, then clamped once through
+/// `CloudKeyFile.clampTerms`, the same clamp both providers apply. User first because
+/// `WhisperClient.promptString` keeps list order and drops what no longer fits its byte
+/// cap: the 20 built-ins already render to 452 of 800 bytes, so a user term appended
+/// LAST is the one that would fall off, unseen — the exact word the user reported
+/// missing. The `keyterms:` trace line prints how many terms were kept and dropped.
+enum UserKeyterms {
+    static let pathComponents = [".config", "thaidictate", "keyterms.txt"]
+
+    struct Loaded: Sendable {
+        /// Terms in file order, trimmed, comments and blanks removed. Not yet clamped.
+        let terms: [String]
+        let path: String
+        /// False when the file does not exist — an ordinary state, not an error.
+        let present: Bool
+    }
+
+    static func defaultURL() -> URL {
+        var url = FileManager.default.homeDirectoryForCurrentUser
+        for component in pathComponents { url.appendPathComponent(component) }
+        return url
+    }
+
+    /// A line whose first non-blank character is `#` is a comment; blank lines are
+    /// ignored. Only WHOLE-line comments, so `C#` is a term. A missing or unreadable
+    /// file is `present: false` with no terms — a no-op, never a failure.
+    static func load(from url: URL = defaultURL()) -> Loaded {
+        guard let data = try? Data(contentsOf: url) else {
+            return Loaded(terms: [], path: url.path, present: false)
+        }
+        var terms: [String] = []
+        let contents = String(decoding: data, as: UTF8.self)
+        for rawLine in contents.split(whereSeparator: \.isNewline) {
+            let term = rawLine.trimmingCharacters(in: .whitespaces)
+            if term.isEmpty || term.hasPrefix("#") { continue }
+            terms.append(term)
+        }
+        return Loaded(terms: terms, path: url.path, present: true)
+    }
+
+    /// User terms first, then the built-ins, de-duplicated and clamped once.
+    static func merge(user: [String], builtin: [String]) -> [String] {
+        CloudKeyFile.clampTerms(user + builtin)
+    }
+}
+
+/// The SCRIPT-SANITY gate `applyCloudResult` runs before `replaceRecentText`.
+///
+/// Measured motivation (TEST-2026-09-03-oog-english.txt, experiment 2; PLAN-2026-09-03-
+/// local-correction.md, "Out-of-glossary English", consequence 2): on the `check` clip
+/// whisper at beam 5 hallucinated Vietnamese — `chui, chết, hay nòi` — at the SAME
+/// length as the Thai it would have replaced, so the size-sanity gate alone would have
+/// overwritten correct-ish Thai with Vietnamese. v1 launches at default beam, where that
+/// clip did not do it; this gate is what stands between the user's text and the next
+/// clip that does. Engine-independent: Gemini has the same failure class.
+///
+/// Two tests, either one refuses:
+///   * a character outside the Thai block (U+0E00–U+0E7F), printable basic Latin
+///     (U+0020–U+007E), ordinary whitespace, or a short list of typographic punctuation
+///     Apple and Gemini both emit (dashes, curly quotes, ellipsis, no-break space).
+///     Vietnamese diacritics, CJK, Cyrillic and Arabic are all outside it, and all are
+///     hallucination signatures in a Thai+English dictation.
+///   * the Thai-letter share collapsing: the typed span was at least half Thai letters
+///     (U+0E01–U+0E3A, U+0E40–U+0E4E — consonants, vowels and marks; not Thai digits or
+///     ฿) and the correction is under a fifth. Catches a Latin-only rewrite of a Thai
+///     sentence, which the first test cannot.
+///
+/// The refusal names the offending scalars as `U+XXXX` code points, at most eight —
+/// what the engine invented, not what the user said, so `trace()`'s no-transcript rule
+/// holds. Shares are over non-whitespace scalars.
+enum CorrectionScript {
+    static let maxNamedOffenders = 8
+
+    static func isPermitted(_ u: Unicode.Scalar) -> Bool {
+        switch u.value {
+        case 0x0E00...0x0E7F, 0x20...0x7E, 0x09, 0x0A, 0x0D: return true
+        case 0x00A0, 0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2026: return true
+        default: return false
+        }
+    }
+
+    static func isThaiLetter(_ u: Unicode.Scalar) -> Bool {
+        switch u.value {
+        case 0x0E01...0x0E3A, 0x0E40...0x0E4E: return true
+        default: return false
+        }
+    }
+
+    /// Thai letters over non-whitespace scalars; 0 for an empty or all-blank string.
+    static func thaiLetterShare(of text: String) -> Double {
+        var letters = 0
+        var counted = 0
+        for u in text.unicodeScalars where !u.properties.isWhitespace {
+            counted += 1
+            if isThaiLetter(u) { letters += 1 }
+        }
+        return counted == 0 ? 0 : Double(letters) / Double(counted)
+    }
+
+    /// Distinct scalars outside the permitted set, in first-seen order.
+    static func offenders(in text: String) -> [Unicode.Scalar] {
+        var seen = Set<Unicode.Scalar>()
+        var out: [Unicode.Scalar] = []
+        for u in text.unicodeScalars where !isPermitted(u) && seen.insert(u).inserted {
+            out.append(u)
+        }
+        return out
+    }
+
+    /// Why `correction` may not replace `typed`, or `nil` when it may. The string is
+    /// safe for the trace: code points and percentages, never text.
+    static func refusal(typed: String, correction: String) -> String? {
+        let bad = offenders(in: correction)
+        if !bad.isEmpty {
+            let named = bad.prefix(maxNamedOffenders)
+                .map { String(format: "U+%04X", $0.value) }.joined(separator: " ")
+            let more = bad.count > maxNamedOffenders
+                ? " (+\(bad.count - maxNamedOffenders) more)" : ""
+            return "\(bad.count) character\(bad.count == 1 ? "" : "s") outside"
+                + " Thai/basic Latin/punctuation: \(named)\(more)"
+        }
+        let typedShare = thaiLetterShare(of: typed)
+        let correctionShare = thaiLetterShare(of: correction)
+        if typedShare >= 0.5, correctionShare < 0.2 {
+            return String(format: "Thai-letter share collapsed (typed %.0f%% -> correction"
+                + " %.0f%%)", typedShare * 100, correctionShare * 100)
+        }
+        return nil
+    }
+}
 
 /// System Settings panes. Named exactly, because "grant Accessibility" without the pane
 /// is a treasure hunt.
@@ -388,6 +618,28 @@ func describeCloudError(_ error: Error) -> (summary: String, missingKeyPath: Str
         case .transport(let reason):
             return ("could not reach Gemini — \(reason)", nil, nil)
         }
+    }
+    // ── Local whisper ────────────────────────────────────────────────────────────────
+    // `WhisperClient.ClientError` and `WhisperServerError` each carry an actionable line
+    // of their own ("brew install whisper-cpp", the model search path); without these
+    // arms they fell to the `NSError` line below as `MicTest.WhisperClient.ClientError
+    // code 1` and the text was lost exactly where the trace wanted it. The HTTP status
+    // is returned so the trace can name it; the 429 auto-disable in `applyCloudFailure`
+    // is Gemini-only, so a local status can never trip it. 503 is "loading model", which
+    // only an ADOPTED server mid-`/load` answers — our own child binds after loading
+    // (WhisperServerManager.swift header).
+    if let we = error as? WhisperClient.ClientError {
+        switch we {
+        case .httpStatus(503):
+            return ("local whisper-server is still loading its model (HTTP 503)", nil, 503)
+        case .httpStatus(let status):
+            return ("local whisper-server returned HTTP \(status)", nil, status)
+        case .unreachable, .emptyResponse, .decoding:
+            return ("local whisper — \(we.errorDescription ?? "\(we)")", nil, nil)
+        }
+    }
+    if let se = error as? WhisperServerError {
+        return ("local whisper-server could not start — \(se.description)", nil, nil)
     }
     let ns = error as NSError
     return ("\(ns.domain) code \(ns.code) — \(ns.localizedDescription)", nil, nil)
@@ -849,12 +1101,38 @@ private struct TraceCounters {
     /// deliberately left untouched. This is the number that matters when judging whether
     /// the focused app can host live revision at all.
     var divergencesRefused = 0
+    /// Repairs `repairDivergence` REFUSED TO ATTEMPT because the effective change — the
+    /// already-typed clusters the write would delete and NOT put back identically — was
+    /// over `reanchorMaxStaleChars`. Counted BEFORE `replaceLastInserted` is called, so the
+    /// document was never touched; each one is then routed through
+    /// `resolveUnrepairedRevision` as `.capRefused` and shows up again there as a
+    /// `divergencesRefused` re-anchor — partial or final — in an app that accepts repair.
+    /// It used to fresh-start on a partial instead, and run 7 measured what that did in
+    /// TextEdit (`TEST-2026-09-03-run7-trace.txt` lines 40-68): six of the seven, all on
+    /// the first sentence, each retyped the whole transcript, so that sentence stood six
+    /// times and the correction pass refused its own fix against the inflated span. Read
+    /// it as "whole-sentence overwrites that did not happen": the shape it stops is
+    /// `TEST-2026-08-31-run5-trace.txt` line 115, `replaced 175 stale chars with 178
+    /// chars`.
+    var repairsRefusedTooLarge = 0
+    /// Pure retractions (`replacement.isEmpty`) refused because more than
+    /// `retractionMaxStaleChars` already-typed clusters would have been deleted with
+    /// nothing typed back. Disjoint from `repairsRefusedTooLarge` — a refused retraction
+    /// is counted here only — so the two sum to every repair the caps stopped.
+    var retractionsRefused = 0
     /// Revisions whose stale tail was too long to strand (see `reanchorMaxStaleChars`) and
     /// which were answered instead by typing the whole transcript again after a separator.
     /// Each one leaves visibly duplicated text in the user's document, so this is the price
     /// of the strand cap: it is the number to read if the cap ever needs re-tuning, and a
     /// large value against a small `divergencesRefused` means the refusals are arriving at
     /// `lcp == 0` rather than mid-word.
+    ///
+    /// Since run 7 this is reachable ONLY from the app-refused route on a partial — an
+    /// app that has latched `finalOnlyInjection`, or one that just refused a repair for
+    /// real. A cap refusal in an app that accepts repair re-anchors instead, so on
+    /// TextEdit this should read 0. The 13 in run 7 were 7 cap refusals (now re-anchors)
+    /// plus 6 from the structural route after focus drifted to ChatGPT at trace line
+    /// 181; those 6 stay, and a focus drift will produce them again.
     var freshStarts = 0
     var secureInputRefusals = 0
     var finalChunks = 0
@@ -883,7 +1161,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let dictationItem = NSMenuItem()
     private let engineItem = NSMenuItem()
+    private let localDictationItem = NSMenuItem()
+    /// "Correction: …" — the parent of `correctionMenu`, its title carrying the state.
     private let cloudItem = NSMenuItem()
+    /// One entry per `CorrectionProviderKind`, each naming its privacy consequence.
+    private let correctionMenu = NSMenu()
+    private let correctionOffItem = NSMenuItem()
+    private let correctionLocalItem = NSMenuItem()
+    private let correctionGeminiItem = NSMenuItem()
     private let autoCorrectItem = NSMenuItem()
     private let daemonRestartItem = NSMenuItem()
     private let micStatusItem = NSMenuItem()
@@ -1268,6 +1553,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pipeline: AudioPipeline?
     private var isCapturing = false
 
+    private typealias FinalQueue = LocalTranscriptionQueue<Data, String>
+    private var finalQueue = FinalQueue()
+    private struct FinalCapture {
+        let target: TextInjector.BufferedTargetToken
+        let keyterms: [String]
+        var transcript = ""
+        var failure: String?
+    }
+    private var finalCaptures: [FinalQueue.CaptureID: FinalCapture] = [:]
+    private var localCaptureID: FinalQueue.CaptureID?
+    private var localWorker: Task<Void, Never>?
+    private var localDeliveryTask: Task<Void, Never>?
+    private var localTranscriptionSuspended = false
+    private var localTerminationRequested = false
+    private var activeLocalDictation = false
+    private var localDictationEnabled: Bool {
+        selectedEngineKind == .apple && WhisperServerManager.shared.localFinalConfigured
+            && (UserDefaults.standard.object(forKey: "localBilingualDictation") as? Bool ?? true)
+    }
+
+
     /// Non-nil only when MICTEST_AUDIO_FILE named a decodable file at capture start. While it
     /// is non-nil the microphone's own buffers are discarded in the tap closure and this
     /// object feeds the file in their place — see SyntheticAudioSource.swift for why that is
@@ -1373,8 +1679,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private nonisolated static let maxTransientRepairSkips = 3
 
     /// The largest stale tail, in grapheme clusters, that may be STRANDED in the user's
-    /// document by `reanchorAfterUnrepairedRevision`. Anything longer takes the fresh-start
-    /// path instead.
+    /// document by `reanchorAfterUnrepairedRevision` when the APP refused the repair —
+    /// and, since the run-5 wipe below, the largest EFFECTIVE change `repairDivergence`
+    /// may write in place at all. On the app-refused path anything longer takes the
+    /// fresh-start path instead; on the successful path anything longer is refused before
+    /// `replaceLastInserted` is called and — since run 7, see the end of this comment —
+    /// is stranded after all in an app that accepts repair, for the correction pass to
+    /// replace.
     ///
     /// TEN, and the reasoning is the measured shapes rather than a round number. The
     /// re-anchor design was justified on "typically the 3-7 characters the trace shows" —
@@ -1386,7 +1697,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// and a momentary AX refusal ("no focused element" in the trace) would otherwise
     /// strand all of it permanently. There is no continuum between the two: a real
     /// revision is a few clusters, a whole-utterance rewrite is dozens to hundreds.
+    ///
+    /// ── THE SAME TEN NOW BOUNDS THE SUCCESSFUL PATH, ON EFFECTIVE CHANGE ─────────────
+    /// The paragraph above bounded only what a REFUSED repair could strand. A repair the
+    /// app ACCEPTED had no bound at all, and `TEST-2026-08-31-run5-trace.txt` line 115 is
+    /// what that looks like: `kept 10 common chars, replaced 175 stale chars with 178
+    /// chars` — one AX write selected and overwrote the user's whole sentence, because the
+    /// recogniser rewrote an early word and the common prefix collapsed to 10. Thai has no
+    /// spaces, so an English word makes th-TH re-segment the Thai before it (`ผมใช้
+    /// Python` → `พรชัยพีเทิร์น`, TEST-2026-08-31-mixed-language.md line 54); `lcp` then
+    /// lands near 0 and `staleCount` is the whole 20 s window. The user reports it as
+    /// "the system resets and deletes all the words".
+    ///
+    /// The bound is on EFFECTIVE change, not raw `staleCount`, because the raw number
+    /// over-refuses: `replaced 93 stale chars with 83 chars` (same trace, line 86) is a
+    /// legitimate final reconciliation if most of the 93 are re-emitted identically at
+    /// the end of the 83. `repairDivergence` therefore subtracts the common SUFFIX of the
+    /// stale tail and its replacement — clusters the write would delete and put straight
+    /// back — and compares only what is actually destroyed. That 93/83 shape with an
+    /// 80-cluster suffix lands at 13 and is still refused: it is the borderline the cap
+    /// sits at, and thirteen clusters retracted mid-sentence is a sentence being
+    /// re-segmented, not a tone mark. What a refusal buys is a stale strand INSTEAD of a
+    /// wipe. Run 6 — every repair structurally refused, so every revision took that route
+    /// — is what it looks like at scale (`divergencesRefused=21`, three fresh starts).
+    /// That is the intended trade for a user whose words were being deleted, and it is
+    /// not to be "fixed" by widening this.
+    ///
+    /// ── WHAT A CAP REFUSAL ON A PARTIAL DOES NOW, AND WHY IT IS NOT A FRESH START ────
+    /// S1 first routed a cap refusal exactly like an app refusal, so on a partial — where
+    /// `staleCount` is over ten by construction — it fresh-started. Run 7, mixed Thai and
+    /// English in TextEdit (`TEST-2026-09-03-run7-trace.txt`), measured the cost: th-TH
+    /// rewrites the Thai before every English word, so the first sentence was refused six
+    /// times running (lines 40-68, effective 18/23/27/18/21/36), each refusal retyped the
+    /// whole transcript, and the document ended with that sentence SIX times. Worse, the
+    /// duplicates all sat inside the span the correction pass snapshots, so the clean
+    /// 38-char fix was refused as `cloud text size mismatch (span 225 vs cloud 38)` (line
+    /// 76). The cap had turned "delete my sentence" into "repeat it six times and block
+    /// the fix". Lines 195 and 218 are the same mismatch from the OTHER route — spans of
+    /// 192 and 122 built by the structural fresh starts at 183-200 after focus drifted to
+    /// ChatGPT (line 181) — and this rule leaves those alone.
+    ///
+    /// So `resolveUnrepairedRevision` now RE-ANCHORS a cap refusal in an app that accepts
+    /// repair, whatever the stale count: ledger := recogniser text, document untouched,
+    /// typing continues. The strand this leaves is larger than ten and that is accepted,
+    /// because it is confined to the app's own output, it is one rewrite deep, and the
+    /// ~1 s correction pass can replace it — the typed span stays the size of one
+    /// utterance, which is exactly what the fresh start destroyed. The app-refused route
+    /// keeps its fresh start: an app that cannot be repaired at all has no pass to clean
+    /// a strand up, and run 6 already showed the fresh start is the better failure there.
+    /// Unproven until the harness is re-run with focus held in TextEdit: that line 76's
+    /// mismatch becomes an applied correction, and that the stranded tail really sits
+    /// inside the span that pass replaces rather than one chunk cut behind it.
     private nonisolated static let reanchorMaxStaleChars = 10
+
+    /// The largest PURE RETRACTION, in grapheme clusters, that `repairDivergence` may apply
+    /// in place: a repair whose replacement is empty, so the write deletes already-typed
+    /// text and puts nothing back.
+    ///
+    /// FOUR, tighter than `reanchorMaxStaleChars`, because this is the worst shape a
+    /// repair can take. Every other repair leaves the recogniser's current wording in the
+    /// document; a retraction leaves a hole, and retracted text is text the recogniser
+    /// has not finished with — run 5 lines 123-124 are a 3-cluster pure delete at `kept
+    /// 19` and, in the same second, `kept 1 … replaced 18 stale chars with 22` over the
+    /// same region. A large retraction the next partial reverses has deleted the user's
+    /// words for nothing. Four admits every pure delete run 5 measured — 3, 3 and 4
+    /// clusters (lines 34, 123, 164) — and that is the whole of its justification. It
+    /// is NOT "one syllable": Swift keeps a base consonant with its marks in one
+    /// `Character`, but a leading vowel (เ แ โ ใ ไ), a trailing one (า ะ ำ) and a final
+    /// consonant are each their own cluster, so a syllable of that shape is five
+    /// (เครื่อง = เ·ค·รื่·อ·ง). A legitimate one-syllable retraction of that shape is
+    /// refused and the text kept until the next partial rewrites it — accepted for v1;
+    /// revisit if S5 shows `retractionsRefused>0` on Thai-only speech.
+    private nonisolated static let retractionMaxStaleChars = 4
 
     /// True once a cloud correction has been applied for the current utterance. The
     /// on-device FINAL can arrive AFTER the (faster, more accurate) cloud result --
@@ -1486,7 +1868,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return (nil, d.summary, d.missingKeyPath)
         }
     }()
-    private var cloudAvailable: Bool { cloudSetup.client?.isConfigured == true }
+    /// Is there a `GOOGLE_API_KEY` on disk? Answers for BOTH Gemini consumers — the Gemini
+    /// Live engine and the `.gemini` correction provider — and for nothing else. This used
+    /// to be `cloudAvailable`; the rename is deliberate, because "available" now also has
+    /// a per-provider meaning (`correctionAvailable`), and conflating the two would let a
+    /// user who keeps a key but picks `.local` lose the Gemini Live engine from the menu.
+    private var geminiKeyAvailable: Bool { cloudSetup.client?.isConfigured == true }
 
     // ---- Which engine drives the live text -------------------------------------------
     //
@@ -1499,9 +1886,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private nonisolated static let engineDefaultsKey = "dictationEngine"
 
     /// The user's EFFECTIVE choice — what the next capture will start. Clamped to `.apple`
-    /// at launch when there is no Google key on disk, exactly as `cloudEnabled` is clamped
-    /// by `cloudAvailable`; the stored preference is deliberately NOT rewritten by that
-    /// clamp, so restoring the key restores the choice.
+    /// at launch when there is no Google key on disk, exactly as `correctionKind` is clamped
+    /// by `correctionAvailable`; the stored preference is deliberately NOT rewritten by
+    /// that clamp, so restoring the key restores the choice.
     private var selectedEngineKind: DictationEngineKind = {
         let d = UserDefaults.standard
         guard let raw = d.string(forKey: AppDelegate.engineDefaultsKey),
@@ -1517,8 +1904,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// a convention. Every mid-session caller — the drain-cancel resume, `endCapture`,
     /// `finishCapture`, the watchdog's stand-down gate, the trace lines — reads
     /// `activeEngine`, so there is no code path that can hand a live session's audio to
-    /// one engine and its `stop()` to another. Mirrors `toggleCloud`'s precedent, where
-    /// the chunk loop's existence is likewise decided once at session start.
+    /// one engine and its `stop()` to another. Mirrors `selectCorrection`'s precedent,
+    /// where the chunk loop's existence is likewise decided once at session start.
     private var activeEngineKind: DictationEngineKind = .apple
 
     /// The engine object for `activeEngineKind`. A two-case switch on a stored enum, on
@@ -1531,12 +1918,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Can Gemini Live be chosen at all? Both halves are load-bearing: `cloudAvailable`
+    /// Can Gemini Live be chosen at all? Both halves are load-bearing: `geminiKeyAvailable`
     /// answers "is there a `GOOGLE_API_KEY` on disk" — the same key, in the same file, as
-    /// the accuracy pass reads, which is also what lets the menu name the path to create —
-    /// and `isSupported` is the engine's own veto for anything else that would stop it
-    /// running here.
-    private var geminiLiveAvailable: Bool { cloudAvailable && geminiRecognizer.isSupported }
+    /// the `.gemini` correction provider reads, which is also what lets the menu name the
+    /// path to create — and `isSupported` is the engine's own veto for anything else that
+    /// would stop it running here. Independent of `correctionKind` on purpose: choosing
+    /// local correction must not take the Gemini Live engine away from a keyed user.
+    private var geminiLiveAvailable: Bool {
+        geminiKeyAvailable && geminiRecognizer.isSupported
+    }
 
     /// Rate limiter for the watchdog's stand-down line, in the shape of
     /// `lastTier3WouldFireLoggedAt` and for the same reason: the ladder's strike branch can
@@ -1544,21 +1934,146 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// would bury the events it is meant to be read beside.
     private var lastEngineStandDownTracedAt = Date.distantPast
 
-    /// "Cloud accuracy pass" menu toggle — REALTIME-FIRST, default OFF. The user's explicit
-    /// directive: "I don't need auto-correction. I need realtime and fast dictation." The
-    /// cloud pass (10 s chunk uploads, ~2-4 s round trips, span-matching replacement) is
-    /// therefore opt-in from the menubar, not the default. Persisted in UserDefaults with
-    /// nil-means-OFF semantics: a stored explicit value (a previous menubar toggle) wins,
-    /// so opting in survives relaunches. The effective value is computed at launch
-    /// (`applicationDidFinishLaunching`) because it also requires `cloudAvailable`, which
-    /// depends on the `cloudSetup` stored property and so cannot be read in a property
-    /// initializer here.
-    ///
-    /// UNCHANGED BY THE MOVE TO GEMINI, deliberately. This toggle is not about which vendor
-    /// gets the audio, it is about whether audio leaves the machine at all — the only
-    /// network egress in this app. A provider swap is no reason to opt someone in.
+    // ---- The correction provider setting ---------------------------------------------
+    //
+    // `correctionKind` is what the menu's "Correction" submenu selects and what
+    // `beginCapture` reads once per session — the chunk loop's existence is decided at
+    // session start, like the engine. Persisted under `correctionProviderDefaultsKey`.
+    //
+    // HISTORY, because the stored keys carry it. Until 2026-09-03 the only second engine
+    // was Gemini and the setting was one Bool, `cloudPassEnabled` — "Cloud accuracy pass",
+    // REALTIME-FIRST, default OFF at the user's directive ("I don't need auto-correction.
+    // I need realtime and fast dictation."), opt-in from the menubar because it was the
+    // only network egress in this app. That key is still read (once, below) and still
+    // written by `selectCorrection` — as `kind == .gemini`, never as "the pass is on":
+    // written as on-ness, a local-only user's `true` would read to an older build as
+    // "send audio to Google".
+    //
+    // MIGRATION (`resolveCorrectionKind`), run once, on the first launch where the new key
+    // is absent. The new key is authoritative thereafter and the old one is never consulted
+    // again while it exists — otherwise a user who moved from Gemini to local would be
+    // moved back on every launch, and audio would leave the Mac against their choice:
+    //   * old key stored `true`  → `.gemini`, and the new key is written. Nothing changes
+    //     for that user: they opted in to Google and still are. If the key file no longer
+    //     configures Gemini the effective pass is off with the "NOT configured" trace, and
+    //     the stored choice is left alone so restoring the key restores it — the
+    //     `selectedEngineKind` idiom.
+    //   * old key stored `false` → `.off`, and the new key is written. An explicit
+    //     opt-out stays an opt-out; the menu offers local one click away.
+    //   * nothing stored → `.local` if the pinned binary AND a model file exist, else
+    //     `.off`. NOT written: a computed default stays computed, so a model appearing
+    //     or vanishing later moves between local and off and can never produce gemini.
+    // On this Mac at the time of writing none of the three keys was stored (`defaults
+    // read com.boombignose.mictest` held only the HUD origin), so this user lands on the
+    // computed default.
     private nonisolated static let cloudPassDefaultsKey = "cloudPassEnabled"
-    private var cloudEnabled = false
+    private nonisolated static let correctionProviderDefaultsKey = "correctionProvider"
+    private var correctionKind: CorrectionProviderKind = .off
+
+    /// The kind the CURRENT session's chunk loop was built for (`.off` when no loop was
+    /// started), for the capture-stopped summary — the `activeEngineKind` split again.
+    private var activeCorrectionKind: CorrectionProviderKind = .off
+
+    /// The pinned `whisper-server`, resolved once at init: two `stat`s, and an answer this
+    /// app would not act on mid-run anyway (the `cloudSetup` idiom).
+    private let localBinaryPath: String? = WhisperServerManager.discoverBinary()
+
+    /// Can `.local` serve at all? CONFIGURED, not READY: the binary and a model file
+    /// exist. Readiness is asynchronous — a loopback probe, a ~2 s model load — and every
+    /// consumer of this property is a synchronous main-actor gate (`refreshMenu`,
+    /// `beginCapture`, `noteFinalChunk`), so readiness is not part of it; nothing on the
+    /// main actor ever awaits `CorrectionProvider.isAvailable()`.
+    /// `LocalWhisperProvider.transcribe` awaits the server itself, and a server that is
+    /// not up surfaces as a traced failure of that one utterance, never as a disabled
+    /// pass — and never as a chunk loop that was not created.
+    private var localCorrectionConfigured: Bool {
+        localBinaryPath != nil && WhisperServerManager.shared.modelURL != nil
+    }
+
+    private let localProvider = LocalWhisperProvider(manager: WhisperServerManager.shared)
+
+    /// Is the selected provider configured? See `localCorrectionConfigured` for why this
+    /// is a synchronous, static answer.
+    private var correctionAvailable: Bool {
+        switch correctionKind {
+        case .off: return false
+        case .local: return localCorrectionConfigured
+        case .gemini: return geminiKeyAvailable
+        }
+    }
+
+    /// The pass will run for the next session: a provider is selected, it is configured,
+    /// and this process has not switched it off itself (`cloudAutoDisabledReason`).
+    private var correctionEnabled: Bool {
+        correctionKind != .off && correctionAvailable && cloudAutoDisabledReason == nil
+    }
+
+    /// Why `correctionEnabled` is false, for the gate traces.
+    private var correctionGateState: String {
+        if correctionKind == .off { return "off" }
+        if !correctionAvailable { return "unavailable (\(correctionKind.rawValue))" }
+        return "auto-disabled"
+    }
+
+    /// The provider object for `correctionKind`, or nil when the pass cannot run.
+    private var correctionProvider: (any CorrectionProvider)? {
+        guard correctionAvailable else { return nil }
+        switch correctionKind {
+        case .off: return nil
+        case .local: return localProvider
+        case .gemini: return cloudSetup.client
+        }
+    }
+
+    /// For the summary lines: the model behind a kind.
+    private func correctionModelName(for kind: CorrectionProviderKind) -> String {
+        switch kind {
+        case .off: return "(none)"
+        case .local: return WhisperServerManager.shared.modelName
+        case .gemini: return GeminiClient.model
+        }
+    }
+
+    /// The merged glossary the next dispatch sends: user terms first, then
+    /// `cloudKeyterms`, clamped (`UserKeyterms`). Published from a detached read
+    /// (`reloadKeyterms`) and read inside `dispatchFinalChunk`'s MainActor hop, where it
+    /// is captured by value into the detached `cloudPass` — `[String]` is Sendable, and
+    /// that hop is the one place per chunk that is already on the main actor, so
+    /// `cloudPass` (nonisolated) never reads main-actor state.
+    private var activeKeyterms: [String] = cloudKeyterms
+
+    // ---- Local server lifecycle: ONE serial chain -----------------------------------
+    //
+    // Every start and stop of the local server goes through `enqueueServerLifecycle`,
+    // which chains onto the previous operation. Independent `Task`s from `beginCapture`
+    // (start) and the sleep/lock observers (stop) would have no arrival order at the
+    // actor — the mechanism `RecognizerEventBox` documents — and the realistic ordering,
+    // wake then hotkey, could land `ensureReady` while `stop()` is still waiting on the
+    // child's exit, take its fast path against a port the child is about to release,
+    // and hand back a URL that refuses the next request.
+    private var serverLifecycle: Task<Void, Never>?
+    /// True while the chain's newest operation is a START — the only kind a later stop
+    /// may cancel. Cancelling a stop would turn its bounded SIGTERM wait into an
+    /// immediate SIGKILL (`waitForExit`'s sleep throws at once under cancellation).
+    private var serverLifecycleIsStart = false
+    /// True from the first start request until a stop: lets the stop paths skip the
+    /// trace and the actor hop when there is nothing to stop.
+    private var localServerRequested = false
+    /// Stops an idle local server `localServerIdleStopSeconds` after the last capture
+    /// ends; cancelled by the next capture start. NOT on the chain — a ten-minute sleep
+    /// on the serial chain would hold every later start behind it.
+    private var localIdleStopTask: Task<Void, Never>?
+    /// The server holds ~1.6 GB of weights (ggml-large-v3-turbo, WhisperServerManager.swift
+    /// header). Kept warm between captures so a dictating user pays the load once;
+    /// released after ten idle minutes, on sleep, on lock, and on quit; `ensureReady`
+    /// pays ~2 s again at the next capture start.
+    private nonisolated static let localServerIdleStopSeconds: Double = 600
+    /// One phrase for the menu: what the local server last reported.
+    private var localServerStatus = "not started"
+    /// How many lines of the manager's log ring have been forwarded into the trace.
+    private var forwardedManagerLogLines = 0
+    /// SIGTERM handler, held for the life of the process — see `installSignalHandlers`.
+    private var sigtermSource: DispatchSourceSignal?
 
     /// "Auto-correct from cloud" menu toggle — nil-means-ON. When ON, a cloud result that
     /// differs from the span typed for its audio chunk is applied IN PLACE via
@@ -1567,27 +2082,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// correction". Persisted in UserDefaults, and an explicit stored choice still wins, so
     /// either decision survives relaunches (same pattern as the hotkey override).
     ///
-    /// DEFAULT FLIPPED TO ON AT THE USER'S EXPLICIT REQUEST, alongside the move to Gemini:
-    /// asked what they wanted, they chose "Apple live + Gemini chunks" — i.e. corrections
-    /// that are actually applied, not merely offered. The paragraph this replaces argued
-    /// the other way, on the user's earlier directive ("I don't need auto-correction. I
-    /// need realtime and fast dictation."), and that reasoning is recorded here rather than
-    /// deleted because nothing about the ENGINEERING changed: an applied correction is
-    /// still a rewrite of text already sitting in someone else's document, seconds after
-    /// they typed it.
-    ///
-    /// So this default is a user preference, not an engineering conclusion — the same
-    /// standing as `daemonRestartEnabled` below. One click of the menubar item reverts it,
-    /// and every safety gate in `applyCloudResult` (span ≥ 10 graphemes, size sanity,
-    /// secure-input refusal, verified-match-or-nothing) is untouched by the flip: this
-    /// changes how often that path RUNS, never how carefully it runs.
+    /// Automatic rewriting is opt-in. With it off, partials remain in the live HUD
+    /// until a complete transcript is inserted once. The same switch gates Apple
+    /// tail repairs and second-pass replacement; a provider is not required to change
+    /// it. Keep the existing defaults key so a stored preference survives upgrades.
     private nonisolated static let autoCorrectDefaultsKey = "cloudAutoCorrect"
     private var autoCorrectEnabled: Bool = {
         let d = UserDefaults.standard
         return d.object(forKey: AppDelegate.autoCorrectDefaultsKey) == nil
-            ? true
+            ? false
             : d.bool(forKey: AppDelegate.autoCorrectDefaultsKey)
     }()
+
+    // With rewriting off, keep the entire evolving transcript in the HUD. Commit
+    // once at a recognizer boundary or normal stop; slicing by an old character
+    // count corrupts Thai tone-mark revisions and mixed-language word merges.
+    private var stableTranscript = StableTranscriptBuffer()
 
     /// "Restart macOS speech service when wedged" menu toggle — the TRIGGER for the
     /// watchdog's tier 3, default OFF, same nil-means-OFF UserDefaults semantics as the two
@@ -1744,38 +2254,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         trace("bundleIdentifier: \(bid)")
         trace("bundlePath: \(Bundle.main.bundlePath)")
         trace("executablePath: \(Bundle.main.executablePath ?? "(nil)")")
-        trace("localWhisperFallbackEnabled=\(localWhisperFallbackEnabled) "
-            + "(WhisperClient.swift is retained but never called; LiveRecognizer drives live text)")
         trace("hotkey: keyCode \(hotkey.keyCode) (Right-Option is \(ModifierKey.rightOption))")
 
         // Accessory, not regular: no Dock icon, no app switcher entry, no main menu bar.
         // The status item and the HUD are the entire surface.
         NSApp.setActivationPolicy(.accessory)
 
-        // Realtime-first: nil-means-OFF. The cloud pass runs only when the user has
-        // explicitly opted in from the menubar (stored true) AND a key is configured.
-        // The trace states the EFFECTIVE state and never any key material.
-        let storedCloudChoice = UserDefaults.standard.object(forKey: Self.cloudPassDefaultsKey) == nil
-            ? false
-            : UserDefaults.standard.bool(forKey: Self.cloudPassDefaultsKey)
-        cloudEnabled = cloudAvailable && storedCloudChoice
-        if cloudAvailable {
-            trace(cloudEnabled
-                ? "gemini: configured (\(GeminiClient.model)); cloud pass ON "
-                    + "(stored menubar opt-in; keyterms: \(cloudKeyterms.count))"
-                : "gemini: configured (\(GeminiClient.model)); cloud pass OFF by default "
-                    + "(enable from the menubar)")
+        // The correction provider: stored choice, migrated legacy choice, or the computed
+        // default — the rule and its history are at `correctionKind`. The trace states
+        // the EFFECTIVE state, the paths it depends on, and never any key material. The
+        // live text is Apple's in every case; this line is about the second engine only.
+        // The whole `correction: provider=` prefix is one literal so the built binary
+        // carries it contiguously (`strings … | grep -c "correction: provider="`).
+        let migration = resolveCorrectionKind()
+        let modelFile = WhisperServerManager.shared.modelURL?.path ?? "missing"
+        trace("correction: provider=\(correctionKind.rawValue) "
+            + "model=\(correctionModelName(for: correctionKind)) "
+            + "binary=\(localBinaryPath ?? "missing") modelFile=\(modelFile) "
+            + "available=\(correctionAvailable) live=Apple"
+            + (migration.map { " (\($0))" } ?? " (stored choice)"))
+        if geminiKeyAvailable {
+            trace("gemini: configured (\(GeminiClient.model)) — "
+                + (correctionKind == .gemini
+                    ? "selected as the correction provider; audio is sent to Google"
+                    : "available to Gemini Live and the correction menu; not selected"))
         } else {
-            trace("gemini: NOT configured — \(cloudSetup.error ?? "unknown reason"); cloud pass disabled")
+            trace("gemini: NOT configured — \(cloudSetup.error ?? "unknown reason")"
+                + (correctionKind == .gemini
+                    ? "; the stored gemini choice is unavailable until a key exists"
+                    : ""))
         }
         // Both halves say whether the state is the default or a stored choice, in BOTH
         // directions — the shape `daemonRestartEnabled`'s line below already uses. A trace
         // that hardcodes "(default)" against one value silently lies the day the default
         // flips, which is exactly what this line did before auto-correct became nil-means-ON.
         let autoCorrectStored = UserDefaults.standard.object(forKey: Self.autoCorrectDefaultsKey) != nil
-        trace("auto-correct from cloud: "
+        trace("automatic corrections (live repairs and second pass): "
             + (autoCorrectEnabled
-                ? "ON \(autoCorrectStored ? "(stored opt-in)" : "(default — user's choice, see autoCorrectEnabled)")"
+                ? "ON \(autoCorrectStored ? "(stored opt-in)" : "(default)")"
                 : "OFF \(autoCorrectStored ? "(stored opt-out)" : "(default)")"))
         trace("restart macOS speech service when wedged: "
             + (daemonRestartEnabled
@@ -1783,7 +2299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 : "OFF (stored opt-out) — watchdog tier 3 detects and logs only"))
 
         // The engine, clamped and named. Clamping here rather than at capture time is the
-        // `cloudEnabled` idiom above, and it is sound for the same reason: `cloudSetup` is
+        // `correctionKind` idiom above, and it is sound for the same reason: `cloudSetup` is
         // built once at init, so the key cannot appear or vanish mid-run and there is
         // nothing later to re-evaluate. The trace says which engine the run used, in both
         // directions and never a key — two runs whose numbers are compared without knowing
@@ -1810,6 +2326,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wireRecognizer()
         wireHotkey()
         wireSystemStateObservers()
+        installSignalHandlers()
 
         // The HUD comes up idle rather than hidden, and stays that way: see the header. This
         // is the affordance that survives a status item hiding behind the notch.
@@ -1841,6 +2358,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let termsField: String = "contextualStrings=\(cloudKeyterms.count)"
         trace("recognizer: \(engineField) \(appleField) \(geminiField) "
             + "\(availField) \(termsField)")
+
+        // The user's glossary and the local server, both off the main thread. The preload
+        // is what makes the first utterance's correction arrive at steady-state latency
+        // instead of behind a ~2 s model load and a ~2.6 s warm-up (WhisperServerManager
+        // header) — during which the one-in-flight gate would refuse every later chunk —
+        // and it is what lets a launch with no capture at all prove that the server
+        // starts with the app and stops with it.
+        reloadKeyterms(reason: "launch")
+        trace("local bilingual primary: \(localDictationEnabled ? "ON" : "OFF"); configured=\(WhisperServerManager.shared.localFinalConfigured)")
+        startLocalServer(reason: "launch preload")
 
         requestPermissions()
 
@@ -1883,9 +2410,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         false
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard finalQueue.pendingCaptureCount > 0 || localDeliveryTask != nil else { return .terminateNow }
+        localTerminationRequested = true
+        wantsDictation = false
+        finishCapture(reason: "finishing local transcription before quit")
+        hud.set(.transcribing("Finishing transcription before quitting…"))
+        return .terminateLater
+    }
+
+    private func finishLocalTerminationIfReady() {
+        guard localTerminationRequested, !isCapturing,
+              finalQueue.pendingCaptureCount == 0,
+              localDeliveryTask == nil, localWorker == nil else { return }
+        localTerminationRequested = false
+        NSApp.reply(toApplicationShouldTerminate: true)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         wantsDictation = false
         finishCapture(reason: "app terminating")
+        // Synchronous SIGTERM to an owned whisper-server — there is no time to await
+        // `stop()` here. An adopted server is left alone by the manager's rule.
+        localIdleStopTask?.cancel()
+        WhisperServerManager.shared.emergencyStop()
+        if localServerRequested {
+            trace("correction: emergencyStop() sent (owned or reclaimed child SIGTERMed; "
+                + "an adopted server is left alone) — app quitting")
+        }
         hotkey.stop()
         uiTimer?.invalidate()
         statusTimer?.invalidate()
@@ -1941,19 +2493,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dictationItem.action = #selector(toggleDictation)
         menu.addItem(dictationItem)
 
-        // Directly under "Dictation", above the cloud pass: this item decides what the
-        // dictation line itself does, where the two cloud items only decorate its output.
+        // Directly under "Dictation", above the correction pass: this item decides what
+        // the dictation line itself does, where the correction items only decorate its
+        // output.
         engineItem.title = "Dictation engine"
         engineItem.target = self
         engineItem.action = #selector(toggleEngine)
         menu.addItem(engineItem)
+        localDictationItem.target = self
+        localDictationItem.action = #selector(toggleLocalDictation)
+        menu.addItem(localDictationItem)
 
-        cloudItem.title = "Cloud accuracy pass"
-        cloudItem.target = self
-        cloudItem.action = #selector(toggleCloud)
+        // "Correction": a submenu with one entry per provider, not a toggle. Three states
+        // do not fit a checkmark, and a click that cycled off → local → gemini would put
+        // "send my audio to Google" one accidental click past "keep it local". Each entry
+        // names its privacy consequence in its own title; the parent shows the state.
+        cloudItem.title = "Correction"
+        cloudItem.submenu = correctionMenu
+        for (kind, entry) in correctionEntries {
+            entry.target = self
+            entry.action = #selector(selectCorrection(_:))
+            entry.representedObject = kind.rawValue
+            correctionMenu.addItem(entry)
+        }
         menu.addItem(cloudItem)
 
-        autoCorrectItem.title = "Auto-correct from cloud"
+        autoCorrectItem.title = "Automatic corrections"
         autoCorrectItem.target = self
         autoCorrectItem.action = #selector(toggleAutoCorrect)
         menu.addItem(autoCorrectItem)
@@ -2010,7 +2575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         copyTranscriptItem.action = #selector(copyLastTranscript)
         menu.addItem(copyTranscriptItem)
 
-        copyCloudItem.title = "Copy cloud correction"
+        copyCloudItem.title = "Copy correction"
         copyCloudItem.target = self
         copyCloudItem.action = #selector(copyCloudCorrection)
         menu.addItem(copyCloudItem)
@@ -2074,11 +2639,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     + "effect at the next capture."
             }
         } else {
-            // Same shape as the cloud-pass line below, because it is the same missing key
-            // in the same file: name the file to create and the assignment to put in it.
+            // Same shape as the Gemini entry of the correction submenu below, because it
+            // is the same missing key in the same file: name the file to create and the
+            // assignment to put in it.
             engineItem.title = "Dictation engine: Apple (on-device) — Gemini Live "
                 + (cloudSetup.keyPath.map { "unavailable: create \($0) with \(GeminiClient.keyName)=…" }
-                    ?? (cloudAvailable
+                    ?? (geminiKeyAvailable
                         ? "unavailable: the engine reports it cannot run here"
                         : (cloudSetup.error ?? "unavailable: no \(GeminiClient.keyName)")))
             engineItem.isEnabled = false
@@ -2086,30 +2652,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 + "no audio leaves it."
         }
 
-        if cloudAvailable {
-            if !cloudEnabled, let reason = cloudAutoDisabledReason {
-                // An off toggle nobody switched off needs to say why, or the next thing
-                // the user does is file a bug about the cloud pass "randomly stopping".
-                cloudItem.title = "Cloud accuracy pass: off (auto-disabled — \(reason))"
-            } else {
-                cloudItem.title = cloudEnabled ? "Cloud accuracy pass: on" : "Cloud accuracy pass: off"
-            }
-            cloudItem.state = cloudEnabled ? .on : .off
-            cloudItem.isEnabled = true
-        } else {
-            cloudItem.title = "Cloud accuracy pass unavailable — "
+        // ── The correction submenu ────────────────────────────────────────────────────
+        // Every entry says where the audio goes, in BOTH the available and the
+        // unavailable state; the unavailable text names what to install or create.
+        localDictationItem.title = localDictationEnabled
+            ? "Thai + English: local large-v3 — preview, then type"
+            : "Thai + English: local large-v3 (off)"
+        localDictationItem.state = localDictationEnabled ? .on : .off
+        localDictationItem.isEnabled = !isCapturing && finalQueue.pendingCaptureCount == 0
+            && selectedEngineKind == .apple && WhisperServerManager.shared.localFinalConfigured
+        localDictationItem.toolTip = "Transcribes completed speech on this Mac and inserts it once. Apple provides the live preview."
+        let localName = "local whisper (\(WhisperServerManager.shared.modelName))"
+        correctionOffItem.title = "Off — no second-pass rewriting"
+        correctionLocalItem.title = localCorrectionConfigured
+            ? "\(localName) — audio stays on this Mac"
+            : "Local whisper unavailable — "
+                + (localBinaryPath == nil
+                    ? "brew install whisper-cpp (no whisper-server at /opt/homebrew/bin"
+                        + " or /usr/local/bin)"
+                    : "no ggml-*.bin model in the search directories"
+                        + " (WhisperServerManager.modelSearchDirectories)")
+        correctionLocalItem.isEnabled = localCorrectionConfigured
+        correctionGeminiItem.title = geminiKeyAvailable
+            ? "Gemini (\(GeminiClient.model)) — audio is SENT TO GOOGLE"
+            : "Gemini unavailable — "
                 + (cloudSetup.keyPath.map { "create \($0) with \(GeminiClient.keyName)=…" }
                     ?? (cloudSetup.error ?? "no key"))
-            cloudItem.state = .off
-            cloudItem.isEnabled = false
+        correctionGeminiItem.isEnabled = geminiKeyAvailable
+        for (kind, entry) in correctionEntries {
+            entry.state = correctionKind == kind ? .on : .off
         }
+        let stateText: String
+        switch correctionKind {
+        case .off:
+            stateText = "off"
+        case .local:
+            stateText = correctionAvailable
+                ? "\(localName) — audio stays on this Mac; server \(localServerStatus)"
+                : "local whisper (unavailable — see submenu)"
+        case .gemini:
+            stateText = correctionAvailable
+                ? "Gemini (\(GeminiClient.model)) — audio is sent to Google"
+                : "Gemini (unavailable — see submenu)"
+        }
+        // A pass nobody switched off needs to say why, or the next thing the user does
+        // is file a bug about corrections "randomly stopping".
+        cloudItem.title = "Correction: \(stateText)"
+            + (cloudAutoDisabledReason.map { " (auto-disabled — \($0))" } ?? "")
+        cloudItem.toolTip = "The correction pass re-transcribes each finished utterance "
+            + "and repairs the typed text; Apple (on-device) always drives the live text. "
+            + "A change takes effect at the next capture."
 
         autoCorrectItem.title = autoCorrectEnabled
-            ? "Auto-correct from cloud: on"
-            : "Auto-correct from cloud: off — cloud text is display-only"
+            ? "Automatic corrections: on — live text can be rewritten"
+            : "Automatic corrections: off — preview, then insert completed text"
         autoCorrectItem.state = autoCorrectEnabled ? .on : .off
-        // Meaningless without the cloud pass itself.
-        autoCorrectItem.isEnabled = cloudAvailable
+        // Meaningless without the correction pass itself.
+        autoCorrectItem.isEnabled = !isCapturing && drainTimer == nil && !localDictationEnabled
+        autoCorrectItem.toolTip = "Controls live text repairs and second-pass replacement. "
+            + "When off, the HUD previews speech and completed text is inserted once. "
+            + "Stop dictation before changing this setting."
 
         daemonRestartItem.title = daemonRestartEnabled
             ? "Restart macOS speech service when wedged: on"
@@ -2205,7 +2807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !hotkey.isHealthy {
             return "Hotkey tap is not running — \(defaultHotkeyName) will not start dictation."
         }
-        if speechAuthorized == false {
+        if speechAuthorized == false && !localDictationEnabled {
             return "Speech recognition not authorized — "
                  + "System Settings > Privacy & Security > Speech Recognition."
         }
@@ -2352,12 +2954,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func systemWillSleep(_ note: Notification) {
+        // BEFORE the shared handler, whose `actingNow` guard returns early when nothing
+        // is live: the local server is up between captures precisely when nothing is
+        // live, and it must not keep 1.6 GB resident and a loopback listener open
+        // through sleep — "must not outlive the ability to stop it" applies to it too.
+        stopLocalServer(reason: "the Mac is going to sleep")
         stopBecauseOffSwitchIsUnreachable(
             why: "the Mac is going to sleep",
             message: "Dictation stopped because the Mac is going to sleep.")
     }
 
     @objc private func screenWasLocked(_ note: Notification) {
+        stopLocalServer(reason: "the screen was locked")   // see `systemWillSleep`
         stopBecauseOffSwitchIsUnreachable(
             why: "the screen was locked",
             message: "Dictation stopped because the screen was locked. The lock screen takes "
@@ -2382,6 +2990,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///      out and would otherwise overwrite the explanation seconds later. A microphone
     ///      that switched itself off without saying why is its own bug.
     private func stopBecauseOffSwitchIsUnreachable(why: String, message: String) {
+        localTranscriptionSuspended = true
+        for id in finalCaptures.keys {
+            finalCaptures[id]?.failure = "Dictation stopped — \(why). Use Copy last transcript for completed text."
+        }
         let wasLive = isCapturing || drainTimer != nil
         let actingNow = wasLive || wantsDictation
         // Trace unconditionally: "the hotkey died while idle" is a real diagnosis too, and
@@ -2421,6 +3033,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Capture
 
     private func beginCapture() {
+        // New recording gets its own audio and target while older results drain.
+        if activeLocalDictation && drainTimer != nil {
+            finishCapture(reason: "new capture during local finalization")
+        }
         // A press that arrives during the drain window cancels the teardown: the user has
         // pressed again, and this is one continuous session as far as the engine is concerned.
         if drainTimer != nil {
@@ -2428,6 +3044,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             drainTimer = nil
             trace("beginCapture: cancelled a pending drain")
             if isCapturing {
+                tickUI()
+                insertStableTranscript()
+                injector.captureBufferedTarget()
                 // The engine is still live but the recogniser was stopped on release; restart
                 // it so the new utterance gets its own session rather than silently producing
                 // no partials at all.
@@ -2481,7 +3100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        guard !isCapturing else { return }
+        guard !isCapturing, !localTerminationRequested else { return }
+        localTranscriptionSuspended = false
 
         micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         trace("beginCapture: micStatus=\(statusName(micStatus)) "
@@ -2531,7 +3151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // exception.
         let pipe: AudioPipeline
         do {
-            pipe = try AudioPipeline(inputFormat: format)
+            pipe = try AudioPipeline(inputFormat: format, mode: localDictationEnabled ? .localDictation : .correction)
         } catch {
             let desc = describePipelineError(error)
             fail("Audio pipeline could not start: \(desc)",
@@ -2590,13 +3210,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // after this line — the tap's captured reference, every `stop()`, the watchdog
         // gate, both trace summaries — goes through `activeEngine`/`activeEngineKind`, so
         // a menu click mid-session cannot split one capture across two engines. Same
-        // precedent as the cloud pass's chunk loop, decided once at session start (see the
-        // REALTIME-FIRST GATE below and `toggleCloud`).
+        // precedent as the correction pass's chunk loop, decided once at session start (see
+        // the REALTIME-FIRST GATE below and `selectCorrection`).
         if activeEngineKind != selectedEngineKind {
             trace("engine: switching \(activeEngineKind.rawValue) -> \(selectedEngineKind.rawValue) "
                 + "for this capture")
         }
         activeEngineKind = selectedEngineKind
+        activeLocalDictation = localDictationEnabled
         // Rebind before start(), so the first event the new engine emits already has
         // somewhere to go — and so the engine we are NOT running is disconnected before it
         // could post a late reconnect/retry report into this session's queue.
@@ -2605,9 +3226,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try activeEngine.start()
         } catch {
             let desc = describeRecognizerError(error)
-            fail("\(activeEngineKind.recognizerNoun) could not start: \(desc)",
-                 context: "beginCapture: \(activeEngineKind.rawValue) start() threw — \(desc)")
-            return
+            if activeLocalDictation {
+                trace("LOCAL FINAL: Apple preview unavailable; local audio capture continues")
+            } else {
+                fail("\(activeEngineKind.recognizerNoun) could not start: \(desc)",
+                     context: "beginCapture: \(activeEngineKind.rawValue) start() threw — \(desc)")
+                return
+            }
         }
         // A fresh recogniser has produced no events yet; a timestamp inherited from a
         // previous session is stale by definition. Stamp the liveness clock now so the
@@ -2693,20 +3318,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         chunkTask = nil
         flushRequest = nil
 
-        // REALTIME-FIRST GATE: the chunk loop exists only to feed the cloud pass. When the
-        // pass is disabled at capture start there is nothing to feed — polling takeChunk()
+        // REALTIME-FIRST GATE: the chunk loop exists only to feed the correction pass. When
+        // the pass is off at capture start there is nothing to feed — polling takeChunk()
         // (a ring-buffer copy + WAV encode per chunk) only for noteFinalChunk to refuse
         // every dispatch is pure waste on the consumer side of the audio path, so the loop
         // is not created at all. (The pipeline itself stays: the tap's append writes into
         // a preallocated 30 s ring whose count saturates at capacity, and chunks are cut
         // lazily inside takeChunk()/flush(), so an unpolled pipeline cannot grow memory.)
-        // The effective state is read HERE, on the MainActor, at session start; toggling
-        // cloud ON mid-session therefore takes effect at the NEXT session start — traced
-        // in `toggleCloud` so it is not mistaken for a bug. The stop paths already
+        // The effective state is read HERE, on the MainActor, at session start; selecting
+        // a provider mid-session therefore takes effect at the NEXT session start — traced
+        // in `selectCorrection` so it is not mistaken for a bug, and `noteFinalChunk`
+        // refuses the running session's sends once the kinds differ. The stop paths already
         // tolerate the nils: `drainElapsed` flushes via `flushRequest?.request()` and
         // `finishCapture` cancels via `chunkTask?.cancel()`, both optional-chained no-ops.
-        if cloudEnabled && cloudAvailable {
-            let cloud = cloudSetup.client
+        //
+        // The gate is CONFIGURED, not READY (`localCorrectionConfigured`): a local server
+        // still loading is not a reason to skip the loop — it is the provider's job to
+        // wait for it, and the preload has usually finished long before now.
+        if activeLocalDictation {
+            let id: FinalQueue.CaptureID
+            do { id = try finalQueue.beginCapture() }
+            catch {
+                wantsDictation = false
+                finishCapture(reason: "local transcription queue full")
+                fail("Transcription is still catching up — try again shortly", context: "local capture capacity reached")
+                return
+            }
+            localCaptureID = id
+            let loadedTerms = UserKeyterms.load()
+            let terms = UserKeyterms.merge(user: loadedTerms.terms, builtin: cloudKeyterms)
+            finalCaptures[id] = FinalCapture(target: injector.captureBufferedTarget(), keyterms: terms)
+            activeCorrectionKind = .off
+            startLocalServer(reason: "bilingual capture")
+            chunkTask = Task.detached { [weak self] in
+                await self?.localChunkLoop(pipeline: pipe, capture: id)
+            }
+            trace("LOCAL FINAL: capture \(id.sequence) started; Apple is preview only")
+        } else if correctionEnabled, let cloud = correctionProvider {
+            activeCorrectionKind = correctionKind
+            // Off the hotkey path: both are detached work that publishes back later. The
+            // server kick is the retry path for a preload that failed or an idle stop.
+            startLocalServer(reason: "capture start")
+            reloadKeyterms(reason: "capture start")
             // One flush flag per session, shared with exactly this session's loop.
             let flushBox = FlushRequestBox()
             flushRequest = flushBox
@@ -2720,13 +3373,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                      flushRequest: flushBox)
             }
         } else {
-            trace("LOOP[\(gen)]: chunk loop not started (cloud pass disabled)")
+            activeCorrectionKind = .off
+            trace("LOOP[\(gen)]: chunk loop not started "
+                + "(correction pass \(correctionGateState))")
         }
 
         finalOnlyInjection = false   // new session, new focused app: try live typing again
         // New pipeline, new generation: a span typed for a previous session's audio must
         // never be offered to this session's cloud pass.
         typedSinceLastChunk = ""
+        injector.captureBufferedTarget()
         startUtterance()
         lastOutcome = nil
         trace(String(format: "capture started OK — session %d, generation %d, %.0f Hz / %u ch",
@@ -2734,9 +3390,180 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshMenu()
     }
 
+    @objc private func toggleLocalDictation() {
+        guard !isCapturing, finalQueue.pendingCaptureCount == 0,
+              WhisperServerManager.shared.localFinalConfigured else { return }
+        let next = !localDictationEnabled
+        UserDefaults.standard.set(next, forKey: "localBilingualDictation")
+        if next { startLocalServer(reason: "bilingual dictation selected") }
+        refreshMenu()
+    }
+
+    /// Audio cutting never waits for inference. This task alone consumes its pipe.
+    nonisolated private func localChunkLoop(pipeline: AudioPipeline,
+                                            capture: FinalQueue.CaptureID) async {
+        while !Task.isCancelled {
+            do { try await Task.sleep(for: .milliseconds(100)) }
+            catch { break }
+            if Task.isCancelled { break }
+            if let chunk = pipeline.takeChunk(), chunk.isFinal {
+                await enqueueLocalChunk(chunk.wav, capture: capture)
+            }
+        }
+        // finishCapture has already removed the tap and stopped the audio producer.
+        while let chunk = pipeline.flush() {
+            await enqueueLocalChunk(chunk.wav, capture: capture)
+        }
+        await sealLocalCapture(capture)
+    }
+
+    private func enqueueLocalChunk(_ wav: Data, capture: FinalQueue.CaptureID) {
+        do {
+            let id = try finalQueue.enqueue(wav, byteCount: wav.count, in: capture)
+            trace("LOCAL FINAL: queued capture \(capture.sequence), chunk \(id.sequence), \(wav.count) bytes")
+            pumpLocalTranscription()
+        } catch {
+            let recovery = preserveLocalAudio(wav, capture: capture)
+            finalCaptures[capture]?.failure = "Transcription queue is full. \(recovery)"
+            injectionBlockedReason = finalCaptures[capture]?.failure
+            if localCaptureID == capture {
+                wantsDictation = false
+                finishCapture(reason: "local transcription backpressure")
+            }
+            hud.set(.error(injectionBlockedReason ?? "Transcription queue is full"))
+            hud.show()
+        }
+    }
+
+    private func sealLocalCapture(_ capture: FinalQueue.CaptureID) {
+        _ = finalQueue.stopCapture(capture)
+        deliverLocalResults()
+        pumpLocalTranscription()
+        if !isCapturing && finalQueue.pendingChunkCount > 0 {
+            hud.set(.transcribing("Finishing Thai + English…"))
+        }
+    }
+
+    private func pumpLocalTranscription() {
+        guard localWorker == nil else { return }
+        localIdleStopTask?.cancel()
+        localWorker = Task { [weak self] in
+            guard let self else { return }
+            while let work = self.finalQueue.nextWork() {
+                let terms = self.finalCaptures[work.id.capture]?.keyterms ?? []
+                do {
+                    let manager = WhisperServerManager.shared
+                    guard manager.localFinalConfigured else {
+                        throw LocalWhisperTranscriber.Failure.invalidReply
+                    }
+                    guard !self.localTranscriptionSuspended else { throw CancellationError() }
+                    await self.serverLifecycle?.value
+                    guard !self.localTranscriptionSuspended else { throw CancellationError() }
+                    let endpoint = try await manager.ensureReady()
+                    guard !self.localTranscriptionSuspended else { throw CancellationError() }
+                    guard let port = endpoint.port else {
+                        throw LocalWhisperTranscriber.Failure.invalidReply
+                    }
+                    let text = try await LocalWhisperTranscriber().transcribe(
+                        wav: work.payload, keyterms: terms, port: port)
+                    guard !self.localTranscriptionSuspended else { throw CancellationError() }
+                    _ = self.finalQueue.complete(work.id, with: .success(text))
+                } catch {
+                    let recovery = self.preserveLocalAudio(work.payload, capture: work.id.capture)
+                    _ = self.finalQueue.complete(work.id, with: .failure(
+                        "Local transcription failed: \(error.localizedDescription). \(recovery)"))
+                }
+                self.deliverLocalResults()
+
+            }
+            self.localWorker = nil
+            self.deliverLocalResults()
+            self.armLocalIdleStop()
+            self.finishLocalTerminationIfReady()
+        }
+    }
+
+    private func deliverLocalResults() {
+        guard localDeliveryTask == nil else { return }
+        localDeliveryTask = Task { [weak self] in
+            guard let self else { return }
+            while let event = self.finalQueue.takeReadyEvents(limit: 1).first {
+                self.deliverLocalEvent(event)
+                // Pace each event, including a batch released by a capture boundary.
+                // The audio consumer and inference worker continue independently.
+                try? await Task.sleep(for: .milliseconds(750))
+            }
+            self.localDeliveryTask = nil
+            self.armLocalIdleStop()
+            self.finishLocalTerminationIfReady()
+        }
+    }
+
+    private func deliverLocalEvent(_ event: FinalQueue.Event) {
+            switch event {
+            case .result(let id, let outcome):
+                guard var capture = finalCaptures[id.capture] else { return }
+                switch outcome {
+                case .success(let raw):
+                    let text = normalizeForInjection(raw, kind: "local final")
+                    guard !text.isEmpty else { return }
+                    let addition = (capture.transcript.isEmpty ? "" : " ") + text
+                    capture.transcript += addition
+                    lastTranscript = capture.transcript
+                    if capture.failure == nil {
+                        if let reason = injector.injectBuffered(addition, target: capture.target) {
+                            capture.failure = reason
+                            lifetime.injectFailures += 1
+                        } else {
+                            clearInjectionBlockAfterSuccessfulWrite()
+                            lifetime.injectedChars += addition.count
+                            if localCaptureID == id.capture { thisCapture.injectedChars += addition.count }
+                            trace("LOCAL FINAL: inserted capture \(id.capture.sequence), chunk \(id.sequence), \(addition.count) chars once")
+                        }
+                    }
+                case .failure(let reason):
+                    capture.failure = reason
+                    trace("LOCAL FINAL: capture \(id.capture.sequence), chunk \(id.sequence) failed; recovery available")
+                }
+                finalCaptures[id.capture] = capture
+                if let reason = capture.failure {
+                    injectionBlockedReason = reason
+                    lastOutcome = "Transcript kept for Copy last transcript — \(reason)"
+                    hud.set(.error(reason))
+                    hud.show()
+                }
+            case .captureDrained(let id):
+                let capture = finalCaptures.removeValue(forKey: id)
+                if let capture, !capture.transcript.isEmpty { lastTranscript = capture.transcript }
+                trace("LOCAL FINAL: capture \(id.sequence) fully drained")
+                if !isCapturing && finalQueue.pendingCaptureCount == 0 && capture?.failure == nil {
+                    hud.set(.idle(idleBody()))
+                }
+            }
+        refreshMenu()
+    }
+
+    /// Failed audio stays on this Mac with user-only permissions for recovery.
+    private func preserveLocalAudio(_ wav: Data, capture: FinalQueue.CaptureID) -> String {
+        let folder = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/MicTest/Recovery", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            let file = folder.appendingPathComponent("capture-\(capture.sequence)-\(UUID().uuidString).wav")
+            try wav.write(to: file, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            trace("LOCAL FINAL: audio recovery saved at \(file.path)")
+            return "Audio saved in \(folder.path)"
+        } catch {
+            return "Audio recovery could not be saved: \(error.localizedDescription)"
+        }
+    }
+
     /// Reset the per-utterance injection bookkeeping and put the HUD into listening.
     private func startUtterance() {
         injectedForUtterance = ""
+        stableTranscript.reset()
         // The ledger claims nothing again, so no deferred repair is outstanding.
         transientRepairSkips = 0
         cloudOwnsUtterance = false
@@ -2770,6 +3597,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func drainElapsed() {
         drainTimer = nil
+        // Drain any final already queued before falling back to the latest partial.
+        tickUI()
+        insertStableTranscript()
         // The release drain is over — no more audio is coming. Ask the chunk loop to
         // force-finalize whatever the trailing-silence gate is still holding: with the
         // room's ambient RMS above the silence threshold, that gate never opens on its
@@ -2788,11 +3618,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // is what makes the release-drain flush actually run. In a realtime-only session
         // (cloud pass disabled at capture start) both are already nil and these lines
         // are deliberate no-ops.
+        // Freeze audio before cancelling: the local consumer drains the old pipe.
+        if activeLocalDictation {
+            syntheticSource?.stop()
+            if let e = engine, isCapturing {
+                e.inputNode.removeTap(onBus: 0)
+                e.stop()
+            }
+        }
         chunkTask?.cancel()
         chunkTask = nil
         flushRequest = nil
+        localCaptureID = nil
         drainTimer?.invalidate()
         drainTimer = nil
+        armLocalIdleStop()
 
         // Above the `isCapturing` guard on purpose. `finishCapture` returns early on any path
         // where the capture was already torn down, and a pacing thread left running past that
@@ -2805,12 +3645,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard isCapturing, let e = engine else { return }
         // Remove the tap before stopping — the reverse order can leave a tap attached to a
         // stopped node and trip an exception the next time around.
-        e.inputNode.removeTap(onBus: 0)
-        e.stop()
+        if !activeLocalDictation { e.inputNode.removeTap(onBus: 0); e.stop() }
         engine = nil
         pipeline = nil
         isCapturing = false
         activeEngine.stop()
+        if !activeLocalDictation && !autoCorrectEnabled, let pending = stableTranscript.finish() {
+            lastTranscript = pending
+            trace("STABLE TEXT: saved \(pending.count) pending chars for Copy last transcript on stop; not inserted")
+        }
+        stableTranscript.reset()
+        injector.clearBufferedTarget()
 
         let (rms, frames) = levelBox.read()
         // THIS CAPTURE unprefixed, lifetime in the trailing bracket, and the bracket is
@@ -2850,6 +3695,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "finals=\(thisCapture.finalsSeen) injectedChars=\(thisCapture.injectedChars) "
             + "divergencesRepaired=\(thisCapture.divergencesRepaired) "
             + "divergencesRefused=\(thisCapture.divergencesRefused) "
+            + "repairsRefusedTooLarge=\(thisCapture.repairsRefusedTooLarge) "
+            + "retractionsRefused=\(thisCapture.retractionsRefused) "
             + "freshStarts=\(thisCapture.freshStarts) "
             + "injectFailures=\(thisCapture.injectFailures) "
             + "secureInputRefusals=\(thisCapture.secureInputRefusals) "
@@ -2857,18 +3704,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "cloudApplied=\(thisCapture.cloudApplied) "
             + "cloudUnapplied=\(thisCapture.cloudUnapplied) "
             + "cloudErrors=\(thisCapture.cloudErrors) cloudEmpty=\(thisCapture.cloudEmpty) cloudSkipped=\(thisCapture.cloudSkipped)"
+            + " correctionProvider=\(activeCorrectionKind.rawValue) "
+            + "correctionModel=\(correctionModelName(for: activeCorrectionKind))"
             + "  [lifetime: sessions=\(sessions) partials=\(lifetime.partialsSeen) "
             + "coalesced=\(lifetime.partialsCoalesced) finals=\(lifetime.finalsSeen) "
             + "injectedChars=\(lifetime.injectedChars) "
             + "divergencesRepaired=\(lifetime.divergencesRepaired) "
             + "divergencesRefused=\(lifetime.divergencesRefused) "
+            + "repairsRefusedTooLarge=\(lifetime.repairsRefusedTooLarge) "
+            + "retractionsRefused=\(lifetime.retractionsRefused) "
             + "freshStarts=\(lifetime.freshStarts) "
             + "injectFailures=\(lifetime.injectFailures) "
             + "secureInputRefusals=\(lifetime.secureInputRefusals) "
             + "finalChunks=\(lifetime.finalChunks) cloudSent=\(lifetime.cloudSent) "
             + "cloudApplied=\(lifetime.cloudApplied) "
             + "cloudUnapplied=\(lifetime.cloudUnapplied) "
-            + "cloudErrors=\(lifetime.cloudErrors) cloudEmpty=\(lifetime.cloudEmpty) cloudSkipped=\(lifetime.cloudSkipped)]")
+            + "cloudErrors=\(lifetime.cloudErrors) cloudEmpty=\(lifetime.cloudEmpty) "
+            + "cloudSkipped=\(lifetime.cloudSkipped) "
+            + "correctionProvider=\(correctionKind.rawValue)]")
 
         // Settle rather than vanish: the HUD keeps the last text (or the reason nothing was
         // typed) so the user can read it, click it, and copy it from the menu.
@@ -3082,8 +3935,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         refreshMenu()
         // Keep the idle HUD's body honest as permissions change under us.
-        if !isCapturing && cloudTask == nil && injectionBlockedReason == nil && !utteranceDiverged {
-            hud.set(.transcribing(idleBody()))
+        if !isCapturing && cloudTask == nil && finalQueue.pendingCaptureCount == 0 && injectionBlockedReason == nil && !utteranceDiverged {
+            hud.set(.idle(idleBody()))
         }
 
         // Audio-flow watchdog: while capturing, the frame counter must move every tick.
@@ -3338,7 +4191,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let backoffCeiling: Double = 12
             let bounceBackoff: Double = min(backoffCeiling,
                                             6 * pow(2, Double(min(suppressedBouncesSinceRestart, 3))))
-            if heardSpeechSinceSilence, Date().timeIntervalSince(lastRecognizerEventAt) > bounceBackoff {
+            if !activeLocalDictation, heardSpeechSinceSilence,
+               Date().timeIntervalSince(lastRecognizerEventAt) > bounceBackoff {
                 // ── ENGINE GATE: THE LADDER BELOW IS APPLE'S, ALL THREE RUNGS ──────────
                 // Tier 3 `kill -9`s `localspeechrecognition.xpc`, a macOS system service
                 // that a WebSocket to Google does not touch — so against a Gemini stall it
@@ -3653,6 +4507,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// `onPartial` delivers the WHOLE growing transcription each time, not a delta. We inject
     /// only the part we have not injected yet.
+    private func insertStableTranscript(final: String? = nil) {
+        guard !activeLocalDictation, !autoCorrectEnabled, isCapturing,
+              let text = stableTranscript.finish(final: final) else { return }
+        lastTranscript = text
+        if let reason = injector.injectBuffered(text) {
+            lifetime.injectFailures += 1; thisCapture.injectFailures += 1
+            injectionBlockedReason = reason
+            lastOutcome = "Transcript kept in preview — \(reason)"
+            hud.set(.error(reason))
+            hud.show()
+            trace("STABLE TEXT: not inserted (\(text.count) chars) — \(reason); available to copy")
+            refreshMenu()
+            return
+        }
+        injectedForUtterance = text
+        typedSinceLastChunk += text
+        lifetime.injectedChars += text.count; thisCapture.injectedChars += text.count
+        clearInjectionBlockAfterSuccessfulWrite()
+        trace("STABLE TEXT: inserted completed transcript once (\(text.count) chars); no replacement")
+    }
+
     private func handlePartial(_ raw: String) {
         guard isCapturing || drainTimer != nil else { return }
         // Shadowed before ANY use, so the ledger, the document, the HUD and (via
@@ -3662,10 +4537,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lifetime.partialsSeen += 1; thisCapture.partialsSeen += 1
         currentOnDeviceText = raw
         hud.set(.transcribing(raw.isEmpty ? "…" : raw))
-        deliver(raw)
+        if autoCorrectEnabled && !activeLocalDictation {
+            deliver(raw)
+        } else {
+            stableTranscript.updatePartial(raw)
+        }
     }
 
     private func handleFinal(_ raw: String) {
+        if activeLocalDictation {
+            lifetime.finalsSeen += 1; thisCapture.finalsSeen += 1
+            currentOnDeviceText = normalizeForInjection(raw, kind: "preview final")
+            return
+        }
         // Same shadow, same reason, and it must precede the `raw.count` in the FINAL trace
         // below so the two counts printed there still describe the same string.
         let raw = normalizeForInjection(raw, kind: "final")
@@ -3673,7 +4557,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // isFinal: the utterance FINAL must attempt to reconcile even after a failed
         // partial repair — extending and/or replacing via the same LCP logic — rather
         // than silently dropping the tail of the utterance.
-        deliver(raw, isFinal: true)
+        if autoCorrectEnabled {
+            deliver(raw, isFinal: true)
+        } else {
+            insertStableTranscript(final: raw)
+        }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         currentOnDeviceText = text
         if !text.isEmpty { lastTranscript = text }
@@ -3700,10 +4588,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func handleRecognizerState(_ state: LiveRecognizer.State) {
+        if activeLocalDictation, case .unavailable = state {
+            trace("LOCAL FINAL: Apple preview unavailable; local transcription continues")
+            return
+        }
         switch state {
         case .idle:
             trace("recogniser state: idle")
         case .listening:
+            if isCapturing {
+                insertStableTranscript()
+            }
+            stableTranscript.reset()
             // A new recognition request just stood up (initial start, pause auto-restart,
             // error restart, or the 20 s rotation). Its partials start FROM SCRATCH, so
             // the typed-count high-water mark of the previous utterance must not survive
@@ -3969,6 +4865,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// cannot compound — and for the one place where that bound is deliberately dropped,
     /// on a seam final.
     private func deliver(_ text: String, isFinal: Bool = false) {
+        // The menu must disable every automatic document rewrite, including the
+        // Apple partial-repair path, even when no second provider is installed.
+        guard autoCorrectEnabled && !activeLocalDictation else { return }
         // ── THE FINAL-ONLY MUTE USED TO BE HERE, AND IT STAYS REMOVED ──────────────────
         // `if finalOnlyInjection && !isFinal { return }` was a reasonable trade when it was
         // written — skip live partials in an app that cannot host revision, let each
@@ -4283,6 +5182,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return n
     }
 
+    /// Longest common suffix of `a` and `b`, in the same unit and by the same walk as
+    /// `commonPrefixLength`, from the end. `repairDivergence` calls it on the stale tail
+    /// and its replacement — both already cut at the common prefix — so it cannot overlap
+    /// the prefix, and it stops at the shorter string, so it never exceeds
+    /// `min(a.count, b.count)`. Stepping by `Character` is what keeps a Thai base
+    /// consonant with its marks: a scalar walk would call "บ่" and "ก่" one unit alike and
+    /// put the cut inside a cluster; this walk calls them different and returns 0.
+    private func commonSuffixLength(_ a: String, _ b: String) -> Int {
+        var n = 0
+        var ia = a.endIndex
+        var ib = b.endIndex
+        while ia > a.startIndex, ib > b.startIndex {
+            let pa = a.index(before: ia)
+            let pb = b.index(before: ib)
+            guard a[pa] == b[pb] else { break }
+            n += 1
+            ia = pa
+            ib = pb
+        }
+        return n
+    }
+
     /// Does a `replaceLastInserted` refusal describe a PERSISTENT property of the focused
     /// app, or a momentary one? Only a persistent one may downgrade this capture to
     /// `finalOnlyInjection`; see that declaration for the trace evidence that forced the
@@ -4313,6 +5234,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "clamped the selection",
         ]
         return structuralMarkers.contains { reason.contains($0) }
+    }
+
+    /// Why a revision is at `resolveUnrepairedRevision` instead of in the document. The
+    /// routing there reads on this, so it is an enum rather than a second string beside
+    /// `why:` — `why:` is the trace text, this is the decision.
+    private enum UnrepairedReason {
+        /// The focused app would not perform the AX replacement — a real refusal from
+        /// `replaceLastInserted` (structural, or a transient that outlived its budget), or
+        /// the attempt skipped because `finalOnlyInjection` has already latched.
+        case appRefused
+        /// `repairDivergence` refused before writing: the effective change was over
+        /// `reanchorMaxStaleChars`, or a pure retraction over `retractionMaxStaleChars`.
+        /// The app was never asked and, the fast-skip not having fired, is one that
+        /// accepts repair — which is what lets this route re-anchor past the cap.
+        case capRefused
     }
 
     /// A partial (or the final) revised, merged, or RETRACTED characters we already typed.
@@ -4386,18 +5322,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// line — `staleCount` IS the entire utterance, up to twenty seconds of speech
     /// stranded permanently to answer one momentary AX hiccup. Nothing here bounded that.
     ///
-    /// Two layers now do, and this function is reached only once both have declined:
+    /// Three layers now do:
     ///   * `repairDivergence` DEFERS a transient refusal (up to `maxTransientRepairSkips`
     ///     in a row) without re-anchoring at all, so the momentary hiccup — which is what
     ///     the trace evidence actually shows — never gets here;
-    ///   * `resolveUnrepairedRevision` diverts anything longer than
+    ///   * `repairDivergence` REFUSES, before asking the app at all, a repair whose
+    ///     effective change exceeds `reanchorMaxStaleChars`, or a pure retraction past
+    ///     `retractionMaxStaleChars` — the run-5 wipe, `replaced 175 stale chars with
+    ///     178` — and routes it through `resolveUnrepairedRevision` as `.capRefused`;
+    ///   * `resolveUnrepairedRevision` diverts an APP refusal longer than
     ///     `reanchorMaxStaleChars` to a fresh start instead of stranding it — ON A
     ///     PARTIAL.
-    /// So every caller of this function on the PARTIAL path strands at most
+    /// So on the app-refused PARTIAL path this function strands at most
     /// `reanchorMaxStaleChars` clusters, which is what turns the compounding argument
     /// above into a real bound rather than a hopeful one. Both of this function's call
     /// sites go through `resolveUnrepairedRevision`; call it directly and the bound is
     /// gone.
+    ///
+    /// The CAP-refused path in an app that accepts repair is deliberately NOT bounded
+    /// this way since run 7: it re-anchors whatever the stale count, so the strand it
+    /// leaves is the whole rewritten region — 18 to 36 clusters at run 7 lines 40-68.
+    /// The compounding argument holds for it unchanged (each strand is local, the next
+    /// partial diffs against the truth); what makes the larger strand acceptable is
+    /// stated at `reanchorMaxStaleChars`: it is one utterance deep and the correction
+    /// pass replaces it, which a fresh start made impossible.
     ///
     /// ── ON A FINAL THE STRAND IS DELIBERATELY UNBOUNDED ──────────────────────────────
     /// `resolveUnrepairedRevision` now sends every FINAL here regardless of `staleCount`,
@@ -4411,6 +5359,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// anything. The user keeps a stale tail in the document instead of a duplicated
     /// window, and loses the gap text, which the trace says out loud.
     ///
+    /// Since the run-5 wipe this door is also reached from an app that ACCEPTS repair:
+    /// `repairDivergence` refuses, before calling `replaceLastInserted`, a final whose
+    /// effective change exceeds `reanchorMaxStaleChars` (`replaced 175 stale chars with
+    /// 178` at run 5 line 115), and a "stale tail" of that size is the sentence the user
+    /// watched being typed. Keeping it, and dropping the recogniser's rewrite, is the
+    /// point of the refusal — the argument above is unchanged, the beneficiary is new.
+    ///
     /// Note what is NOT touched: `injectedChars` and `typedSinceLastChunk` both describe
     /// characters actually written to the document, and this path writes none. Inflating
     /// them here would corrupt the cloud pass's span accounting, which is the one consumer
@@ -4422,19 +5377,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// note at the `.listening` clear. Do not "restore" it here on the assumption that
     /// something else still depends on it.
     /// The single door to "this revision will not be applied in place" — reached from the
-    /// structural fast-skip and from a real refusal alike, which is the point: an app that
-    /// refuses EVERY repair (Electron, via `finalOnlyInjection`) is precisely where the
-    /// unbounded strand recurs, so routing only the refusal branch through the cap would
-    /// leave the common case uncapped.
+    /// structural fast-skip, from a real refusal, and from the two cap gates alike, which
+    /// is the point: an app that refuses EVERY repair (Electron, via `finalOnlyInjection`)
+    /// is precisely where the unbounded strand recurs, so routing only the refusal branch
+    /// through the cap would leave the common case uncapped.
     ///
-    /// Small stale tail — a revision, a merge, a tone mark — re-anchors exactly as before.
-    /// A tail past the cap is not a revision at all; it is the recogniser having replaced
-    /// the whole utterance, and stranding it would cost the user everything said so far.
-    /// So the app types the transcript again, in full, after a separator, and says so.
+    /// The rule, in the order the code tests it:
+    ///   * a FINAL re-anchors, whatever the stale count (argued at the first guard);
+    ///   * a stale tail within the cap — a revision, a merge, a tone mark — re-anchors;
+    ///   * a CAP refusal in an app that accepts repair re-anchors too, past the cap, so
+    ///     the stranded rewrite stays inside the one-utterance span the correction pass
+    ///     can replace (run 7; the measurement is at `reanchorMaxStaleChars`);
+    ///   * an APP refusal past the cap on a partial is not a revision at all — it is the
+    ///     recogniser having replaced the whole utterance in an app that cannot fix it —
+    ///     so the app types the transcript again, in full, after a separator, and says so.
+    /// `reason` is what separates the last two; `why` is only the trace text.
     private func resolveUnrepairedRevision(to text: String,
                                            lcp: Int,
                                            staleCount: Int,
                                            isFinal: Bool,
+                                           reason: UnrepairedReason,
                                            why: String) {
         // ── A FINAL NEVER FRESH-STARTS, WHATEVER THE STALE COUNT ──────────────────────
         // The fresh start below types the whole transcript again. On a PARTIAL that is the
@@ -4467,7 +5429,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // start below is therefore partial-only; its trace still carries the
         // "(final reconciliation)" suffix, now unreachable, kept so the line stays correct
         // if this rule is ever revisited.
-        guard staleCount > Self.reanchorMaxStaleChars, !isFinal else {
+        //
+        // ── A CAP REFUSAL IN AN APP THAT ACCEPTS REPAIR RE-ANCHORS, PAST THE CAP ──────
+        // The third clause is run 7's correction (`TEST-2026-09-03-run7-trace.txt` lines
+        // 40-68, argued at `reanchorMaxStaleChars`): a cap refusal on a partial always has
+        // `staleCount` over the cap, so without it every one fresh-started, the first
+        // sentence was typed six times, and the correction pass refused its own fix
+        // against the inflated span (line 76). Re-anchoring instead leaves the rewritten
+        // region in the document, one utterance deep, where that pass can replace it.
+        //
+        // `!finalOnlyInjection` is unreachable today — the cap gates sit BELOW the
+        // structural fast-skip in `repairDivergence`, so a `.capRefused` always comes from
+        // an app that has not latched — and is written anyway so the rule is complete in
+        // one place: in an app that cannot be repaired there is no pass to clean a strand
+        // up, and the fresh start stays the better failure there (run 6).
+        let capRefusedInRepairableApp = reason == .capRefused && !finalOnlyInjection
+        guard staleCount > Self.reanchorMaxStaleChars, !isFinal, !capRefusedInRepairableApp
+        else {
             reanchorAfterUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
                                             isFinal: isFinal, why: why)
             return
@@ -4564,12 +5542,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // cap the rare path and leave the common one unbounded.
         if finalOnlyInjection {
             resolveUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
-                isFinal: isFinal,
+                isFinal: isFinal, reason: .appRefused,
                 why: "this app structurally refuses in-place repair (attempt skipped)")
             return
         }
-        if let reason = injector.replaceLastInserted(count: staleCount, with: replacement,
-                                                     expecting: expected) {
+
+        // ── AND AN APP THAT ACCEPTS REPAIR IS STILL NOT HANDED A WIPE ─────────────────
+        // Everything above bounds what a REFUSED repair may strand. Nothing bounded what
+        // an ACCEPTED one may overwrite, and `TEST-2026-08-31-run5-trace.txt` line 115 is
+        // the result: `kept 10 common chars, replaced 175 stale chars with 178 chars` —
+        // the recogniser rewrote an early word, the common prefix collapsed to 10, and
+        // the call below selected and overwrote the user's entire sentence in one AX
+        // write. Thai has no spaces, so th-TH re-segments the Thai before an English
+        // word (`ผมใช้ Python` → `พรชัยพีเทิร์น`, TEST-2026-08-31-mixed-language.md line
+        // 54); `lcp` then lands near 0 and `staleCount` is the whole 20 s window. The
+        // user reports it as "the system resets and deletes all the words". Same trace,
+        // line 124: `kept 1 … replaced 18 stale chars with 22`.
+        //
+        // The bound is on what the write DESTROYS — not on `staleCount`, and not on the
+        // size of the write. `replaceLastInserted` selects exactly `staleCount` clusters
+        // and pastes `replacement` over them. A cluster that sits at the end of both is
+        // deleted and put straight back, so it costs the user nothing; and a replacement
+        // that is merely LONGER than the tail it replaces is new speech being typed, not
+        // typed speech being removed. The second is in the trace: `replaced 3 stale chars
+        // with 12` at line 144 is a revision that arrived with a burst of new text behind
+        // it, and a bound on `max(staleCount, replacement.count)` would refuse it — and a
+        // refusal here re-anchors, which DROPS the replacement, so that shape would lose
+        // nine clusters of speech to protect three. The first is NOT measured: the old
+        // success line printed no suffix, so the effective change of `replaced 93 stale
+        // chars with 83` at line 86 is unknown, and a raw `staleCount > 10` cannot tell a
+        // re-emitted tail from a wipe at all — it refuses both. The constructed version
+        // of that shape with an 80-cluster suffix lands at 13 and is refused too
+        // (tools/cap-test/RESULT-2026-09-03.txt, case 3). Each false refusal trades a
+        // correct repair for a stranded tail or a duplicated sentence. So: the common
+        // suffix comes off, and only the stale clusters that are NOT put back are
+        // counted against the cap.
+        //
+        // WHAT A REFUSAL COSTS, stated here because the alternative was a wipe and the
+        // trade must stay visible. The route is `resolveUnrepairedRevision` with
+        // `.capRefused`, and in this app — one that accepts repair, or the fast-skip above
+        // would have returned — it RE-ANCHORS, partial or final: the recogniser's rewrite
+        // is dropped, the document keeps what the user watched being typed, and the
+        // ~1 s correction pass gets a span the size of one utterance to replace. S1 first
+        // sent a partial to a fresh start instead, and run 7 measured the cost in TextEdit
+        // (`TEST-2026-09-03-run7-trace.txt` lines 40-68): six refusals in a row on one
+        // sentence, six retyped transcripts, and the correction pass refusing its own fix
+        // as `span 225 vs cloud 38` (line 76). The full argument sits at
+        // `reanchorMaxStaleChars`. It is not deferred like a transient refusal, because it
+        // is not transient — the next partial carries the same rewrite — and it leaves
+        // `transientRepairSkips` alone, because nothing was written and nothing was
+        // learned about the app.
+        //
+        // The trace line ends in "re-anchoring", and since run 7 that is what happens;
+        // `resolveUnrepairedRevision` prints its own outcome line (re-anchored / seam
+        // final diverged too deeply) immediately after, and the harness greps this one
+        // by its prefix.
+        let suffix = commonSuffixLength(expected, replacement)
+        let effectiveChange = staleCount - suffix
+
+        // ── A PURE RETRACTION GETS THE TIGHTER CAP ────────────────────────────────────
+        // `replacement.isEmpty` is the one shape that removes text and puts none back
+        // (`deliver` calls it a pure delete), and the recogniser does not always mean it:
+        // run 5 lines 123-124 are a 3-cluster delete and, in the same second, a rewrite
+        // of the same region. Deleting a whole clause on a partial that the next partial
+        // reverses is the wipe again with extra steps. `retractionMaxStaleChars` says why
+        // four. Checked before the general cap so a large retraction is counted as what
+        // it is; `suffix` is 0 here by construction, so `effectiveChange == staleCount`.
+        if replacement.isEmpty, staleCount > Self.retractionMaxStaleChars {
+            lifetime.retractionsRefused += 1; thisCapture.retractionsRefused += 1
+            trace("DIVERGENCE: retraction refused — \(staleCount) stale chars with nothing "
+                + "to type back exceeds cap \(Self.retractionMaxStaleChars); re-anchoring")
+            resolveUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
+                isFinal: isFinal, reason: .capRefused,
+                why: "pure retraction of \(staleCount) chars exceeded cap "
+                    + "\(Self.retractionMaxStaleChars) (refused before writing)")
+            return
+        }
+        if effectiveChange > Self.reanchorMaxStaleChars {
+            lifetime.repairsRefusedTooLarge += 1; thisCapture.repairsRefusedTooLarge += 1
+            trace("DIVERGENCE: repair refused — effective change \(effectiveChange) exceeds "
+                + "cap \(Self.reanchorMaxStaleChars) (stale \(staleCount), replacement "
+                + "\(replacement.count), common suffix \(suffix)); re-anchoring")
+            resolveUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
+                isFinal: isFinal, reason: .capRefused,
+                why: "effective change \(effectiveChange) exceeded cap "
+                    + "\(Self.reanchorMaxStaleChars) (refused before writing)")
+            return
+        }
+        guard let repair = TailRepair.plan(typed: injectedForUtterance,
+                                          staleCount: staleCount, replacement: replacement) else {
+            trace("DIVERGENCE: invalid repair span; nothing replaced")
+            return
+        }
+        if let reason = injector.replaceLastInserted(count: repair.count, with: repair.replacement,
+                                                     expecting: repair.expected) {
             trace("DIVERGENCE: repair FAILED\(isFinal ? " (final reconciliation)" : "") — "
                 + "kept \(lcp) common chars, could not replace \(staleCount) stale chars "
                 + "with \(replacement.count) chars — \(reason)")
@@ -4620,7 +5686,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // `maxTransientRepairSkips` times in a row and is therefore behaving
             // structurally whatever the classifier calls it.
             resolveUnrepairedRevision(to: text, lcp: lcp, staleCount: staleCount,
-                                      isFinal: isFinal, why: reason)
+                                      isFinal: isFinal, reason: .appRefused, why: reason)
             return
         }
 
@@ -4662,9 +5728,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastOutcome = nil
         }
         clearInjectionBlockAfterSuccessfulWrite()
+        // `replaced N stale chars` keeps its wording — tools/run-correction-harness.sh
+        // greps it — and the parenthetical that follows is what makes "no repair above
+        // the cap" checkable from the trace: raw N can exceed the cap on a correct repair
+        // (stale 175 / suffix 170 / effective 5), so the harness must read `effective`.
         trace("DIVERGENCE: repaired in place\(isFinal ? " (final reconciliation)" : "") — "
             + "kept \(lcp) common chars, replaced \(staleCount) stale chars with "
-            + "\(replacement.count) chars"
+            + "\(replacement.count) chars (effective \(effectiveChange), suffix \(suffix))"
             + (replacement.isEmpty ? " (RETRACTION: pure delete)" : ""))
     }
 
@@ -4676,10 +5746,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// this is neither the main actor nor — emphatically — the realtime audio thread.
     /// `takeChunk()` is documented as "call from a background Task", and this is that Task.
     nonisolated private func chunkLoop(pipeline: AudioPipeline,
-                                       cloud: GeminiClient?,
+                                       cloud: any CorrectionProvider,
                                        generation: Int,
                                        flushRequest: FlushRequestBox) async {
-        trace("LOOP[\(generation)]: chunk loop started (cloud client \(cloud == nil ? "absent" : "present"))")
+        trace("LOOP[\(generation)]: chunk loop started (correction via \(cloud.displayName))")
         var polls = 0
         var chunks = 0
         var finals = 0
@@ -4758,7 +5828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// completion hop is necessarily a LATER MainActor job and always finds its task
     /// registered.
     nonisolated private func dispatchFinalChunk(_ chunk: AudioPipeline.Chunk,
-                                                cloud: GeminiClient?,
+                                                cloud: any CorrectionProvider,
                                                 generation: Int) async -> Bool {
         let wav = chunk.wav
         // Extracted out here beside `wav`, for the same reason `wav` is: the MainActor
@@ -4771,17 +5841,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Gate (generation stale-guard included) — unchanged semantics, now simply
             // called in the same job that will register the task it approves.
             guard let handle = self.noteFinalChunk(generation: generation),
-                  handle.runCloud, let cloud else { return false }
-            // Immutable copies of the MainActor-taken snapshot; String is Sendable, so
-            // this is the whole cross-isolation story for the typed span.
+                  handle.runCloud else { return false }
+            // Immutable copies of the MainActor-taken snapshot; String and [String] are
+            // Sendable, so this is the whole cross-isolation story for the typed span and
+            // the glossary (`activeKeyterms`, read here and nowhere off the main actor).
             let typedSpan = handle.typedSpan
             let typedSpanSeq = handle.typedSpanSeq
             let utteranceID = handle.id
+            let keyterms = self.activeKeyterms
             let task = Task.detached { [weak self] in
                 guard let self else { return }
                 await self.cloudPass(wav: wav, utteranceID: utteranceID, typedSpan: typedSpan,
                                      typedSpanSeq: typedSpanSeq,
-                                     generation: generation, client: cloud)
+                                     generation: generation, client: cloud,
+                                     keyterms: keyterms)
             }
             self.registerCloudTask(task, utteranceID: utteranceID, generation: generation,
                                    seconds: seconds)
@@ -4835,8 +5908,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 + "(silence-hallucination guard)")
             return nil
         }
-        guard cloudEnabled, cloudAvailable else {
-            trace("CLOUD GATE: pass is \(cloudAvailable ? "off" : "unavailable"); not sent")
+        // Both the SELECTED kind and the kind this session's loop was built for: the loop
+        // dispatches to the provider captured in `beginCapture`, so after a mid-session
+        // switch (say gemini -> local, "audio stays on this Mac") the selected kind and
+        // the provider that would actually receive the audio disagree until the next
+        // capture. Refusing here is what a mid-session toggle OFF did at HEAD (main.swift
+        // 4838, `guard cloudEnabled, cloudAvailable`): the send stops at this gate now,
+        // and the new provider takes effect at the next capture (`selectCorrection`).
+        guard correctionEnabled, correctionKind == activeCorrectionKind else {
+            let why = !correctionEnabled
+                ? correctionGateState
+                : "changed mid-session (\(activeCorrectionKind.rawValue) -> "
+                    + "\(correctionKind.rawValue)); takes effect at the next capture"
+            trace("CLOUD GATE: pass is \(why); not sent")
             return FinalizedUtterance(id: 0, runCloud: false, typedSpan: "", typedSpanSeq: 0)
         }
         if let running = cloudTask {
@@ -4904,53 +5988,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// One cloud round trip for one finalized utterance.
     ///
     /// `nonisolated` and only ever entered from `Task.detached` — a multi-second HTTP request
-    /// has no business on the main actor, and `GeminiClient` is `Sendable` precisely so it
-    /// can be used this way. Every UI touch hops explicitly and the generation is checked on
-    /// the far side of that hop.
+    /// has no business on the main actor, and `any CorrectionProvider` is `Sendable`
+    /// precisely so it can be used this way. Every UI touch hops explicitly and the
+    /// generation is checked on the far side of that hop. `keyterms` arrives as a value
+    /// captured in `dispatchFinalChunk`'s MainActor hop: this function reads no main-actor
+    /// state, which `-swift-version 6` would refuse anyway.
     ///
     /// A failure here is never allowed to disturb anything: the on-device text is already
-    /// typed and stays exactly as it is.
+    /// typed and stays exactly as it is. The lines keep the old `GEMINI[…]` shape under a
+    /// provider-neutral prefix, with the provider named on every one.
     nonisolated private func cloudPass(wav: Data, utteranceID: Int, typedSpan: String,
-                                       typedSpanSeq: UInt64,
-                                       generation: Int, client: GeminiClient) async {
-        trace("GEMINI[\(generation)]: sending utterance #\(utteranceID) — \(wav.count) wav bytes, "
-            + "\(cloudKeyterms.count) keyterms")
+                                       typedSpanSeq: UInt64, generation: Int,
+                                       client: any CorrectionProvider,
+                                       keyterms: [String]) async {
+        let provider = client.displayName
+        trace("CORRECTION[\(generation)] \(provider): sending utterance #\(utteranceID) — "
+            + "\(wav.count) wav bytes, \(keyterms.count) keyterms, audio "
+            + (client.sendsAudioOffDevice ? "LEAVES this Mac" : "stays on this Mac"))
         do {
-            let result = try await client.transcribe(wav: wav, keyterms: cloudKeyterms)
+            let result = try await client.transcribe(wav: wav, keyterms: keyterms)
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             // `audioTokens`, not the old `langProb`: this is the EXACT unit Gemini bills,
             // straight from the response, so the one number worth carrying per request is
             // the one that costs money. A confidence figure was interesting; this is
-            // actionable, and it is the only place it can ever be observed.
-            trace(String(format: "GEMINI[%d]: utterance #%d OK — %.0f ms, %d chars, audioTokens=%d",
-                         generation, utteranceID, result.elapsedMS, text.count,
-                         result.audioTokens))
+            // actionable, and it is the only place it can ever be observed. Local whisper
+            // reports 0 — nothing is billed and nothing is counted.
+            trace("CORRECTION[\(generation)] \(provider): utterance #\(utteranceID) OK — "
+                + String(format: "%.0f ms, %d chars, audioTokens=%d",
+                         result.elapsedMS, text.count, result.audioTokens))
             await MainActor.run { [weak self] in
                 self?.applyCloudResult(text: text, utteranceID: utteranceID,
                                        typedSpan: typedSpan,
                                        typedSpanSeq: typedSpanSeq,
                                        elapsedMS: result.elapsedMS,
                                        audioTokens: result.audioTokens,
-                                       generation: generation)
+                                       generation: generation, provider: provider)
             }
         } catch {
             let ns = error as NSError
             let wasCancelled = error is CancellationError
                 || (ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled)
             let d = describeCloudError(error)
-            trace("GEMINI[\(generation)]: utterance #\(utteranceID) FAILED "
+            trace("CORRECTION[\(generation)] \(provider): utterance #\(utteranceID) FAILED "
                 + "(cancelled=\(wasCancelled)) — \(d.summary)")
             await MainActor.run { [weak self] in
                 self?.applyCloudFailure(d.summary, utteranceID: utteranceID,
                                         generation: generation, cancelled: wasCancelled,
-                                        httpStatus: d.httpStatus)
+                                        httpStatus: d.httpStatus, provider: provider)
             }
         }
     }
 
     private func applyCloudResult(text rawText: String, utteranceID: Int, typedSpan: String,
                                   typedSpanSeq: UInt64,
-                                  elapsedMS: Double, audioTokens: Int, generation: Int) {
+                                  elapsedMS: Double, audioTokens: Int, generation: Int,
+                                  provider: String) {
         // ── Token ledger, ABOVE EVERY GUARD BELOW, deliberately ──────────────────────
         // A response exists, therefore Google served it, therefore it was billed — and
         // none of that is undone by this app deciding the text is stale. The stale-guards
@@ -4998,9 +6090,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // healthy account look like it was failing. Counted separately instead, so the
             // rate stays visible without being mistaken for breakage.
             lifetime.cloudEmpty += 1; thisCapture.cloudEmpty += 1
-            lastOutcome = "Cloud pass heard nothing in that span; on-device text kept"
-            trace("GEMINI: empty result (silence — not counted as an error); "
-                + "on-device text kept")
+            lastOutcome = "\(provider) heard nothing in that span; on-device text kept"
+            trace("CORRECTION (\(provider)): empty result (silence — not counted as an "
+                + "error); on-device text kept")
             settleAfterCloud()
             return
         }
@@ -5026,9 +6118,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // only case that gets to say it.
             lifetime.cloudApplied += 1; thisCapture.cloudApplied += 1
             unappliedCloudText = ""
-            lastOutcome = String(format: "Cloud confirmed the typed text (%.0f ms)", elapsedMS)
-            trace(String(format: "GEMINI: result matches the typed text exactly (%d chars, %.0f ms)",
-                         text.count, elapsedMS))
+            lastOutcome = "\(provider) confirmed the typed text "
+                + String(format: "(%.0f ms)", elapsedMS)
+            trace("CORRECTION (\(provider)): result matches the typed text exactly "
+                + String(format: "(%d chars, %.0f ms)", text.count, elapsedMS))
             hud.set(.corrected(text))
             hud.show()
             refreshMenu()
@@ -5054,6 +6147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 10 graphemes, not 3: measured in production, a 3-char span ("การ", "ครับ")
             // occurs all over Thai prose -- one such match replaced CORRECT text. A span
             // shorter than a phrase cannot be located safely, period.
+            // KEPT AT 10 FOR THE LOCAL PROVIDER, and the cost is stated: the user's own
+            // report ("I say time and it does not appear") is a short utterance — `ขอ
+            // time` alone types as five or six clusters — so v1 corrects such a word only
+            // inside an utterance of ten clusters or more; a shorter one is shown in the
+            // HUD and offered under "Copy correction", not typed. Lowering the floor
+            // safely needs a caret-relative match in `TextInjector`, not a smaller number.
             repairFailure = "typed span too short to match safely (\(typedSpan.count) chars)"
         } else if injector.secureInputActive() {
             // Same policy as the live path: never touch a secure field. This is a quiet
@@ -5066,13 +6165,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // the audio chunk drifted apart (the ledger lags the audio cut) -- replacing
             // would swap in text belonging to a different stretch of speech.
             repairFailure = "cloud text size mismatch (span \(typedSpan.count) vs cloud \(text.count) chars)"
+        } else if let why = CorrectionScript.refusal(typed: typedSpan, correction: text) {
+            // ── SCRIPT SANITY ─────────────────────────────────────────────────────────
+            // The size gate above cannot see a hallucination that keeps the length:
+            // whisper's Vietnamese for the `check` clip (`chui, chết, hay nòi`) was the
+            // same length as the Thai it would have replaced. `CorrectionScript` says
+            // what is measured and what the two tests are. Refused BEFORE the exact-
+            // match branch on purpose: an unreadable script is never "confirmed".
+            repairFailure = "script sanity refused it — \(why)"
         } else if text == typedSpan {
             // The cloud agrees with exactly what was typed for this chunk.
             lifetime.cloudApplied += 1; thisCapture.cloudApplied += 1
             unappliedCloudText = ""
-            lastOutcome = String(format: "Cloud confirmed the typed text (%.0f ms)", elapsedMS)
-            trace(String(format: "GEMINI: result matches the typed span exactly (%d chars, %.0f ms)",
-                         text.count, elapsedMS))
+            lastOutcome = "\(provider) confirmed the typed text "
+                + String(format: "(%.0f ms)", elapsedMS)
+            trace("CORRECTION (\(provider)): result matches the typed span exactly "
+                + String(format: "(%d chars, %.0f ms)", text.count, elapsedMS))
             hud.set(.corrected(text))
             hud.show()
             refreshMenu()
@@ -5085,8 +6193,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // The document now reads `text` where `typedSpan` used to be.
             lifetime.cloudApplied += 1; thisCapture.cloudApplied += 1
             unappliedCloudText = ""
-            lastOutcome = String(format: "Cloud auto-corrected the typed text (%.0f ms)", elapsedMS)
-            trace("GEMINI: auto-corrected span (\(typedSpan.count) -> \(text.count) chars)")
+            lastOutcome = "\(provider) corrected the typed text "
+                + String(format: "(%.0f ms)", elapsedMS)
+            trace("CORRECTION (\(provider)): auto-corrected span "
+                + "(\(typedSpan.count) -> \(text.count) chars)")
 
             // ── Bookkeeping: the recogniser-side mark is NOT touched here ───────────
             // `injectedForUtterance` is consumed by `deliver()` against RECOGNIZER text,
@@ -5140,9 +6250,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // text one click away in the menubar. Never follow the refusal with blind backspaces.
         lifetime.cloudUnapplied += 1; thisCapture.cloudUnapplied += 1
         unappliedCloudText = text
-        lastOutcome = "Cloud text ready but NOT typed — use “Copy cloud correction”"
-        trace(String(format: "GEMINI: result differs from the typed text "
-                   + "(cloud %d chars vs typed %d chars, %.0f ms); NOT applied — ",
+        lastOutcome = "\(provider) text ready but NOT typed — use “Copy correction”"
+        trace("CORRECTION (\(provider)): result differs from the typed text "
+            + String(format: "(correction %d chars vs typed %d chars, %.0f ms); "
+                        + "NOT applied — ",
                      text.count, injectedForUtterance.count, elapsedMS)
             + (repairFailure ?? "unknown reason"))
         // A neutral offer, not an error — NO error flash: either the app chose not to
@@ -5155,7 +6266,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func applyCloudFailure(_ summary: String, utteranceID: Int,
-                                   generation: Int, cancelled: Bool, httpStatus: Int?) {
+                                   generation: Int, cancelled: Bool, httpStatus: Int?,
+                                   provider: String) {
         // Id-guarded for the same reason as applyCloudResult: a superseded request's
         // cancellation hop must not clear the NEW task registered after it.
         if utteranceID == lastCloudUtteranceID {
@@ -5165,8 +6277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard generation == captureGeneration, utteranceID == lastCloudUtteranceID else { return }
         if !cancelled { lifetime.cloudErrors += 1; thisCapture.cloudErrors += 1 }
         lastOutcome = cancelled
-            ? "Cloud pass cancelled; on-device text kept"
-            : "Cloud pass failed — \(summary). On-device text kept."
+            ? "\(provider) cancelled; on-device text kept"
+            : "\(provider) failed — \(summary). On-device text kept."
 
         // ── HTTP 429: quota or rate limit ────────────────────────────────────────────
         // 429, NOT 402. fal signalled "out of credit" with a 402; Google never sends one,
@@ -5180,10 +6292,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // supersede (which cancels — see `noteFinalChunk`) reset the run, two genuine 429s
         // straddling one supersede would never trip the rule, and on a dead network that
         // is the likeliest ordering there is.
-        if !cancelled {
+        // GEMINI ONLY: a quota is a property of the Google account. Local whisper-server
+        // has no 429 to send, and if a status of that number ever did arrive from
+        // loopback it would not mean "quota", so it must neither count here nor produce
+        // the "hit Gemini quota" wording.
+        if !cancelled, correctionKind == .gemini {
             if httpStatus == 429 {
                 consecutive429s += 1
-                if consecutive429s >= Self.max429sBeforeAutoDisable, cloudEnabled {
+                if consecutive429s >= Self.max429sBeforeAutoDisable, correctionEnabled {
                     // SESSION-ONLY: `cloudPassDefaultsKey` IS DELIBERATELY NOT WRITTEN.
                     // That stored value records the user's opt-in, and hitting a quota is
                     // not a change of mind. After the quota resets and a relaunch the pass
@@ -5191,15 +6307,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     // revoke a preference on the app's own authority and leave no trace of
                     // having done it. This matters MORE than it did under fal: a rate limit
                     // clears by itself in a minute, so a persisted opt-out would outlive the
-                    // condition that caused it by an arbitrary margin.
-                    cloudEnabled = false
+                    // condition that caused it by an arbitrary margin. `correctionEnabled`
+                    // is computed from this reason, so setting it IS the switch-off.
                     cloudAutoDisabledReason = "hit Gemini quota"
                     trace("CLOUD PASS AUTO-DISABLED: \(Self.max429sBeforeAutoDisable) consecutive "
                         + "HTTP 429 (quota or rate limit); re-enable from the menubar — "
                         + "check quota at \(googleQuotaURL)")
                     // Overwrites the generic failure line set just above, on purpose: the
                     // pass turning itself off is the more important half of this event.
-                    lastOutcome = "Cloud pass auto-disabled — hit Gemini quota"
+                    lastOutcome = "Correction auto-disabled — hit Gemini quota"
                     refreshMenu()
                 }
             } else {
@@ -5302,32 +6418,298 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshMenu()
     }
 
-    @objc private func toggleCloud() {
-        guard cloudAvailable else { return }
-        cloudEnabled.toggle()
-        UserDefaults.standard.set(cloudEnabled, forKey: Self.cloudPassDefaultsKey)
-        // Every deliberate flip clears the auto-disable memory. On the way back ON that is
-        // load-bearing: without it, one stale 429 from before the quota reset plus one new
-        // failure would trip the rule again immediately and the pass would appear to
-        // refuse to stay on. On the way OFF it is simply true — the reason exists to
-        // explain an off state the user did not choose, and this one they did.
+    /// The submenu's entries paired with their kinds, in menu order.
+    private var correctionEntries: [(CorrectionProviderKind, NSMenuItem)] {
+        [(.off, correctionOffItem), (.local, correctionLocalItem),
+         (.gemini, correctionGeminiItem)]
+    }
+
+    /// Resolve `correctionKind` at launch: stored, migrated, or computed — the rule is on
+    /// the property. Returns a phrase for the launch trace saying which, or nil for an
+    /// ordinary stored choice.
+    private func resolveCorrectionKind() -> String? {
+        let d = UserDefaults.standard
+        if let raw = d.string(forKey: Self.correctionProviderDefaultsKey) {
+            if let stored = CorrectionProviderKind(rawValue: raw) {
+                correctionKind = stored
+                return nil
+            }
+            // A string nobody recognises: the privacy-preserving reading, and say so.
+            correctionKind = .off
+            return "stored value \"\(raw)\" not recognised; off"
+        }
+        if d.object(forKey: Self.cloudPassDefaultsKey) != nil {
+            let legacy = d.bool(forKey: Self.cloudPassDefaultsKey)
+            correctionKind = legacy ? .gemini : .off
+            d.set(correctionKind.rawValue, forKey: Self.correctionProviderDefaultsKey)
+            return "migrated from cloudPassEnabled=\(legacy) -> \(correctionKind.rawValue);"
+                + " new key written, old key not consulted again"
+        }
+        correctionKind = localCorrectionConfigured ? .local : .off
+        return "default — nothing stored; local when binary and model exist, else off;"
+            + " not written"
+    }
+
+    @objc private func selectCorrection(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let next = CorrectionProviderKind(rawValue: raw) else { return }
+        let previous = correctionKind
+        guard next != previous else { return }
+        // Refuse a dead provider rather than select it: a toggle that silently picks an
+        // engine that cannot run presents as "corrections just stopped".
+        switch next {
+        case .off: break
+        case .local: guard localCorrectionConfigured else { return }
+        case .gemini: guard geminiKeyAvailable else { return }
+        }
+        correctionKind = next
+        let d = UserDefaults.standard
+        d.set(next.rawValue, forKey: Self.correctionProviderDefaultsKey)
+        // The legacy key says "gemini or not", never "on or not" — see `correctionKind`.
+        d.set(next == .gemini, forKey: Self.cloudPassDefaultsKey)
+        // Every deliberate change clears the auto-disable memory. On the way back to a
+        // provider that is load-bearing: without it, one stale 429 from before the quota
+        // reset plus one new failure would trip the rule again immediately and the pass
+        // would appear to refuse to stay on. On the way OFF it is simply true — the reason
+        // exists to explain an off state the user did not choose, and this one they did.
         cloudAutoDisabledReason = nil
         consecutive429s = 0
-        trace("MENU: cloud accuracy pass -> \(cloudEnabled ? "on" : "off")")
+        trace("MENU: correction provider \(previous.rawValue) -> \(next.rawValue) "
+            + "(model=\(correctionModelName(for: next)); audio "
+            + (next == .gemini ? "is sent to Google" : "stays on this Mac") + ")")
+        // The running session's loop keeps the provider it started with
+        // (`activeCorrectionKind`); `noteFinalChunk` refuses every later send of that
+        // session because the kinds now differ. A local server it was using is stopped
+        // when that session ends (`finishCapture` → `armLocalIdleStop`), not now.
+        if previous == .local, !isCapturing, drainTimer == nil, !localDictationEnabled, finalQueue.pendingCaptureCount == 0 {
+            stopLocalServer(reason: "provider changed to \(next.rawValue)")
+        }
+        startLocalServer(reason: "provider selected")
         // The chunk loop is created (or skipped) once, at session start, from the state
         // read there. `isCapturing && chunkTask == nil` identifies exactly "this session
-        // started realtime-only": say so, or the missing cloud activity looks like a bug.
-        if cloudEnabled && isCapturing && chunkTask == nil {
-            trace("MENU: cloud pass enabled mid-session — takes effect at the NEXT session "
-                + "(tap \(defaultHotkeyName) to stop, then again to start)")
+        // started realtime-only"; `activeCorrectionKind != next` is a session whose loop
+        // is bound to the previous provider. Say so, or the missing activity looks like
+        // a bug.
+        if correctionEnabled && isCapturing && chunkTask == nil {
+            trace("MENU: correction pass enabled mid-session — takes effect at the NEXT "
+                + "session (tap \(defaultHotkeyName) to stop, then again to start)")
+        } else if correctionEnabled && isCapturing && activeCorrectionKind != next {
+            trace("MENU: correction provider changed mid-session — this session's "
+                + "remaining utterances are not sent; \(next.rawValue) takes effect at "
+                + "the NEXT session (tap \(defaultHotkeyName) to stop, then again to start)")
         }
         refreshMenu()
+    }
+
+    // MARK: - Local server lifecycle
+
+    /// Chain `operation` after whatever the chain is already doing. See `serverLifecycle`.
+    private func enqueueServerLifecycle(isStart: Bool,
+                                        _ operation: @escaping @Sendable () async -> Void) {
+        let previous = serverLifecycle
+        serverLifecycleIsStart = isStart
+        serverLifecycle = Task {
+            await previous?.value
+            await operation()
+        }
+    }
+
+    /// Start (or re-verify) the local server and warm it, then report ONE outcome. No
+    /// progress callback: `ensureReady(progress:)` fires from the actor twice a second,
+    /// and feeding the HUD from it would need a Task per call — the unordered shape
+    /// `RecognizerEventBox` bans, where a late `.loadingModel` lands after `.ready`. The
+    /// terminal outcome is enough for the trace and the menu. A no-op unless `.local` is
+    /// selected and configured, so every caller may call it unconditionally.
+    private func startLocalServer(reason: String) {
+        guard (correctionKind == .local && localCorrectionConfigured) || localDictationEnabled else { return }
+        localIdleStopTask?.cancel()
+        localIdleStopTask = nil
+        localServerRequested = true
+        let manager = WhisperServerManager.shared
+        enqueueServerLifecycle(isStart: true) { [weak self] in
+            let clock = ContinuousClock()
+            let started = clock.now
+            do {
+                let url = try await manager.ensureReady()
+                let readyMS = Self.milliseconds(started.duration(to: clock.now))
+                let ownership = await manager.currentOwnership
+                let warm = await manager.warmUp()
+                await MainActor.run {
+                    self?.noteLocalServerReady(url: url, readyMS: readyMS,
+                                               ownership: ownership, warm: warm,
+                                               reason: reason)
+                }
+            } catch {
+                await MainActor.run {
+                    self?.noteLocalServerFailed(error, reason: reason)
+                }
+            }
+        }
+    }
+
+    private func noteLocalServerReady(url: URL, readyMS: Double,
+                                      ownership: WhisperServerManager.Ownership,
+                                      warm: WhisperServerManager.WarmUpOutcome,
+                                      reason: String) {
+        let port = url.port ?? WhisperServerManager.defaultPort
+        let warmText: String
+        switch warm {
+        case .warmed(let seconds):
+            warmText = String(format: "warmed in %.0f ms", seconds * 1000)
+        case .alreadyWarm: warmText = "already warm"
+        case .skipped(let why): warmText = "warm-up skipped — \(why)"
+        case .failed(let why): warmText = "warm-up FAILED — \(why)"
+        }
+        localServerStatus = "ready on port \(port) (\(ownership))"
+        trace(String(format: "correction: local server ready port=%d in %.0f ms ",
+                     port, readyMS)
+            + "ownership=\(ownership)"
+            + (ownership == .adopted
+                ? " (not started by this app: model and -l unverified; not stopped by it)"
+                : "")
+            + (ownership == .reclaimed
+                ? " (orphan of an earlier run of this app, per its pidfile; stopped by it)"
+                : "")
+            + "; \(warmText) [\(reason)]")
+        forwardManagerNotes()
+        refreshMenu()
+    }
+
+    private func noteLocalServerFailed(_ error: Error, reason: String) {
+        if error is CancellationError {
+            trace("correction: local server start cancelled [\(reason)]")
+            return
+        }
+        let text = String(describing: error)
+        localServerStatus = "FAILED — \(text)"
+        trace("correction: local server FAILED — \(text) [\(reason)]")
+        forwardManagerNotes()
+        refreshMenu()
+    }
+
+    /// Forward the manager's own `[manager]` notes, and ONLY those, into the trace. The
+    /// ring also holds the child's stdout/stderr, which is under the child's control —
+    /// an adopted server started with `--print-realtime` would fill it with transcript
+    /// segments — and the trace never carries transcript text (`trace()`'s contract).
+    /// Forwarded once each: `totalLines` counts what the ring has ever held.
+    private func forwardManagerNotes() {
+        let manager = WhisperServerManager.shared
+        let total = manager.log.totalLines
+        let fresh = total - forwardedManagerLogLines
+        guard fresh > 0 else { return }
+        forwardedManagerLogLines = total
+        for line in manager.recentLog(fresh) where line.hasPrefix("[manager]") {
+            trace("correction: \(line)")
+        }
+    }
+
+    /// Stop the local server through the chain. A start still loading its model is
+    /// cancelled first so the stop is not held behind a 60 s readiness wait; the
+    /// cancelled start traces "cancelled" and the stop runs after it. The cancellation
+    /// reaches the wrapper only — `WhisperServerManager.startShared` awaits an inner
+    /// task that it does not cancel — so the manager is also told to veto the spawn:
+    /// without that, a start cancelled before `launch` still spawned whisper-server and
+    /// began the model load that the queued `stop()` then SIGTERMed. A stop is never
+    /// cancelled (see `serverLifecycleIsStart`). No-op with no trace when nothing was
+    /// ever started, so the sleep/lock observers may call it on every event.
+    private func stopLocalServer(reason: String) {
+        localIdleStopTask?.cancel()
+        localIdleStopTask = nil
+        guard localServerRequested else { return }
+        localServerRequested = false
+        let manager = WhisperServerManager.shared
+        if serverLifecycleIsStart {
+            manager.vetoPendingStart()
+            serverLifecycle?.cancel()
+        }
+        trace("correction: local server stopping — \(reason)")
+        enqueueServerLifecycle(isStart: false) { [weak self] in
+            await manager.stop()
+            await MainActor.run {
+                guard let self else { return }
+                self.localServerStatus = "stopped (\(reason))"
+                self.forwardManagerNotes()
+                self.refreshMenu()
+            }
+        }
+    }
+
+    /// After a capture ends: release the server if the session's provider is no longer
+    /// the selected one, else start the idle clock. Both are no-ops when nothing runs.
+    private func armLocalIdleStop() {
+        localIdleStopTask?.cancel()
+        localIdleStopTask = nil
+        guard finalQueue.pendingCaptureCount == 0 else { return }
+        guard correctionKind == .local || localDictationEnabled else {
+            stopLocalServer(reason: "provider is \(correctionKind.rawValue)")
+            return
+        }
+        guard localServerRequested else { return }
+        let seconds = Self.localServerIdleStopSeconds
+        localIdleStopTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            guard let self, !self.isCapturing, self.drainTimer == nil, self.finalQueue.pendingCaptureCount == 0 else { return }
+            self.stopLocalServer(reason: "idle for \(Int(seconds)) s")
+        }
+    }
+
+    /// Route SIGTERM through ordinary AppKit termination so local captures flush
+    /// and pending results finish before the owned server is stopped. SIGKILL
+    /// cannot drain work; a later launch only reclaims an exact owned PID record.
+    private func installSignalHandlers() {
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(
+            signal: SIGTERM, queue: DispatchQueue.global(qos: .userInitiated))
+        source.setEventHandler {
+            // Nonisolated, so it runs right here on the global queue; the terminate is
+            // one hop to the main actor, and one hop has no ordering to lose.
+            trace("SIGTERM received — finishing pending work and terminating through "
+                + "NSApp.terminate so applicationWillTerminate runs")
+            Task { @MainActor in NSApp.terminate(nil) }
+        }
+        source.resume()
+        sigtermSource = source
+    }
+
+    /// Read the user's glossary off the main thread, merge it ahead of the built-ins,
+    /// and publish `activeKeyterms`. See `UserKeyterms`.
+    private func reloadKeyterms(reason: String) {
+        guard correctionKind != .off || localDictationEnabled else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            let loaded = UserKeyterms.load()
+            let merged = UserKeyterms.merge(user: loaded.terms, builtin: cloudKeyterms)
+            let rendering = WhisperClient.promptRendering(from: merged)
+            let bytes = rendering.sentence.utf8.count
+            await MainActor.run {
+                self?.publishKeyterms(loaded, merged: merged, promptKept: rendering.kept,
+                                      promptDropped: rendering.dropped, promptBytes: bytes,
+                                      reason: reason)
+            }
+        }
+    }
+
+    private func publishKeyterms(_ loaded: UserKeyterms.Loaded, merged: [String],
+                                 promptKept: Int, promptDropped: Int, promptBytes: Int,
+                                 reason: String) {
+        activeKeyterms = merged
+        // Counts and a path only — never a term. `dropped` is the number the user file
+        // exists to keep at zero.
+        trace("keyterms: user=\(loaded.terms.count) "
+            + "(\(loaded.path)\(loaded.present ? "" : " absent")) "
+            + "builtin=\(cloudKeyterms.count) merged=\(merged.count) "
+            + "localPrompt=\(promptKept) kept/\(promptDropped) dropped "
+            + "\(promptBytes)/\(WhisperClient.maxPromptBytes) bytes [\(reason)]")
+    }
+
+    private nonisolated static func milliseconds(_ duration: Duration) -> Double {
+        let parts = duration.components
+        return Double(parts.seconds) * 1000 + Double(parts.attoseconds) / 1e15
     }
 
     /// Switch the dictation engine between Apple's on-device recogniser and Gemini Live.
     ///
     /// TAKES EFFECT AT THE NEXT CAPTURE, never mid-session, and that is the same rule
-    /// `toggleCloud` follows one screen up — but here it is a correctness requirement
+    /// `selectCorrection` follows one screen up — but here it is a correctness requirement
     /// rather than a convenience. `activeEngineKind` and the `activeEngine` reference it
     /// resolves are captured once in `beginCapture` and are what `processTap` feeds on the
     /// realtime audio thread; swapping the engine under a live session would hand a
@@ -5335,11 +6717,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// ledger still describing the first one's text. So the flip only ever moves
     /// `selectedEngineKind`, and the running session keeps the engine it started with.
     ///
-    /// Guarded on `geminiLiveAvailable` for the same reason `toggleCloud` guards on
-    /// `cloudAvailable`: with no `GOOGLE_API_KEY` on disk the Gemini engine cannot start,
-    /// and a toggle that silently selects a dead engine would present as "dictation just
-    /// stopped working". `refreshMenu` renders that unavailable state with the key name
-    /// and path, so the user is told what to create.
+    /// Guarded on `geminiLiveAvailable` for the same reason `selectCorrection` refuses an
+    /// unconfigured provider: with no `GOOGLE_API_KEY` on disk the Gemini engine cannot
+    /// start, and a toggle that silently selects a dead engine would present as "dictation
+    /// just stopped working". `refreshMenu` renders that unavailable state with the key
+    /// name and path, so the user is told what to create.
     @objc private func toggleEngine() {
         let next: DictationEngineKind = (selectedEngineKind == .apple) ? .geminiLive : .apple
         // Only the way IN is gated. Falling back to Apple must always be possible — it is
@@ -5375,9 +6757,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleAutoCorrect() {
+        guard !isCapturing && drainTimer == nil else { return }
         autoCorrectEnabled.toggle()
         UserDefaults.standard.set(autoCorrectEnabled, forKey: Self.autoCorrectDefaultsKey)
-        trace("MENU: auto-correct from cloud -> \(autoCorrectEnabled ? "on" : "off")")
+        trace("MENU: auto-apply corrections -> \(autoCorrectEnabled ? "on" : "off")")
         refreshMenu()
     }
 
@@ -5593,8 +6976,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "injectedChars=\(lifetime.injectedChars) injectFailures=\(lifetime.injectFailures) "
             + "divergencesRepaired=\(lifetime.divergencesRepaired) "
             + "divergencesRefused=\(lifetime.divergencesRefused) "
+            + "repairsRefusedTooLarge=\(lifetime.repairsRefusedTooLarge) "
+            + "retractionsRefused=\(lifetime.retractionsRefused) "
             + "secureInputRefusals=\(lifetime.secureInputRefusals)")
-        trace("AUTOSTART CLOUD SUMMARY: available=\(cloudAvailable) enabled=\(cloudEnabled) "
+        trace("AUTOSTART CLOUD SUMMARY: available=\(correctionAvailable) "
+            + "enabled=\(correctionEnabled) correctionProvider=\(correctionKind.rawValue) "
+            + "correctionModel=\(correctionModelName(for: correctionKind)) "
             + "finalChunks=\(lifetime.finalChunks) sent=\(lifetime.cloudSent) "
             + "applied=\(lifetime.cloudApplied) unapplied=\(lifetime.cloudUnapplied) "
             + "errors=\(lifetime.cloudErrors) skipped=\(lifetime.cloudSkipped) "

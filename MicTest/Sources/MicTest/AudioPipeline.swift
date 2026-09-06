@@ -31,6 +31,14 @@ final class AudioPipeline: @unchecked Sendable {
 
     // MARK: - Public surface
 
+    enum Mode: Sendable {
+        /// Existing second-pass behavior: trim idle input and emit interim windows.
+        case correction
+        /// Preserve quiet input for the local model's VAD. RMS only suggests an
+        /// utterance boundary; it must not decide which spoken samples survive.
+        case localDictation
+    }
+
     /// One unit of audio handed to the transcriber.
     struct Chunk: Sendable {
         /// A complete 16 kHz mono 16-bit PCM WAV file, 44-byte header included.
@@ -106,6 +114,20 @@ final class AudioPipeline: @unchecked Sendable {
     /// continuous speech.
     private static let maxChunkSeconds: Double = 10.0
 
+    /// Local primary transcription has no previously typed span to repair. A longer
+    /// window gives mixed-language phrases more context and reduces mid-word cuts.
+    /// The consumer must still poll while inference runs, before the 30 s ring fills.
+    private static let localMaxChunkSeconds: Double = 20.0
+    /// Search only the last two seconds before a running capture reaches its cap.
+    /// Ten-millisecond frames reject zero crossings; twelve consecutive quiet
+    /// frames provide 120 ms of evidence for a seam between phonemes.
+    private static let localCapSearchSeconds: Double = 2.0
+    private static let localCapFrameSeconds: Double = 0.01
+    private static let localCapGapSeconds: Double = 0.12
+    /// Preserve short words when the user explicitly stops. VAD, not this duration
+    /// floor, decides whether the retained audio contains speech.
+    private static let localMinFlushSeconds: Double = 0.15
+
     /// Ring capacity. Must exceed `maxChunkSeconds` with headroom so the force-finalise
     /// fires before the oldest samples are overwritten. 30 s of Float32 at 16 kHz is 1.9 MB.
     private static let ringSeconds: Double = 30.0
@@ -125,6 +147,10 @@ final class AudioPipeline: @unchecked Sendable {
     private let interimIntervalSamples: Int
     private let maxChunkSamples: Int
     private let preRollSamples: Int
+    private let minFlushSamples: Int
+    private let mode: Mode
+    private let capFrameSamples: Int
+    private let capMinimumQuietFrames: Int
 
     // MARK: - Shared state (audio thread ⇄ background Task)
 
@@ -169,6 +195,10 @@ final class AudioPipeline: @unchecked Sendable {
     /// section would zero-fill 1.9 MB while the audio thread spins on the lock; the copy
     /// alone is bad enough. `takeChunk` is documented single-consumer, so this needs no lock.
     private var snapshot: [Float]
+    /// Fixed-size scratch for cap selection, touched only by the single consumer.
+    /// No allocation or sorting occurs while the audio ring's lock is held.
+    private var capFrameRMS: [Float]
+    private var capFramePeaks: [Float]
 
     // MARK: - Converter input plumbing
 
@@ -183,9 +213,12 @@ final class AudioPipeline: @unchecked Sendable {
 
     // MARK: - Init
 
-    /// - Parameter inputFormat: the tap's own format, e.g. 48 kHz mono Float32. It must be
-    ///   the format `installTap` was given; a made-up format produces silence or garbage.
-    init(inputFormat: AVAudioFormat) throws {
+    /// - Parameters:
+    ///   - inputFormat: The tap's own format, e.g. 48 kHz mono Float32. It must be
+    ///     the format `installTap` was given; a made-up format produces silence or garbage.
+    ///   - mode: Local dictation retains quiet input and requires downstream model VAD.
+    ///     Omitting this argument preserves the existing correction behavior.
+    init(inputFormat: AVAudioFormat, mode: Mode = .correction) throws {
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw PipelineError.invalidInputFormat(
                 "sampleRate=\(inputFormat.sampleRate) channels=\(inputFormat.channelCount)")
@@ -218,6 +251,7 @@ final class AudioPipeline: @unchecked Sendable {
         self.converter = conv
         self.outputFormat = outFormat
         self.converted = outBuffer
+        self.mode = mode
 
         let rate = Self.outputSampleRate
         self.ringCapacity = Int(rate * Self.ringSeconds)
@@ -225,8 +259,16 @@ final class AudioPipeline: @unchecked Sendable {
         self.minFinalSpeechSamples = Int(rate * Self.minFinalSpeechSeconds)
         self.minInterimSpeechSamples = Int(rate * Self.minInterimSpeechSeconds)
         self.interimIntervalSamples = Int(rate * Self.interimIntervalSeconds)
-        self.maxChunkSamples = Int(rate * Self.maxChunkSeconds)
+        self.maxChunkSamples = Int(rate * (mode == .localDictation
+            ? Self.localMaxChunkSeconds : Self.maxChunkSeconds))
         self.preRollSamples = Int(rate * Self.preRollSeconds)
+        self.minFlushSamples = Int(rate * (mode == .localDictation
+            ? Self.localMinFlushSeconds : Self.minFinalSpeechSeconds))
+        self.capFrameSamples = Int(rate * Self.localCapFrameSeconds)
+        self.capMinimumQuietFrames = Int((Self.localCapGapSeconds / Self.localCapFrameSeconds).rounded())
+        let capFrames = Int((Self.localCapSearchSeconds / Self.localCapFrameSeconds).rounded())
+        self.capFrameRMS = [Float](repeating: 0, count: capFrames)
+        self.capFramePeaks = [Float](repeating: 0, count: capFrames)
 
         self.scratch = [Float](repeating: 0, count: Int(rate * 2))
         self.snapshot = [Float](repeating: 0, count: ringCapacity)
@@ -299,7 +341,9 @@ final class AudioPipeline: @unchecked Sendable {
 
             // While nothing has been spoken, keep only the pre-roll. Dropping the oldest
             // samples is just a smaller `count`, since the read origin is derived from it.
-            if state.speech == 0 && state.count > preRoll {
+            // Local dictation leaves even all-quiet audio intact for model VAD.
+            // A quiet phoneme cannot be recovered after pre-roll trimming deletes it.
+            if mode == .correction && state.speech == 0 && state.count > preRoll {
                 state.count = preRoll
             }
             // Cap *after* any trim, so neither counter can claim more samples than the ring
@@ -375,6 +419,21 @@ final class AudioPipeline: @unchecked Sendable {
             let silenceEnded = state.trailingSilence >= finalSilence
             let tooLong = state.count >= maxChunk
 
+            if mode == .localDictation {
+                // Polling room tone or quiet speech must not repeatedly clear the
+                // retained audio. A qualified RMS utterance may end naturally; all
+                // other input waits for the cap or explicit flush, then model VAD.
+                // No interim copy/encode is needed: Apple supplies the live preview.
+                if tooLong {
+                    let cap = preferredLocalCap(state, capacity: capacity, hardCap: maxChunk)
+                    return emitFinal(&state, capacity: capacity, maxChunk: cap)
+                }
+                if silenceEnded && state.speech >= minFinalSpeech {
+                    return emitFinal(&state, capacity: capacity, maxChunk: maxChunk)
+                }
+                return nil
+            }
+
             if silenceEnded {
                 // Exactly two outcomes, no middle band: either the utterance is long enough
                 // to transcribe, or it was a click/thump and gets dropped. Leaving a 0.3–0.4 s
@@ -414,16 +473,18 @@ final class AudioPipeline: @unchecked Sendable {
                      seconds: Double(taken.samples) / Self.outputSampleRate)
     }
 
-    /// Force-finalize: return all buffered speech as a final chunk immediately,
-    /// regardless of trailing-silence state, then clear the consumed audio.
-    /// Returns nil only when there is less than `minSpeechSeconds` of buffered speech.
+    /// Force-finalize up to the mode's chunk cap, leaving any remainder for another
+    /// flush. Call repeatedly after input stops to drain everything. Audio below the
+    /// mode's duration floor is discarded: 0.4 s for correction, 0.15 s for local.
+    /// Local mode includes silence/quiet speech; downstream model VAD must reject
+    /// non-speech before its transcript can be inserted.
     /// Called from the background chunk loop (NOT the audio thread) when the user
     /// releases the hold-to-talk key -- the release is the utterance boundary, so
     /// waiting for acoustic silence would be redundant (and impossible in a room
     /// whose ambient noise sits above silenceRMSThreshold, which is exactly the
     /// measured failure this method fixes).
     func flush() -> Chunk? {
-        let minFinalSpeech = minFinalSpeechSamples
+        let minDuration = minFlushSamples
         let maxChunk = maxChunkSamples
         let capacity = ringCapacity
 
@@ -431,20 +492,16 @@ final class AudioPipeline: @unchecked Sendable {
         // so the realtime `append` path never waits on WAV encoding.
         let decision: Taken? = lock.withLock { state -> Taken? in
             guard state.count > 0 else { return nil }
-            // Gate on total buffered DURATION, not the `speech` counter. `speech` only
-            // accumulates above silenceRMSThreshold (0.01), and a quiet microphone can
-            // sit below that while the on-device recognizer still hears words fine --
-            // measured in production: 11 chars transcribed and typed, yet speech==0 and
-            // flush returned nil, so the cloud pass never fired. The caller already
-            // gates the cloud dispatch on non-empty recognizer text (the
-            // anti-hallucination gate), so RMS adds no protection here -- it only
-            // starves the flush. Below ~0.4 s of ANY audio it is still a click/thump:
-            // clear rather than leave it pending so the next press starts clean.
-            guard state.count >= minFinalSpeech else {
+            // Gate on total buffered duration, not the RMS speech counter: quiet
+            // speech must still reach the transcriber. Correction dispatch separately
+            // checks Apple's nonempty transcript; local dictation requires model VAD.
+            // This duration floor is never evidence that the audio contains speech.
+            // Clear a subminimum tail so the next capture starts clean.
+            guard state.count >= minDuration else {
                 Self.clear(&state)
                 return nil
             }
-            // `emitFinal` applies the 25 s cap, consumes the emitted span, and resets
+            // `emitFinal` applies the mode's cap, consumes the emitted span, and resets
             // segmentation state (fully, when nothing is left pending).
             return emitFinal(&state, capacity: capacity, maxChunk: maxChunk)
         }
@@ -477,11 +534,73 @@ final class AudioPipeline: @unchecked Sendable {
         let isFinal: Bool
     }
 
+    /// Choose a seam in the latest suitable quiet run in [cap - 2 s, cap).
+    /// Only the running local cap calls this; explicit flush and correction retain
+    /// their existing full-chunk behavior. Call with the ring lock held.
+    ///
+    /// The RMS reference is a mean of 10 ms frame RMS values, with each frame
+    /// clipped to three times that mean before averaging again. This limits the
+    /// influence of a loud transient on otherwise quiet continuous speech.
+    /// A quiet frame needs RMS <= min(0.0025, 0.2 * reference, 0.05 * window peak)
+    /// AND peak <= 3 * that threshold, so a low-RMS plosive interrupts the run.
+    /// Uniform quiet speech stays above its own relative threshold. With no
+    /// nonzero reference, retain the hard cap rather than repartitioning silence.
+    ///
+    /// Bounded work: exactly 32,000 samples and 200 frame summaries per cap,
+    /// independent of utterance length. Scratch is preallocated in init.
+    private func preferredLocalCap(_ state: State, capacity: Int, hardCap: Int) -> Int {
+        let frameCount = capFrameRMS.count
+        let windowSamples = frameCount * capFrameSamples
+        let windowStart = hardCap - windowSamples
+        guard windowStart >= 0, state.count >= hardCap else { return hardCap }
+        var position = (state.write - state.count + capacity + windowStart) % capacity
+        var rmsSum: Float = 0
+        var windowPeak: Float = 0
+        for frame in 0..<frameCount {
+            var energy: Float = 0
+            var peak: Float = 0
+            for _ in 0..<capFrameSamples {
+                let sample = state.ring[position]
+                energy += sample * sample
+                peak = max(peak, sample.magnitude)
+                position += 1
+                if position == capacity { position = 0 }
+            }
+            let rms = (energy / Float(capFrameSamples)).squareRoot()
+            capFrameRMS[frame] = rms
+            capFramePeaks[frame] = peak
+            rmsSum += rms
+            windowPeak = max(windowPeak, peak)
+        }
+        let mean = rmsSum / Float(frameCount)
+        guard mean > 0, mean.isFinite, windowPeak.isFinite else { return hardCap }
+        var clippedSum: Float = 0
+        for frame in 0..<frameCount { clippedSum += min(capFrameRMS[frame], mean * 3) }
+        let reference = clippedSum / Float(frameCount)
+        let threshold = min(Self.silenceRMSThreshold, reference * 0.2, windowPeak * 0.05)
+        var quietStart: Int?
+        var chosen = hardCap
+        for frame in 0...frameCount {
+            let quiet = frame < frameCount && capFrameRMS[frame] <= threshold
+                && capFramePeaks[frame] <= threshold * 3
+            if quiet {
+                if quietStart == nil { quietStart = frame }
+            } else if let start = quietStart {
+                let length = frame - start
+                if length >= capMinimumQuietFrames {
+                    chosen = windowStart + start * capFrameSamples + length * capFrameSamples / 2
+                }
+                quietStart = nil
+            }
+        }
+        return chosen
+    }
+
     /// Emit a final chunk, never longer than `maxChunk`. Call with the lock held.
     ///
     /// The clamp matters because `count` saturates at the ring's 30 s capacity, not at the
-    /// 25 s chunk cap: a consumer that stalls for six seconds mid-monologue would otherwise
-    /// be handed a 30 s chunk. So we take the oldest `maxChunk` samples and leave the tail
+    /// mode's chunk cap: a stalled consumer would otherwise be handed a 30 s chunk.
+    /// So we take the oldest `maxChunk` samples and leave the tail
     /// pending — it becomes the head of the next chunk rather than being thrown away.
     private func emitFinal(_ state: inout State, capacity: Int, maxChunk: Int) -> Taken? {
         let take = min(state.count, maxChunk)

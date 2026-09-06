@@ -1,3 +1,54 @@
 MicTest/build/
 .DS_Store
 _archive/PhayaVoice/build/
+
+# Local project memory and agent instructions (never publish)
+.project-memory/
+AGENTS.md
+AGENTS.override.md
+INSTRUCTIONS.md
+agent.md
+CLAUDE.md
+MEMORY.md
+.codex/
+.claude/
+.agents/
+.cursor/
+
+# Credentials and personal configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets/
+*.local.*
+
+# Generated files, runtime models and private audio
+__pycache__/
+*.py[cod]
+.venv/
+.build/
+DerivedData/
+*.app/
+*.dSYM/
+*.gguf
+ggml-*.bin
+recordings/
+Recovery/
+*.wav
+!experiments/thaitest/*.wav
+*.m4a
+*.mp3
+*.log
+*-trace.txt
+
+# Internal plans, machine-specific reports and measurement output
+/docs/superpowers/
+/docs/research/
+/MicTest/PLAN-*
+/MicTest/TEST-*
+/MicTest/tools/**/RESULT-*

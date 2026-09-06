@@ -1,0 +1,30 @@
+name: เสนอไอเดีย / Feature request
+description: เล่าว่าฟีเจอร์ใหม่จะช่วยงานของคุณอย่างไร
+title: "[Idea] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: ปัญหาหรืองานที่อยากทำ
+      description: เล่าสถานการณ์ใช้งานโดยไม่ใส่ข้อมูลส่วนตัว
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: อยากให้ MicTest ทำอะไร
+      description: อธิบายพฤติกรรมหรือขั้นตอนที่คาดหวัง
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: วิธีที่ใช้อยู่หรือทางเลือกอื่น
+  - type: dropdown
+    id: processing
+    attributes:
+      label: ความต้องการด้านการประมวลผล
+      options:
+        - ต้องทำงานในเครื่อง
+        - ใช้ cloud แบบเลือกเปิดได้
+        - ไม่เกี่ยวข้อง / ยังไม่แน่ใจ

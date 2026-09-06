@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds MicTest.app onto the Desktop.
 #
-# MicTest is a background Thai dictation app: hold Right-Option, speak, and the
+# MicTest is a background Thai dictation app: tap Right-Option, speak, and the
 # words are typed into whatever app has keyboard focus. It is an LSUIElement
 # (agent) app -- no Dock icon, no window -- because a dictation tool that steals
 # focus is worse than useless.
@@ -34,17 +34,23 @@ ICON="$SRC/MicTest.icns"
 #   identifier "com.boombignose.mictest" and anchor apple generic
 #   and certificate 1[field.1.2.840.113635.100.6.2.6]
 #   and certificate leaf[field.1.2.840.113635.100.6.1.13]
-#   and certificate leaf[subject.OU] = "59CAS739TY"
+#   and certificate leaf[subject.OU] = "YOUR_TEAM_ID"
 # i.e. keyed on identifier + team OU, both of which are stable across rebuilds.
 # The TCC grant therefore survives. The archived PhayaVoice used exactly this.
 #
-# Referenced by SHA-1 because two certs share the same common name
-# ("Developer ID Application: Vittawat Sootawee (59CAS739TY)").
-SIGN_ID="${MICTEST_SIGN_ID:-06A6DF4F3FF0A89E2B74786D7C36220260ACA82E}"
+# Select your own Developer ID certificate explicitly. Certificate details are
+# machine-specific and must not be hardcoded into a shared build script.
+SIGN_ID="${MICTEST_SIGN_ID:-}"
+if [ -z "$SIGN_ID" ]; then
+  echo "Set MICTEST_SIGN_ID to your Developer ID certificate SHA-1." >&2
+  echo "List identities with: security find-identity -v -p codesigning" >&2
+  echo "For a local development build, use ./build-dev.sh instead." >&2
+  exit 1
+fi
 # "-" is codesign's ad-hoc pseudo-identity. Reject it explicitly rather than
 # letting it reach codesign: overriding MICTEST_SIGN_ID=- would reintroduce the
 # cdhash DR and the exact permission-reset bug this script exists to prevent.
-if [ -z "$SIGN_ID" ] || [ "$SIGN_ID" = "-" ]; then
+if [ "$SIGN_ID" = "-" ]; then
   echo "✗ MICTEST_SIGN_ID=\"$SIGN_ID\" requests ad-hoc signing, which is refused." >&2
   echo "  Ad-hoc gives a cdhash designated requirement: macOS forgets the" >&2
   echo "  microphone grant on every rebuild and re-prompts. Use a Developer ID" >&2

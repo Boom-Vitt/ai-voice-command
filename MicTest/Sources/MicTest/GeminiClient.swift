@@ -616,3 +616,50 @@ struct GeminiClient: Sendable {
             + Double(parts.attoseconds) / 1_000_000_000_000_000
     }
 }
+
+// MARK: - CorrectionProvider
+
+/// ``GeminiClient`` as the cloud choice behind main.swift's correction pass.
+///
+/// The three properties live in this ordinary conformance extension. The
+/// `transcribe` witness does not, and that placement is load-bearing:
+/// ``transcribe(wav:keyterms:)`` already exists on this type returning
+/// ``Result``, and a second method with the same labels returning
+/// ``CorrectionResult`` — the obvious way to write the witness — makes
+/// main.swift's existing `let result = try await client.transcribe(wav:keyterms:)`
+/// fail with *ambiguous use of 'transcribe(wav:keyterms:)'* (tried 2026-09-03,
+/// Swift 6.3.2). Supplying the witness from a protocol extension constrained to
+/// `Self == GeminiClient` instead keeps the concrete method winning at a concrete
+/// call site — the same un-annotated call compiled and returned ``Result`` — while
+/// `any CorrectionProvider` dispatches to the witness through the protocol.
+/// Nothing about the existing method, its result type, or its callers changes.
+extension GeminiClient: CorrectionProvider {
+
+    /// Derived from ``model`` so the menu cannot name one model while the
+    /// request names another.
+    var displayName: String { "Gemini (\(Self.model))" }
+
+    /// The WAV is inlined into a request to `generativelanguage.googleapis.com`.
+    var sendsAudioOffDevice: Bool { true }
+
+    /// ``isConfigured``. Always true on a live instance — ``init()`` throws
+    /// rather than build an unconfigured client — so `false` here is
+    /// unreachable today; the protocol asks, and this is the honest answer.
+    func isAvailable() async -> Bool { isConfigured }
+}
+
+extension CorrectionProvider where Self == GeminiClient {
+
+    /// ``GeminiClient/Result`` → ``CorrectionResult``: the same `text`, the same
+    /// monotonic `elapsedMS`, and `audioTokens` straight from Google's ledger.
+    /// `totalTokens` is dropped because nothing downstream reads it.
+    func transcribe(wav: Data, keyterms: [String]) async throws -> CorrectionResult {
+        // The annotation selects the concrete method. Without it this line faces
+        // the same overload set main.swift does, inside the very function that
+        // would be the other candidate.
+        let result: GeminiClient.Result = try await transcribe(wav: wav, keyterms: keyterms)
+        return CorrectionResult(text: result.text,
+                                elapsedMS: result.elapsedMS,
+                                audioTokens: result.audioTokens)
+    }
+}

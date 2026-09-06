@@ -1,0 +1,8 @@
+วันนี้ผมจะ deploy ระบบใหม่ขึ้น production ครับ.
+ช่วย commit แล้ว push ขึ้น branch main ให้หน่อย.
+ขอ time สักครู่นะครับ เดี๋ยว save ไฟล์ก่อน.
+เปิด browser แล้ว test ดูว่า function นี้ทำงานไหม.
+ผมใช้ Python กับ JavaScript เป็นหลักครับ.
+meeting ตอนบ่ายสามโมง อย่าลืม refactor โค้ดด้วยนะ.
+ส่ง email ไปหา team แล้วครับ.
+สวัสดีครับ วันนี้อากาศดีมากเลย.

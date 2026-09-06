@@ -98,6 +98,51 @@ import OSLog
 @MainActor
 final class TextInjector: TextInjecting {
 
+    /// The field captured for one recording. Keep this value alongside delayed
+    /// transcription work so a later recording cannot redirect its result.
+    /// A missing focused element stays missing; delivery must not substitute
+    /// whichever field a subsequent recording captured.
+    struct BufferedTargetToken {
+        fileprivate let element: AXUIElement?
+    }
+
+    // Compatibility slot for callers that deliver only the current recording.
+    // Explicit tokens retain their own target when this slot changes or clears.
+    private var bufferedTarget: BufferedTargetToken?
+
+    @discardableResult
+    func captureBufferedTarget() -> BufferedTargetToken {
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
+        let token = BufferedTargetToken(
+            element: copyElement(systemWide, attribute: kAXFocusedUIElementAttribute))
+        bufferedTarget = token
+        return token
+    }
+
+    func clearBufferedTarget() { bufferedTarget = nil }
+
+    func injectBuffered(_ text: String) -> String? {
+        injectBuffered(text, target: bufferedTarget ?? BufferedTargetToken(element: nil))
+    }
+
+    func injectBuffered(_ text: String, target token: BufferedTargetToken) -> String? {
+        guard let target = token.element, focusIsStill(target) else {
+            return "The text field changed. Transcript kept in the preview; "
+                + "use Copy last transcript or start dictation in the intended field."
+        }
+        guard let range = selectedTextRange(of: target), range.location >= 0, range.length >= 0 else {
+            return "The text selection cannot be verified. Transcript kept in the preview; use Copy last transcript."
+        }
+        // No selected text is replaced when automatic corrections are off.
+        return inject(text, collapseStandingSelection: true, expectedTarget: target)
+    }
+
+    private func bufferedTargetIsReady(_ target: AXUIElement) -> Bool {
+        guard focusIsStill(target), let range = selectedTextRange(of: target) else { return false }
+        return range.location >= 0 && range.length == 0
+    }
+
     // MARK: - Timing constants
     //
     // Every number here has a reason. If you change one, change the comment.
@@ -425,7 +470,8 @@ final class TextInjector: TextInjecting {
     ///   the direction is load-bearing and the caller — not this file — is the
     ///   one that knows whether a standing selection is the user's or a mess
     ///   left by a refused repair.
-    func inject(_ text: String, collapseStandingSelection: Bool) -> String? {
+    func inject(_ text: String, collapseStandingSelection: Bool,
+                expectedTarget: AXUIElement? = nil) -> String? {
         guard !text.isEmpty else {
             // Nothing to deliver is not a failure — an empty transcript just
             // means the user held the hotkey and said nothing.
@@ -446,7 +492,7 @@ final class TextInjector: TextInjecting {
         // CGEvent.post to the HID tap is gated on it too. One check covers both.
         guard AXIsProcessTrusted() else {
             Self.log.notice("Refusing injection: Accessibility permission not granted.")
-            return "PhayaVoice needs Accessibility permission. Grant it in System Settings > "
+            return "MicTest needs Accessibility permission. Grant it in System Settings > "
                 + "Privacy & Security > Accessibility, then try again."
         }
 
@@ -484,6 +530,9 @@ final class TextInjector: TextInjecting {
             let systemWide = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
             if let focused = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute) {
+                if let expectedTarget, !CFEqual(focused, expectedTarget) {
+                    return Self.focusMovedRefusal
+                }
                 AXUIElementSetMessagingTimeout(focused, Self.axMessagingTimeout)
                 if let reason = collapseStandingSelectionToEnd(focused) {
                     // Return HERE. Falling through would reach the clipboard
@@ -503,9 +552,12 @@ final class TextInjector: TextInjecting {
 
         let target = frontmostAppInfo()
         let targetID = target?.bundleID ?? "unknown"
+        if let expectedTarget, !bufferedTargetIsReady(expectedTarget) {
+            return "The text field or selection changed. Transcript kept in the preview."
+        }
 
         // Path A: direct Accessibility insertion.
-        if insertViaAccessibility(text) {
+        if insertViaAccessibility(text, expectedTarget: expectedTarget) {
             Self.log.info(
                 "Injected \(text.count, privacy: .public) chars via AX direct insertion into \(targetID, privacy: .public)"
             )
@@ -516,7 +568,7 @@ final class TextInjector: TextInjecting {
         Self.log.info(
             "AX direct insertion unavailable for \(targetID, privacy: .public) (expected for Electron apps); falling back to clipboard paste"
         )
-        return injectViaClipboard(text, targetID: targetID)
+        return injectViaClipboard(text, targetID: targetID, expectedTarget: expectedTarget)
     }
 
     /// Collapse a selection standing in `focused` to its END, so an append
@@ -649,7 +701,7 @@ final class TextInjector: TextInjecting {
     /// - Returns: `true` only when we have positive evidence the text landed.
     ///   Anything ambiguous returns `false` so the caller falls back to the
     ///   clipboard path.
-    private func insertViaAccessibility(_ text: String) -> Bool {
+    private func insertViaAccessibility(_ text: String, expectedTarget: AXUIElement? = nil) -> Bool {
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
 
@@ -671,6 +723,10 @@ final class TextInjector: TextInjecting {
         // Snapshot the insertion point so we can tell a real insertion from a
         // polite lie (see the verification note below).
         let rangeBefore = selectedTextRange(of: focused)
+        if let expectedTarget,
+           (!CFEqual(focused, expectedTarget) || !bufferedTargetIsReady(expectedTarget)) {
+            return false
+        }
 
         guard AXUIElementSetAttributeValue(
             focused, kAXSelectedTextAttribute as CFString, text as CFString
@@ -1672,7 +1728,8 @@ final class TextInjector: TextInjecting {
     /// (`restorePending` / `restoreGeneration` / `ourChangeCount`) instead of
     /// growing a second, parallel one. There is exactly one borrow mechanism in
     /// this file and this is it.
-    private func borrowPasteboardAndPasteV(_ text: String) -> PasteHandoff {
+    private func borrowPasteboardAndPasteV(_ text: String,
+                                          expectedTarget: AXUIElement? = nil) -> PasteHandoff {
         let pasteboard = NSPasteboard.general
 
         // Resolve the keycode BEFORE touching the pasteboard, so a resolution
@@ -1694,6 +1751,9 @@ final class TextInjector: TextInjecting {
         }
 
         // Only snapshot when we are not already holding one. See `restorePending`.
+        if let expectedTarget, !bufferedTargetIsReady(expectedTarget) {
+            return .failed("The text field or selection changed. Transcript kept in the preview.")
+        }
         if !restorePending {
             savedClipboard = snapshotPasteboard(pasteboard)
         }
@@ -1709,6 +1769,11 @@ final class TextInjector: TextInjecting {
         }
         ourChangeCount = pasteboard.changeCount
 
+        if let expectedTarget, !bufferedTargetIsReady(expectedTarget) {
+            completeRestore(generation: generation, restoring: true)
+            return .failed("The text field or selection changed. Nothing was pasted.")
+        }
+
         guard postCommandV(keyCode: vKeyCode) else {
             completeRestore(generation: generation, restoring: true)
             return .failed("Could not post the paste keystroke. Check Accessibility permission in System Settings.")
@@ -1716,8 +1781,9 @@ final class TextInjector: TextInjecting {
         return .posted(generation: generation, postedAt: Date(), keyCode: vKeyCode)
     }
 
-    private func injectViaClipboard(_ text: String, targetID: String) -> String? {
-        switch borrowPasteboardAndPasteV(text) {
+    private func injectViaClipboard(_ text: String, targetID: String,
+                                    expectedTarget: AXUIElement? = nil) -> String? {
+        switch borrowPasteboardAndPasteV(text, expectedTarget: expectedTarget) {
         case .failed(let reason):
             return reason
 
