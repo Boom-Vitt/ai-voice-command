@@ -1,5 +1,16 @@
+<!-- BBN:HEADER:START -->
+<div align="center">
+
+<img src=".github/brand/banner.svg" width="100%" alt="MicTest · AI Voice Command — Speak Thai and English, type into any app on your Mac" />
+
+<a href="https://github.com/Boom-Vitt/ai-voice-command/stargazers"><img src="https://img.shields.io/github/stars/Boom-Vitt/ai-voice-command?style=flat-square&color=14b8a6&labelColor=0b1220" alt="stars" /></a>
+<a href="https://github.com/Boom-Vitt/ai-voice-command/commits/main"><img src="https://img.shields.io/github/last-commit/Boom-Vitt/ai-voice-command?style=flat-square&color=14b8a6&labelColor=0b1220" alt="last commit" /></a>
+<a href="https://github.com/Boom-Vitt"><img src="https://img.shields.io/badge/by-BoomBigNose-14b8a6?style=flat-square&labelColor=0b1220" alt="by BoomBigNose" /></a>
+
+</div>
+<!-- BBN:HEADER:END -->
+
 <p align="center">
-  <img src="docs/assets/hero.png" alt="MicTest · AI Voice Command โดย BoomBigNose — ภาพประกอบโปรเจกต์" width="100%">
 </p>
 
 <h1 align="center">MicTest · AI Voice Command</h1>
@@ -123,3 +134,15 @@ MicTest is an experimental native macOS dictation app for Thai and Thai–Englis
 Build from source on Apple Silicon with macOS 26+ and Swift 6. Models are not bundled or downloaded by the app build. Real-voice accuracy and target-app compatibility remain under development.
 
 </details>
+
+<!-- BBN:FOOTER:START -->
+---
+
+<div align="center">
+
+**สร้างโดย [BoomBigNose](https://github.com/Boom-Vitt)** · [Kruoop.com](https://kruoop.com) แหล่งเรียน AI + คอมมูนิตี้ · [Seeneo.ai](https://seeneo.ai) · [YouTube 220K](https://www.youtube.com/@BoomBigNose)
+
+<sub>ถ้าโปรเจกต์นี้มีประโยชน์ กด ⭐ ให้กำลังใจกันได้เลย</sub>
+
+</div>
+<!-- BBN:FOOTER:END -->
